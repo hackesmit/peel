@@ -203,7 +203,7 @@ def extract(job: Job) -> Result:
     except BaseException:
         # This run claimed the folder with an exclusive mkdir, so everything in
         # it is ours: a refused or failed extract leaves nothing behind.
-        shutil.rmtree(folder, ignore_errors=True)
+        _remove_tree(folder)
         raise
     count = sum(1 for _ in folder.rglob("*") if _.is_file())
     noun = "file" if count == 1 else "files"
@@ -252,6 +252,58 @@ def zip_up(job: Job) -> Result:
     count = len(job.inputs)
     noun = "item" if count == 1 else "items"
     return ok([target], f"Zipped {count} {noun} into {target.name}")
+
+
+def _remove_tree(folder: Path) -> None:
+    """Remove ``folder`` however deep it goes.
+
+    shutil.rmtree recurses once per level (Python 3.12) and joins full paths,
+    so a folder thousands of levels deep stops it. The fallback walks down and
+    back up through directory descriptors, one level open at a time.
+    """
+    try:
+        shutil.rmtree(folder)
+        return
+    except FileNotFoundError:
+        return
+    except (OSError, RecursionError):
+        pass
+    if os.name != "posix" or not os.path.isdir(folder):
+        shutil.rmtree(folder, ignore_errors=True)
+        return
+    flags = os.O_RDONLY | os.O_DIRECTORY
+    names: list[str] = []
+    fd = os.open(folder, flags)
+    try:
+        while True:
+            sub = None
+            with os.scandir(fd) as it:
+                entries = list(it)
+            for entry in entries:
+                if entry.is_dir(follow_symlinks=False):
+                    sub = entry.name
+                    break
+                os.unlink(entry.name, dir_fd=fd)
+            if sub is not None:
+                child = os.open(sub, flags | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+                names.append(sub)
+                continue
+            if not names:
+                break
+            parent = os.open("..", flags, dir_fd=fd)
+            os.close(fd)
+            fd = parent
+            os.rmdir(names.pop(), dir_fd=fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+    try:
+        os.rmdir(folder)
+    except OSError:
+        pass
 
 
 def _unique_name(name: str, taken: set[str], *, folder: bool) -> str:
@@ -418,7 +470,7 @@ def _extract_archive(source: Path, dest: Path, budget: _Budget) -> list[str]:
     elif ext in _COMPRESSED:
         _extract_compressed(source, dest, budget, skipped)
     elif ext in _SEVENZIP_IN:
-        _extract_sevenzip(source, dest, budget)
+        _extract_sevenzip(source, dest, budget, skipped)
     else:
         raise RunnerFailed(f"{source.name}: not a supported archive")
     return skipped
@@ -475,6 +527,10 @@ def _extract_tar(source: Path, dest: Path, budget: _Budget, skipped: list[str], 
             with tarfile.open(fileobj=reader, mode="r|", tarinfo=_bounded_tarinfo()) as tf:
                 for member in tf:
                     _read_tar_member(tf, member, dest, root, tree, budget, skipped)
+                    # Stream-mode tarfile keeps every TarInfo (PAX headers
+                    # included) in tf.members; drop each one once it is
+                    # processed so memory stays bounded by one member.
+                    tf.members.clear()
     except _TarMetaRefused as exc:
         budget.refuse(str(exc))
     except (tarfile.TarError, EOFError, lzma.LZMAError, zlib.error) as exc:
@@ -657,7 +713,7 @@ def _extract_compressed(source: Path, dest: Path, budget: _Budget, skipped: list
         raise RunnerFailed(f"{source.name} is not a valid {ext} file: {_clean(exc)}") from None
 
 
-def _extract_sevenzip(source: Path, dest: Path, budget: _Budget) -> None:
+def _extract_sevenzip(source: Path, dest: Path, budget: _Budget, skipped: list[str]) -> None:
     from .. import backends
 
     exe = backends.require("7z")
@@ -675,6 +731,40 @@ def _extract_sevenzip(source: Path, dest: Path, budget: _Budget) -> None:
     # 2. The extraction, watched: headers can lie, so the folder itself is
     # measured while 7-Zip writes and 7-Zip is killed on overflow.
     _watch_7z([str(exe), "x", "-y", f"-o{dest}", "--", str(source)], source, dest, budget)
+    _drop_7z_folder_links(listing, dest, skipped)
+
+
+def _drop_7z_folder_links(listing: str, dest: Path, skipped: list[str]) -> None:
+    """List a stored folder link that 7-Zip wrote as a plain empty folder.
+
+    7-Zip on Windows writes a stored link (attribute L, or a Unix ``l`` mode)
+    as an empty ordinary folder, so the link would vanish with no note. Such a
+    folder is removed and listed as skipped, as ``_flatten_links`` does for
+    the real links 7-Zip writes elsewhere.
+    """
+    _, sep, body = listing.partition("\n----------")
+    for block in body.split("\n\n") if sep else ():
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            key, eq, value = line.partition(" = ")
+            if eq:
+                fields[key.strip()] = value.strip()
+        path = fields.get("Path")
+        win, _, unix = fields.get("Attributes", "").partition(" ")
+        if not path or not ("L" in win or unix.startswith("l")):
+            continue
+        rel = path.replace("\\", "/")
+        try:
+            out = _safe_target(dest, rel)
+        except RunnerFailed:
+            continue
+        if not os.path.isdir(out) or os.path.islink(out):
+            continue
+        with os.scandir(out) as it:
+            empty = next(it, None) is None
+        if empty:
+            os.rmdir(out)
+            skipped.append(f"{rel} (folder link)")
 
 
 def _parse_7z_listing(text: str) -> list[tuple[str, int]]:
@@ -713,7 +803,13 @@ def _tree_usage(root: Path) -> tuple[int, int, str, int]:
                         if entry.is_dir(follow_symlinks=False):
                             stack.append(entry.path)
                             continue
-                        size = entry.stat(follow_symlinks=False).st_size
+                        if os.name == "nt":
+                            # scandir's cached size on NTFS stays stale while
+                            # 7-Zip still holds the file open; a real stat
+                            # reads the live size through a handle.
+                            size = os.stat(entry.path, follow_symlinks=False).st_size
+                        else:
+                            size = entry.stat(follow_symlinks=False).st_size
                     except OSError:
                         continue
                     total += size
@@ -890,11 +986,13 @@ def _link_key(dest: Path, member) -> str:
     A hard link names its target from the archive root; a symlink is relative
     to the folder that holds it. Absolute targets are refused either way.
     """
-    link = member.linkname
+    # A Windows-built archive may use back slashes in names and targets;
+    # normalise both before taking the link's folder. Escape checks follow.
+    link = member.linkname.replace("\\", "/")
     if not link or PurePosixPath(link).is_absolute() or PureWindowsPath(link).is_absolute():
-        raise RunnerFailed(f"refused unsafe archive link: {member.name!r} -> {link!r}")
+        raise RunnerFailed(f"refused unsafe archive link: {member.name!r} -> {member.linkname!r}")
     if member.issym():
-        link = posixpath.join(posixpath.dirname(member.name), link)
+        link = posixpath.join(posixpath.dirname(member.name.replace("\\", "/")), link)
     joined = posixpath.normpath(link)
     if joined == ".." or joined.startswith("../"):
         raise RunnerFailed(f"refused unsafe archive link: {member.name!r} -> {member.linkname!r}")
@@ -926,6 +1024,7 @@ def _materialize_links(root: Path, tree: _TarTree, budget: _Budget, skipped: lis
     a missing entry, round in a loop, or into its own folder is listed as
     skipped, never dropped silently.
     """
+    names = _NameClaims(tree)
     for key in tree.links:
         if not tree.is_link(key):
             skipped.append(f"{key} (link over an existing name)")
@@ -941,23 +1040,80 @@ def _materialize_links(root: Path, tree: _TarTree, budget: _Budget, skipped: lis
             if _within(key, canon):
                 skipped.append(f"{key} (link to its own folder)")
                 continue
-            _copy_logical_dir(root, tree, canon, out, key, budget, skipped)
+            _copy_logical_dir(root, tree, canon, out, key, budget, skipped, names)
         elif kind == "file":
-            _copy_logical_file(root, canon, out, key, budget)
+            if names.claim(out, key, skipped):
+                _copy_logical_file(root, canon, out, key, budget, skipped)
         else:
             skipped.append(f"{key} (link to a skipped entry)")
 
 
-def _copy_logical_file(root: Path, canon: str, out: Path, name: str, budget: _Budget) -> None:
+def _win_name(path: str) -> str:
+    """``path`` as Windows compares it: case folded, trailing dots and spaces cut."""
+    return "/".join(part.rstrip(" .").casefold() for part in path.split("/"))
+
+
+class _NameClaims:
+    """The names a link copy may still take without hitting another entry.
+
+    On Windows ``A.TXT`` and ``a.txt`` (or ``lib.``) are one file, so a link
+    copy written under such a name would truncate the entry it copies from.
+    Every name the stream wrote, and every name a link copy has taken, is
+    held here in its Windows form; a link copy that matches one, or whose
+    destination already exists on disk, is listed as skipped instead.
+    """
+
+    def __init__(self, tree: _TarTree) -> None:
+        self.taken: set[str] = set()
+        for key, (kind, _) in tree.nodes.items():
+            if kind not in ("sym", "hard"):
+                self._take(key, parents=True)
+        for key in tree.children:
+            if key:
+                self.taken.add(_win_name(key))
+
+    def _take(self, key: str, parents: bool = False) -> None:
+        parts = key.split("/")
+        for i in range(1 if parents else len(parts), len(parts) + 1):
+            self.taken.add(_win_name("/".join(parts[:i])))
+
+    def claim(self, out: Path, name: str, skipped: list[str]) -> bool:
+        if _win_name(name) in self.taken or os.path.lexists(out):
+            skipped.append(f"{name} (name clash with an existing entry on Windows)")
+            return False
+        self._take(name)
+        return True
+
+
+def _copy_logical_file(
+    root: Path, canon: str, out: Path, name: str, budget: _Budget, skipped: list[str]
+) -> None:
     _make_dirs(root, out.parent, budget)
-    if not os.path.lexists(out):
+    src_path = _safe_target(root, canon)
+    if os.path.lexists(out):
+        try:
+            same = os.path.samefile(src_path, out)
+        except OSError:
+            same = False
+        if same:
+            # Opening ``out`` for writing would truncate the source itself.
+            skipped.append(f"{name} (name clash with an existing entry on Windows)")
+            return
+    else:
         budget.add_member()
-    with open(_safe_target(root, canon), "rb") as src, open(out, "wb") as out_file:
+    with open(src_path, "rb") as src, open(out, "wb") as out_file:
         budget.copy(src, out_file, name)
 
 
 def _copy_logical_dir(
-    root: Path, tree: _TarTree, canon: str, out: Path, name: str, budget: _Budget, skipped: list[str]
+    root: Path,
+    tree: _TarTree,
+    canon: str,
+    out: Path,
+    name: str,
+    budget: _Budget,
+    skipped: list[str],
+    names: _NameClaims,
 ) -> None:
     """Copy the logical folder ``canon`` to ``out``, following its links.
 
@@ -969,6 +1125,8 @@ def _copy_logical_dir(
     work = [(canon, out, name, (canon,))]
     while work:
         folder, out_dir, out_name, anchors = work.pop()
+        if not names.claim(out_dir, out_name, skipped):
+            continue
         _make_dirs(root, out_dir, budget)
         for child in sorted(tree.children.get(folder, ()), reverse=True):
             src = f"{folder}/{child}" if folder else child
@@ -991,7 +1149,8 @@ def _copy_logical_dir(
             if kind == "dir":
                 work.append((src, dst, dst_name, chain))
             elif kind == "file":
-                _copy_logical_file(root, src, dst, dst_name, budget)
+                if names.claim(dst, dst_name, skipped):
+                    _copy_logical_file(root, src, dst, dst_name, budget, skipped)
             else:
                 skipped.append(f"{dst_name} (not a file)")
 

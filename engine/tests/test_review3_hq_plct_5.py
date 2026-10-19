@@ -1,5 +1,4 @@
-"""Final (round 3) review checks for hq-plct.5. Not collected by default
-(no test_ prefix); run with: python3 -m pytest -q tests/review3_hq_plct_5.py"""
+"""Final (round 3) review checks for hq-plct.5, collected with the suite."""
 
 from __future__ import annotations
 
@@ -171,6 +170,12 @@ def test_one_gnu_long_name_still_works(real, tmp_path):
     src = tmp_path / "long.tar.gz"
     src.write_bytes(gzip.compress(_tar_bytes([("file", name, b"L")])))
     result = real.run("archive.extract", [src])
+    if WINDOWS and not result.ok:
+        # Without LongPathsEnabled Windows refuses a path past MAX_PATH; the
+        # final review accepted a clean runner_failed that leaves nothing.
+        assert result.code == "runner_failed" and "206" in result.message, result.message
+        assert not (tmp_path / "long").exists()
+        return
     assert result.ok, result.message
     assert (result.outputs[0] / name).read_bytes() == b"L"
 

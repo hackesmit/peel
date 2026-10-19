@@ -79,7 +79,7 @@ def test_7z_with_epoch_mtimes_converts_to_zip(real, tmp_path):
     tree = tmp_path / "tree"
     tree.mkdir()
     member = tree / "a.txt"
-    member.write_text("alpha\n", encoding="utf-8")
+    member.write_bytes(b"alpha\n")
     os.utime(member, (0, 0))
     src = tmp_path / "old.7z"
     exe = str(backends.require("7z"))

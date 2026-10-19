@@ -606,8 +606,8 @@ def test_zip_up_keeps_two_files_with_the_same_name(real, tmp_path):
     (tmp_path / "two").mkdir()
     a = tmp_path / "one" / "notes.txt"
     b = tmp_path / "two" / "Notes.TXT"
-    a.write_text("first\n")
-    b.write_text("second\n")
+    a.write_bytes(b"first\n")
+    b.write_bytes(b"second\n")
     result = real.run("archive.zip", [a, b])
     assert result.ok, result.message
     with zipfile.ZipFile(result.outputs[0]) as zf:
@@ -618,8 +618,11 @@ def test_zip_up_keeps_two_files_with_the_same_name(real, tmp_path):
 
 
 def test_zip_up_keeps_two_folders_with_the_same_name(real, tmp_path):
-    a = make_tree(tmp_path / "x" / "album", {"a.txt": "1\n"})
-    b = make_tree(tmp_path / "y" / "Album", {"a.txt": "2\n"})
+    a = tmp_path / "x" / "album"
+    b = tmp_path / "y" / "Album"
+    for folder, data in ((a, b"1\n"), (b, b"2\n")):
+        folder.mkdir(parents=True)
+        (folder / "a.txt").write_bytes(data)
     result = real.run("archive.zip", [a, b])
     assert result.ok, result.message
     with zipfile.ZipFile(result.outputs[0]) as zf:
