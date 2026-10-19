@@ -1899,3 +1899,29 @@ def test_a_csv_formula_is_text_not_run(registry, tmp_path):
         content = package.read("content.xml").decode("utf-8")
     assert "table:formula" not in content
     assert "<text:p>=1+1</text:p>" in content
+
+
+def test_csv_error_like_text_stays_text_in_xlsx(tmp_path):
+    from openpyxl import load_workbook
+    from peel_engine.registry import load_registry
+
+    src = tmp_path / "errs.csv"
+    src.write_bytes(b"id,note\n1,#N/A\n2,#DIV/0!\n3,#REF!\n4,#NAME?\n5,#NULL!\n6,#NUM!\n7,#VALUE!\n")
+    res = load_registry().run("docs.sheet_to_xlsx", [src])
+    assert res.ok, res.message
+    ws = load_workbook(res.outputs[0]).active
+    notes = [ws.cell(row=r, column=2) for r in range(2, 9)]
+    assert [c.value for c in notes] == ["#N/A", "#DIV/0!", "#REF!", "#NAME?", "#NULL!", "#NUM!", "#VALUE!"]
+    assert all(c.data_type == "s" for c in notes)
+
+
+def test_csv_trailing_empty_records_and_columns_survive_in_xlsx(tmp_path):
+    from openpyxl import load_workbook
+    from peel_engine.registry import load_registry
+
+    src = tmp_path / "blank.csv"
+    src.write_bytes(b"a,b\n,,\n,,\n")
+    res = load_registry().run("docs.sheet_to_xlsx", [src])
+    assert res.ok, res.message
+    ws = load_workbook(res.outputs[0]).active
+    assert ws.max_row == 3 and ws.max_column == 3

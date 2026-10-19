@@ -1800,14 +1800,17 @@ def _delimited_to_xlsx(job: Job, source: Path, src_ext: str) -> Result:
     book = Workbook()
     sheet = book.active
     sheet.title = _sheet_title(source.stem)
+    width = max((len(cells) for cells in rows), default=0)
     for number, cells in enumerate(rows, start=1):
+        cells = list(cells) + [""] * (width - len(cells))
         for column, text in enumerate(cells, start=1):
-            if text == "":
-                continue
             value = _as_number(text)
             cell = sheet.cell(row=number, column=column)
             cell.value = value
-            if isinstance(value, str) and value.startswith("="):
+            # Every string is text: openpyxl would otherwise turn "=..." into a
+            # formula and "#N/A" or "#DIV/0!" into an error cell. Empty strings
+            # are written too, so trailing empty records and columns survive.
+            if isinstance(value, str):
                 cell.data_type = "s"
     book.save(_abs(target))
     return ok([target], f"Wrote {target.name} ({len(rows)} rows)")
