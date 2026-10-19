@@ -10,6 +10,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Threading;
+using Peel.Editors;
 using Peel.Engine;
 using Peel.Hooks;
 using Peel.Jobs;
@@ -81,7 +82,7 @@ public partial class App : Application
         _toasts = new ToastHost();
         var jobs = new JobRunner(_engine, _toasts, Dispatcher);
         _jobs = jobs;
-        var editors = new MissingEditorHost(jobs);
+        var editors = new EditorHost(_engine, jobs, Dispatcher);
 
         _wheel = new WheelWindow();
         _wheel.Warm();

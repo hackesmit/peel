@@ -28,6 +28,14 @@
 // photos is longer than that, so past CommandLineBudget the paths go to a
 // temporary UTF-8 list file passed as --files-from, deleted afterwards (and,
 // should Peel die first, swept at the next start by ScavengeListFiles).
+//
+// Editor parameters take the same road for a different reason. `peel run
+// --param K=V` reads the value from a file when it starts with "@", which is
+// how the engine lets an editor pass a long list of shapes; that also means a
+// Metadata title of "@danielfhack" would be read as a file name and the job
+// would fail. So whenever a value starts with "@", or the parameters are long
+// (a pen stroke is hundreds of points), they all go into a temporary JSON
+// object passed as --params-file, where no value is magic.
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -69,6 +77,12 @@ internal sealed class EngineClient
     /// allows 32767; the margin covers the executable, the prefix and quoting.
     /// </summary>
     internal int CommandLineBudget { get; init; } = 24000;
+
+    /// <summary>
+    /// Past this many characters of parameters they go in a JSON file. Well
+    /// under CommandLineBudget, which the file paths share with them.
+    /// </summary>
+    internal int ParamBudget { get; init; } = 6000;
 
     internal EngineLocation? Location => _location.Value;
 
@@ -172,33 +186,133 @@ internal sealed class EngineClient
         return parsed;
     }
 
+    /// <summary>
+    /// Run one action. <paramref name="outDir"/> sends the outputs somewhere
+    /// other than next to the source, which the editors use to rasterise a
+    /// preview into a temporary folder without leaving a file by the user's.
+    /// </summary>
     internal async Task<RunResult> RunAsync(
         string actionId,
         IReadOnlyList<string> files,
         IReadOnlyDictionary<string, string>? parameters = null,
-        CancellationToken token = default)
+        CancellationToken token = default,
+        string? outDir = null)
     {
         var tail = new List<string>();
-        if (parameters is not null)
+        string? paramsFile;
+        try
+        {
+            paramsFile = ParamArgs(parameters, ParamBudget, tail);
+        }
+        catch (Exception error)
+        {
+            Log.Write("cannot write the parameters for the engine", error);
+            return RunResult.Failed($"Peel could not pass the settings to the engine: {error.Message}", "shell_params");
+        }
+        if (outDir is not null)
+        {
+            tail.Add("--out-dir");
+            tail.Add(outDir);
+        }
+        (string Output, string Error, int? ExitCode) call;
+        try
+        {
+            call = await RunProcessAsync(
+                new[] { "run", actionId }, files, tail, RunTimeout, token).ConfigureAwait(false);
+        }
+        finally
+        {
+            Discard(paramsFile);
+        }
+        var (output, problem, code) = call;
+        if (code is null)
+        {
+            return RunResult.Failed(problem, "shell_engine");
+        }
+        var parsed = Parse<RunResult>(output);
+        if (parsed is null)
+        {
+            return RunResult.Failed(Describe(output, problem, code.Value), "shell_engine");
+        }
+        return parsed;
+    }
+
+    /// <summary>
+    /// The --param or --params-file arguments for one set of parameters.
+    /// Returns the temporary file to delete afterwards, or null when the
+    /// parameters went on the command line. A value starting with "@" always
+    /// takes the file, because the engine would otherwise read it as a path.
+    /// </summary>
+    internal static string? ParamArgs(
+        IReadOnlyDictionary<string, string>? parameters,
+        int budget,
+        List<string> tail,
+        Action<string, string>? write = null)
+    {
+        if (parameters is null || parameters.Count == 0)
+        {
+            return null;
+        }
+        var length = 0;
+        var magic = false;
+        foreach (var pair in parameters)
+        {
+            length += pair.Key.Length + pair.Value.Length + 12;
+            magic |= pair.Value.StartsWith('@');
+        }
+        if (!magic && length <= budget)
         {
             foreach (var pair in parameters)
             {
                 tail.Add("--param");
                 tail.Add($"{pair.Key}={pair.Value}");
             }
+            return null;
         }
-        var (output, error, code) = await RunProcessAsync(
-            new[] { "run", actionId }, files, tail, RunTimeout, token).ConfigureAwait(false);
-        if (code is null)
+
+        var folder = ListFolder;
+        Directory.CreateDirectory(folder);
+        var file = Path.Combine(folder, $"params-{Guid.NewGuid():N}.json");
+        using var json = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(json))
         {
-            return RunResult.Failed(error, "shell_engine");
+            writer.WriteStartObject();
+            foreach (var pair in parameters)
+            {
+                writer.WriteString(pair.Key, pair.Value);
+            }
+            writer.WriteEndObject();
         }
-        var parsed = Parse<RunResult>(output);
-        if (parsed is null)
+        write ??= (path, contents) => File.WriteAllText(path, contents, new UTF8Encoding(false));
+        try
         {
-            return RunResult.Failed(Describe(output, error, code.Value), "shell_engine");
+            write(file, Encoding.UTF8.GetString(json.ToArray()));
         }
-        return parsed;
+        catch
+        {
+            // Same rule as the file list: a half written file is never kept.
+            Discard(file);
+            throw;
+        }
+        tail.Add("--params-file");
+        tail.Add(file);
+        return file;
+    }
+
+    private static void Discard(string? file)
+    {
+        if (file is null)
+        {
+            return;
+        }
+        try
+        {
+            File.Delete(file);
+        }
+        catch (Exception error)
+        {
+            Log.Write($"cannot delete the temporary file {file}", error);
+        }
     }
 
     private static T? Parse<T>(string output) where T : class
@@ -297,10 +411,11 @@ internal sealed class EngineClient
     }
 
     /// <summary>
-    /// Delete list files a killed or crashed Peel left in %TEMP%\Peel (which
-    /// is this user's own temp folder). Only files-*.txt older than
-    /// <paramref name="olderThan"/>, so a list another Peel call is using right
-    /// now is never touched. Returns how many were deleted.
+    /// Delete the temporary files a killed or crashed Peel left in %TEMP%\Peel
+    /// (which is this user's own temp folder): the file lists it passes as
+    /// --files-from and the parameter objects it passes as --params-file. Only
+    /// ones older than <paramref name="olderThan"/>, so a file another Peel
+    /// call is using right now is never touched. Returns how many were deleted.
     /// </summary>
     internal static int ScavengeListFiles(TimeSpan olderThan, string? folder = null)
     {
@@ -313,7 +428,8 @@ internal sealed class EngineClient
                 return 0;
             }
             var cutoff = DateTime.UtcNow - olderThan;
-            foreach (var file in Directory.EnumerateFiles(folder, "files-*.txt"))
+            foreach (var file in Directory.EnumerateFiles(folder, "files-*.txt")
+                         .Concat(Directory.EnumerateFiles(folder, "params-*.json")))
             {
                 try
                 {
@@ -332,6 +448,45 @@ internal sealed class EngineClient
         catch (Exception error)
         {
             Log.Write("cannot sweep the stale file lists", error);
+        }
+        deleted += ScavengePreviews(olderThan, folder);
+        return deleted;
+    }
+
+    /// <summary>
+    /// The editors rasterise a preview into %TEMP%\Peel\preview-&lt;id&gt; and
+    /// delete it when the window has the pixels. A killed Peel leaves one, so
+    /// the stale ones go at the next start, like the file lists.
+    /// </summary>
+    private static int ScavengePreviews(TimeSpan olderThan, string folder)
+    {
+        var deleted = 0;
+        try
+        {
+            if (!Directory.Exists(folder))
+            {
+                return 0;
+            }
+            var cutoff = DateTime.UtcNow - olderThan;
+            foreach (var directory in Directory.EnumerateDirectories(folder, "preview-*"))
+            {
+                try
+                {
+                    if (Directory.GetLastWriteTimeUtc(directory) < cutoff)
+                    {
+                        Directory.Delete(directory, recursive: true);
+                        deleted++;
+                    }
+                }
+                catch (Exception error)
+                {
+                    Log.Write($"cannot delete the stale preview folder {directory}", error);
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            Log.Write("cannot sweep the stale preview folders", error);
         }
         return deleted;
     }

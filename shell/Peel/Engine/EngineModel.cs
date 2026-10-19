@@ -16,6 +16,11 @@ internal sealed class ParamSpec
     [JsonPropertyName("default")] public JsonElement Default { get; set; }
     [JsonPropertyName("required")] public bool Required { get; set; }
     [JsonPropertyName("choices")] public List<JsonElement> Choices { get; set; } = new();
+    // The engine declares the range of a number here. The editors read it so a
+    // slider or a numeric field never repeats a limit the registry already
+    // states; null means the engine set no limit on that side.
+    [JsonPropertyName("minimum")] public double? Minimum { get; set; }
+    [JsonPropertyName("maximum")] public double? Maximum { get; set; }
     [JsonPropertyName("help")] public string Help { get; set; } = string.Empty;
 }
 
