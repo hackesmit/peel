@@ -77,8 +77,32 @@ METADATA_INPUTS = ("jpg", "jpeg", "png", "webp", "tiff", "tif", "heic", "heif", 
 LOSSY = frozenset({"JPEG", "WEBP", "AVIF", "HEIF"})
 
 #: Formats that cannot carry an alpha channel, so a transparent source is
-#: flattened onto white rather than failing.
-NO_ALPHA = frozenset({"JPEG", "PDF"})
+#: flattened onto white rather than failing. BMP can technically hold a 32 bit
+#: alpha channel, but most viewers ignore it and show whatever colour sits
+#: under a transparent pixel, so it is flattened like JPG.
+NO_ALPHA = frozenset({"JPEG", "PDF", "BMP"})
+
+#: Pillow modes with more than 8 bits per channel: 16 bit greyscale (scanners,
+#: medical and scientific images), 32 bit integer and 32 bit float.
+DEEP_MODES = frozenset({"I;16", "I;16L", "I;16B", "I;16N", "I", "F"})
+
+#: The deep modes each format can store as they are. Every other format, and
+#: every other mode, gets a properly scaled 8 bit image instead of a clipped one.
+DEEP_OK: dict[str, frozenset[str]] = {
+    "PNG": frozenset({"I;16", "I;16L", "I;16B", "I;16N", "I"}),
+    "TIFF": DEEP_MODES,
+}
+
+#: Formats that hold an animation. An animated source converted or compressed
+#: into one of these keeps every frame; anything else gets the first frame and
+#: the result message says so.
+ANIMATED = frozenset({"WEBP", "GIF"})
+
+#: Metadata keys of ``img.info`` that are not personal data and are kept when
+#: Peel strips or redacts: the ICC colour profile (without it a Display P3 or
+#: Adobe RGB photo shifts colour) and palette transparency (part of the
+#: picture, not a tag).
+KEEP_INFO = ("icc_profile", "transparency")
 
 #: Re-encode quality for everything except Compress, which is given one.
 QUALITY = 92
@@ -92,6 +116,11 @@ PDF_DPI = 96
 #: blown up more than SVG_MAX_ZOOM.
 SVG_TARGET_PX = 1024
 SVG_MAX_ZOOM = 8.0
+
+#: Pixel budget for anything Peel draws or decodes itself, matching pillow's
+#: own decompression bomb limit (``Image.MAX_IMAGE_PIXELS``, about 89 million).
+#: An SVG that would render bigger is refused before anything is allocated.
+PIXEL_BUDGET = 178956970 // 2
 
 #: Default annotation ink: the same orange-red every screenshot tool uses.
 DEFAULT_INK = "#ff3b30"
@@ -401,15 +430,39 @@ def _svg_via_pymupdf(path: Path) -> bytes:
         page = doc[0]
         longest = max(page.rect.width, page.rect.height, 1.0)
         zoom = min(max(SVG_TARGET_PX / longest, 1.0), SVG_MAX_ZOOM)
+        _check_budget(path, page.rect.width * zoom, page.rect.height * zoom)
         pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=True)
         return pixmap.tobytes("png")
+
+
+def pixel_budget() -> int:
+    """The most pixels Peel will render or decode in one image."""
+    limit = pillow().MAX_IMAGE_PIXELS
+    return int(limit) if limit else PIXEL_BUDGET
+
+
+def _check_budget(path: Path, width: float, height: float) -> None:
+    """Refuse a render bigger than the pixel budget, before it is allocated."""
+    budget = pixel_budget()
+    if width * height > budget:
+        raise RunnerFailed(
+            f"{path.name} would draw at {int(width)} by {int(height)} pixels, "
+            f"more than the {budget // 1_000_000} million pixel limit Peel keeps "
+            "so one file cannot exhaust the memory. Make the SVG smaller and try again."
+        )
 
 
 def _svg_via_magick(path: Path) -> bytes:
     magick = backends.require("magick")
     try:
         proc = subprocess.run(
-            [str(magick), str(path), "-background", "none", "png:-"],
+            [
+                str(magick),
+                "-limit", "area", str(pixel_budget()),
+                "-limit", "width", "65000",
+                "-limit", "height", "65000",
+                str(path), "-background", "none", "png:-",
+            ],
             capture_output=True,
             timeout=120,
         )
@@ -430,7 +483,7 @@ def save(
     target: Path,
     ext: str,
     *,
-    quality: int | None = None,
+    quality: int | str | None = None,
     exif: bytes | Any = None,
     icc_profile: Any = None,
     pages: Sequence[Any] = (),
@@ -445,7 +498,10 @@ def save(
     out = _prepare(img, fmt)
     options: dict[str, Any] = {}
     if fmt in LOSSY and quality is not None:
-        options["quality"] = int(quality)
+        # "keep" reuses a JPEG's own quantisation tables, so a metadata edit
+        # does not cost a generation of quality. Only valid on an untouched
+        # JPEG straight from its decoder.
+        options["quality"] = quality if quality == "keep" else int(quality)
     if fmt == "PNG":
         options["optimize"] = True
     if fmt == "TIFF":
@@ -480,9 +536,14 @@ def _write(img, target: Path, fmt: str, options: dict[str, Any]) -> None:
         # place and time the photo was taken survive the conversion.
         options = {key: value for key, value in options.items() if key != "compression"}
         attempts.append((lambda: img, options))
+    if options.get("quality") == "keep":
+        # Pillow refuses "keep" on anything it did not decode as a JPEG.
+        options = {**options, "quality": QUALITY}
+        attempts.append((lambda: img, options))
     if img.mode != "RGB":
-        # Odd source modes (CMYK, 16 bit, YCbCr) that a given encoder refuses.
-        attempts.append((lambda: img.convert("RGB"), options))
+        # Odd source modes (CMYK, YCbCr) that a given encoder refuses. A deep
+        # mode is scaled down first, never clipped.
+        attempts.append((lambda: to_8bit(img).convert("RGB"), options))
 
     last: Exception | None = None
     for build, chosen in attempts:
@@ -497,6 +558,8 @@ def _write(img, target: Path, fmt: str, options: dict[str, Any]) -> None:
 
 def _prepare(img, fmt: str):
     """Put the image in a mode the target format can actually hold."""
+    if img.mode in DEEP_MODES and img.mode not in DEEP_OK.get(fmt, ()):
+        img = to_8bit(img)
     if fmt not in NO_ALPHA:
         return img
     if img.mode == "P":
@@ -512,7 +575,42 @@ def flatten(img, rgb: tuple[int, int, int]):
     """Composite an image with alpha onto an opaque colour."""
     Image = pillow()
     base = Image.new("RGBA", img.size, tuple(rgb) + (255,))
-    return Image.alpha_composite(base, img.convert("RGBA")).convert("RGB")
+    return Image.alpha_composite(base, to_rgba(img)).convert("RGB")
+
+
+def to_8bit(img):
+    """A deep (16 bit, 32 bit or float) image scaled into 8 bit greyscale.
+
+    Pillow's own ``convert("L")`` or ``convert("RGB")`` from these modes clips
+    every value above 255, so a 16 bit scan comes out almost white. The value
+    range is read off the pixels: 16 bit data is divided by 256, float data in
+    0..1 is multiplied by 255, data already in 0..255 is left alone, and
+    anything else is stretched from its own minimum to its own maximum.
+    Any other mode is returned unchanged.
+    """
+    if img.mode not in DEEP_MODES:
+        return img
+    if img.mode.startswith("I;16"):
+        low, high = 0.0, 65535.0
+        img = img.convert("I")
+    else:
+        low, high = (float(v) for v in img.getextrema())
+        if img.mode == "F" and 0.0 <= low and high <= 1.0:
+            low, high = 0.0, 1.0
+        elif 0.0 <= low and high <= 255.0:
+            low, high = 0.0, 255.0
+        elif 0.0 <= low and high <= 65535.0:
+            low, high = 0.0, 65535.0
+    span = (high - low) or 1.0
+    scale = 255.0 / span
+    offset = -low * scale
+    source = img if img.mode == "F" else img.convert("F")
+    return source.point(lambda v: v * scale + offset).convert("L")
+
+
+def to_rgba(img):
+    """``convert("RGBA")`` that scales a deep image instead of clipping it."""
+    return to_8bit(img).convert("RGBA")
 
 
 def carry_exif(img) -> bytes | None:
@@ -552,7 +650,22 @@ def _rgb_or_rgba(img):
     """Narrow any mode down to RGB or RGBA, so drawing code has two cases."""
     if img.mode in ("RGB", "RGBA"):
         return img
-    return img.convert("RGBA" if _has_alpha(img) else "RGB")
+    return to_8bit(img).convert("RGBA" if _has_alpha(img) else "RGB")
+
+
+def bare(img):
+    """A copy of ``img`` carrying no metadata at all, except ``KEEP_INFO``.
+
+    Pillow's encoders fall back to ``img.info`` for anything not passed to
+    ``save`` (the JPEG writer reads ``info["comment"]``, others read EXIF, XMP
+    or text chunks), so a copy with a cleared ``info`` is the only reliable way
+    to write nothing the source carried.
+    """
+    clean = img.copy()
+    clean.info = {key: img.info[key] for key in KEEP_INFO if key in img.info}
+    if hasattr(clean, "_exif"):
+        clean._exif = None
+    return clean
 
 
 def _has_alpha(img) -> bool:
@@ -580,26 +693,125 @@ def _kb(size: int) -> str:
     return f"{size / (1024 * 1024):.1f} MB"
 
 
+# --- animation --------------------------------------------------------------
+
+
+def frame_count(path: Path) -> int:
+    """How many frames a file holds (animated WebP, APNG, AVIF or HEIC sequence).
+
+    Opening is lazy, so this reads only the header. A file pillow cannot open
+    counts as one frame and ``load`` reports the real problem.
+    """
+    if naming.normalise_ext(Path(path).suffix) in VECTOR_INPUTS:
+        return 1
+    Image = pillow()
+    try:
+        with Image.open(path) as img:
+            return max(1, int(getattr(img, "n_frames", 1) or 1))
+    except Exception:
+        return 1
+
+
+def load_frames(path: Path, longest: int = 0):
+    """Every frame as RGBA, with per frame durations and the loop count.
+
+    Returns None when the frames together exceed twice the pixel budget, so the
+    caller falls back to the first frame instead of exhausting the memory.
+    ``longest`` caps the long edge of each frame, as Compress does.
+    """
+    from PIL import ImageSequence
+
+    Image = pillow()
+    try:
+        img = Image.open(path)
+    except OSError as exc:
+        raise _cannot_read(path, exc) from None
+    with img:
+        count = max(1, int(getattr(img, "n_frames", 1) or 1))
+        if img.width * img.height * count > 2 * pixel_budget():
+            return None
+        frames, durations = [], []
+        for frame in ImageSequence.Iterator(img):
+            durations.append(int(frame.info.get("duration") or 100))
+            rgba = to_rgba(frame)
+            frames.append(fit_within(rgba, longest) if longest else rgba)
+        info = {
+            "loop": int(img.info.get("loop", 0) or 0),
+            "exif": carry_exif(img),
+            "icc_profile": img.info.get("icc_profile"),
+        }
+    return frames, durations, info
+
+
+def save_frames(frames, durations, info, target: Path, fmt: str, quality: int) -> None:
+    """Write an animation into the claimed ``target``."""
+    options: dict[str, Any] = {
+        "save_all": True,
+        "append_images": frames[1:],
+        "duration": durations,
+        "loop": info["loop"],
+    }
+    if fmt in LOSSY:
+        options["quality"] = int(quality)
+    if info.get("exif"):
+        options["exif"] = info["exif"]
+    if info.get("icc_profile"):
+        options["icc_profile"] = info["icc_profile"]
+    try:
+        with open(target, "wb") as handle:
+            frames[0].save(handle, format=fmt, **options)
+    except Exception as exc:
+        raise RunnerFailed(f"cannot write an animated {fmt}: {exc}") from None
+
+
+def _first_frame_note(source: Path, count: int, fmt: str, why: str = "") -> str:
+    reason = why or f"{fmt} here holds one picture"
+    return (
+        f" {source.name} has {count} frames and {reason}, "
+        "so Peel kept only the first frame."
+    )
+
+
 # --- conversions ------------------------------------------------------------
 
 
 def convert(job: Job) -> Result:
-    """Any image (SVG included) to any of the SPEC.md output formats."""
+    """Any image (SVG included) to any of the SPEC.md output formats.
+
+    An animated source keeps every frame when the target can animate (WebP);
+    otherwise the first frame is converted and the message says so.
+    """
     source = job.source
     target = job.output_path()
+    ext = naming.normalise_ext(target.suffix)
+    fmt = FORMATS[ext]
+    count = frame_count(source)
+    note = ""
+    if count > 1:
+        if fmt in ANIMATED:
+            loaded = load_frames(source)
+            if loaded is not None:
+                frames, durations, info = loaded
+                save_frames(frames, durations, info, target, fmt, QUALITY)
+                return ok([target], f"Wrote {target.name} with all {count} frames",
+                          frames=count)
+            note = _first_frame_note(source, count, fmt, "they are too large to keep together")
+        else:
+            note = _first_frame_note(source, count, fmt)
     img = load(source)
     try:
         save(
             img,
             target,
-            naming.normalise_ext(target.suffix),
+            ext,
             quality=QUALITY,
             exif=carry_exif(img),
             icc_profile=img.info.get("icc_profile"),
         )
     finally:
         img.close()
-    return ok([target], f"Wrote {target.name}")
+    return ok([target], f"Wrote {target.name}.{note}" if note else f"Wrote {target.name}",
+              frames=1, source_frames=count)
 
 
 # --- tools ------------------------------------------------------------------
@@ -612,6 +824,22 @@ def compress(job: Job) -> Result:
     cap = job.params["max_dimension"]
     target = job.output_path()
     ext = naming.normalise_ext(target.suffix)
+    count = frame_count(source)
+    note = ""
+    if count > 1:
+        if FORMATS[ext] in ANIMATED:
+            loaded = load_frames(source, cap)
+            if loaded is not None:
+                frames, durations, info = loaded
+                save_frames(frames, durations, info, target, FORMATS[ext], quality)
+                return _compressed(source, target, ext, frames[0].size,
+                                   f" All {count} frames kept.")
+            note = _first_frame_note(source, count, FORMATS[ext],
+                                     "they are too large to keep together")
+        else:
+            note = _first_frame_note(source, count, FORMATS[ext],
+                                     "Peel cannot write an animated "
+                                     f"{FORMATS[ext]}")
     img = load(source)
     try:
         smaller = fit_within(img, cap) if cap else img
@@ -626,7 +854,10 @@ def compress(job: Job) -> Result:
         size = smaller.size
     finally:
         img.close()
+    return _compressed(source, target, ext, size, note)
 
+
+def _compressed(source: Path, target: Path, ext: str, size, note: str) -> Result:
     before = source.stat().st_size
     after = target.stat().st_size
     if FORMATS[ext] in LOSSY:
@@ -639,7 +870,7 @@ def compress(job: Job) -> Result:
         )
     return ok(
         [target],
-        message,
+        message + note,
         bytes_before=before,
         bytes_after=after,
         width=size[0],
@@ -747,7 +978,8 @@ def annotate(job: Job) -> Result:
 
     img = load(source)
     try:
-        base = img.convert("RGBA")
+        base = to_rgba(img)
+        shapes = [_fit_shape(shape, base.size) for shape in shapes]
         overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
         for shape in shapes:
@@ -806,6 +1038,21 @@ def _check_shapes(raw: Any) -> list[dict[str, Any]]:
                 raise InvalidParams(f"shape {index}: a text shape needs some text")
         shapes.append(clean)
     return shapes
+
+
+def _fit_shape(shape: dict[str, Any], size: tuple[int, int]) -> dict[str, Any]:
+    """Clamp a shape's line width and text size to the image.
+
+    Nothing wider than the image's diagonal can show more than a stroke that
+    covers it, and pillow draws a wide outline one pixel ring at a time, so
+    an absurd width (10**9) would otherwise hang the run.
+    """
+    diagonal = max(1, math.ceil(math.hypot(*size)))
+    fitted = dict(shape)
+    fitted["width"] = min(shape["width"], diagonal)
+    if "size" in shape:
+        fitted["size"] = min(shape["size"], diagonal)
+    return fitted
 
 
 def _whole(shape: dict[str, Any], key: str, default: int, index: int) -> int:
@@ -880,8 +1127,11 @@ def _draw_arrow(draw, shape: dict[str, Any]) -> None:
 def redact(job: Job) -> Result:
     """Hide regions for good, with a blur that cannot be undone or a black box.
 
-    The output carries no metadata. An image redacted in the pixels but still
-    holding the original EXIF (place, time, embedded thumbnail) is not redacted.
+    The output carries no metadata: no EXIF, XMP, JPEG comment or text chunk.
+    An image redacted in the pixels but still holding the original EXIF
+    (place, time, embedded thumbnail) or a comment naming the subject is not
+    redacted. The ICC colour profile is the one thing kept, because it is not
+    personal data and without it the colours shift.
     """
     from PIL import ImageDraw, ImageFilter
 
@@ -914,7 +1164,13 @@ def redact(job: Job) -> Result:
             mosaic = small.resize((span_w, span_h), Image.Resampling.NEAREST)
             out.paste(mosaic.filter(ImageFilter.GaussianBlur(radius=max(2, step))), box)
         target = job.output_path()
-        save(out, target, naming.normalise_ext(target.suffix), quality=QUALITY)
+        save(
+            bare(out),
+            target,
+            naming.normalise_ext(target.suffix),
+            quality=QUALITY,
+            icc_profile=img.info.get("icc_profile"),
+        )
         noun = "region" if len(boxes) == 1 else "regions"
         return ok([target], f"Hid {len(boxes)} {noun} with a {mode}", regions=len(boxes))
     finally:
@@ -959,7 +1215,7 @@ def background(job: Job) -> Result:
 
     img = load(source)
     try:
-        rgba = img.convert("RGBA")
+        rgba = to_rgba(img)
         had = rgba.getchannel("A").getextrema()[0] < 255
         base = Image.new("RGBA", rgba.size, colour[:3] + (255,))
         flat = Image.alpha_composite(base, rgba).convert("RGB")
@@ -1007,7 +1263,7 @@ def collage(job: Job) -> Result:
             colour[:3] + (255,),
         )
         for index, img in enumerate(images):
-            tile = img.convert("RGBA")
+            tile = to_rgba(img)
             column, row = index % columns, index // columns
             canvas.alpha_composite(
                 tile,
@@ -1061,6 +1317,13 @@ def metadata(job: Job) -> Result:
 
     ``view`` writes nothing: the editor calls it to fill the form, then calls
     back with ``set`` or ``strip``.
+
+    ``strip`` removes EXIF, XMP, comments and text chunks, and keeps the ICC
+    colour profile on purpose: it describes the colours, not the person, and
+    without it a wide gamut photo shifts colour. Because the Orientation tag
+    goes too, the pixels are turned upright first, so a phone photo still
+    displays the way it did. ``set`` re-encodes a JPEG with its own
+    quantisation tables (quality "keep"), so changing a title costs nothing.
     """
     action = job.params["action"]
     source = job.source
@@ -1072,18 +1335,24 @@ def metadata(job: Job) -> Result:
             return ok([], f"Read the metadata of {source.name}", metadata=_read(img, source))
         ext = naming.normalise_ext(source.suffix)
         if action == "strip":
-            clean = img.copy()
-            clean.info = {}
+            from PIL import ImageOps
+
+            upright = ImageOps.exif_transpose(img) or img
+            clean = bare(upright)
             target = job.output_path()
-            save(clean, target, ext, quality=QUALITY)
-            return ok([target], f"Removed every tag from {target.name}")
+            save(clean, target, ext, quality=QUALITY,
+                 icc_profile=img.info.get("icc_profile"))
+            return ok(
+                [target],
+                f"Removed every tag from {target.name} (the colour profile is kept)",
+            )
         exif = _edited_exif(img, job.params)
         target = job.output_path()
         save(
             img,
             target,
             ext,
-            quality=QUALITY,
+            quality="keep" if img.format == "JPEG" else QUALITY,
             exif=exif,
             icc_profile=img.info.get("icc_profile"),
         )
