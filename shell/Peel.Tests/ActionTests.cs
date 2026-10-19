@@ -226,6 +226,259 @@ public class ActionTests
         }
     }
 
+    // --- Move: physical containment and cross-device -------------------------
+    // The destination below is the moved folder's own descendant, reached by a
+    // spelling path strings cannot see through. Every case must refuse and
+    // leave the folder whole. They run on a real NTFS volume on George.
+
+    private static string NewRoot()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "peel-move-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        return root;
+    }
+
+    /// <summary>A folder "album" holding a precious file and a subfolder "out".</summary>
+    private static (string Album, string Out, string Keep) MakeAlbum(string root)
+    {
+        var album = Path.Combine(root, "album");
+        var into = Path.Combine(album, "out");
+        Directory.CreateDirectory(into);
+        var keep = Path.Combine(album, "photo.txt");
+        File.WriteAllText(keep, "precious");
+        return (album, into, keep);
+    }
+
+    private static void AssertRefusedAndWhole(string album, string keep, string destination)
+    {
+        // The refusal must come from the containment test seeing the alias,
+        // not from some other IOException on the way.
+        Assert.True(FileIdentity.IsSameOrBeneath(destination, album), $"{destination} not seen inside {album}");
+        Assert.Throws<IOException>(() => MoveAction.MoveInto(album, destination));
+        Assert.True(Directory.Exists(album));
+        Assert.Equal("precious", File.ReadAllText(keep));
+    }
+
+    /// <summary>The same local path through the administrative share.</summary>
+    private static string UncAlias(string local)
+    {
+        var full = Path.GetFullPath(local);
+        return $@"\\localhost\{full[0]}$" + full.Substring(2);
+    }
+
+    private static void RunCmd(string arguments)
+    {
+        using var process = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("cmd.exe", "/c " + arguments)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        })!;
+        process.WaitForExit();
+        Assert.True(process.ExitCode == 0, $"cmd /c {arguments} failed: {process.StandardError.ReadToEnd()}");
+    }
+
+    private static void Cleanup(string root)
+    {
+        // Remove junctions first so a recursive delete can never reach through one.
+        foreach (var dir in Directory.GetDirectories(root, "*", SearchOption.AllDirectories))
+        {
+            if (Directory.Exists(dir) && new DirectoryInfo(dir).Attributes.HasFlag(FileAttributes.ReparsePoint))
+            {
+                Directory.Delete(dir);
+            }
+        }
+        Directory.Delete(root, recursive: true);
+    }
+
+    [Fact]
+    public void ADescendantReachedThroughAUncAliasIsRefused()
+    {
+        var root = NewRoot();
+        var (album, into, keep) = MakeAlbum(root);
+        try
+        {
+            var alias = UncAlias(into);
+            Assert.True(Directory.Exists(alias), $"admin share not reachable: {alias}");
+            AssertRefusedAndWhole(album, keep, alias);
+            // And the other way round: the source named by its alias.
+            AssertRefusedAndWhole(UncAlias(album), keep, into);
+        }
+        finally
+        {
+            Cleanup(root);
+        }
+    }
+
+    [Fact]
+    public void ADescendantReachedThroughAJunctionIsRefused()
+    {
+        var root = NewRoot();
+        var (album, into, keep) = MakeAlbum(root);
+        var link = Path.Combine(root, "link");
+        try
+        {
+            RunCmd($"mklink /J \"{link}\" \"{into}\"");
+            AssertRefusedAndWhole(album, keep, link);
+            // A junction to the folder itself, too.
+            var self = Path.Combine(root, "self");
+            RunCmd($"mklink /J \"{self}\" \"{album}\"");
+            AssertRefusedAndWhole(album, keep, self);
+            AssertRefusedAndWhole(album, keep, Path.Combine(self, "out"));
+        }
+        finally
+        {
+            Cleanup(root);
+        }
+    }
+
+    [Fact]
+    public void ADescendantSpelledInAnotherCaseIsRefused()
+    {
+        var root = NewRoot();
+        var (album, into, keep) = MakeAlbum(root);
+        try
+        {
+            AssertRefusedAndWhole(album, keep, into.ToUpperInvariant());
+        }
+        finally
+        {
+            Cleanup(root);
+        }
+    }
+
+    [Fact]
+    public void ADescendantThroughAShortNameIsRefused()
+    {
+        var root = NewRoot();
+        var album = Path.Combine(root, "a long album name");
+        var into = Path.Combine(album, "out");
+        Directory.CreateDirectory(into);
+        var keep = Path.Combine(album, "photo.txt");
+        File.WriteAllText(keep, "precious");
+        try
+        {
+            // fsutil may refuse to set a short name without admin; when the
+            // volume already made one (or lets us set one) the case is real.
+            var shortAlbum = Path.Combine(root, "ALBUM~1");
+            if (!Directory.Exists(shortAlbum))
+            {
+                var info = new System.Diagnostics.ProcessStartInfo("fsutil.exe", $"file setshortname \"{album}\" ALBUM~1")
+                {
+                    UseShellExecute = false, CreateNoWindow = true,
+                    RedirectStandardOutput = true, RedirectStandardError = true,
+                };
+                using var process = System.Diagnostics.Process.Start(info)!;
+                process.WaitForExit();
+            }
+            if (Directory.Exists(shortAlbum))
+            {
+                AssertRefusedAndWhole(album, keep, Path.Combine(shortAlbum, "out"));
+            }
+            // Always holds: the plain descendant is refused too.
+            AssertRefusedAndWhole(album, keep, into);
+        }
+        finally
+        {
+            Cleanup(root);
+        }
+    }
+
+    [Fact]
+    public void ADescendantThroughASubstDriveIsRefused()
+    {
+        var root = NewRoot();
+        var (album, _, keep) = MakeAlbum(root);
+        var free = "PQRSTUVWXYZ".Select(c => $"{c}:").FirstOrDefault(d => !Directory.Exists(d + @"\"));
+        Assert.NotNull(free);
+        try
+        {
+            RunCmd($"subst {free} \"{album}\"");
+            try
+            {
+                AssertRefusedAndWhole(album, keep, free + @"\out");
+                AssertRefusedAndWhole(album, keep, free + @"\");
+            }
+            finally
+            {
+                RunCmd($"subst {free} /d");
+            }
+        }
+        finally
+        {
+            Cleanup(root);
+        }
+    }
+
+    [Fact]
+    public void AFolderMovesToASiblingNamedThroughAUncAlias()
+    {
+        // Same disk, but Windows calls a local path and its UNC alias different
+        // devices, so the rename fails with ERROR_NOT_SAME_DEVICE and the move
+        // must fall back to copy then delete, keeping every byte.
+        var root = NewRoot();
+        var (album, _, _) = MakeAlbum(root);
+        File.WriteAllText(Path.Combine(album, "out", "deep.txt"), "deep");
+        var sibling = Path.Combine(root, "sibling");
+        Directory.CreateDirectory(sibling);
+        try
+        {
+            Assert.False(FileIdentity.IsSameOrBeneath(UncAlias(sibling), album));
+            var landed = MoveAction.MoveInto(album, UncAlias(sibling));
+            Assert.False(Directory.Exists(album));
+            Assert.Equal("precious", File.ReadAllText(Path.Combine(sibling, "album", "photo.txt")));
+            Assert.Equal("deep", File.ReadAllText(Path.Combine(sibling, "album", "out", "deep.txt")));
+            Assert.EndsWith(@"sibling\album", landed);
+        }
+        finally
+        {
+            Cleanup(root);
+        }
+    }
+
+    [Fact]
+    public void AFolderMovesToASiblingOnTheSameVolumeByRename()
+    {
+        var root = NewRoot();
+        var (album, _, _) = MakeAlbum(root);
+        var sibling = Path.Combine(root, "sibling");
+        Directory.CreateDirectory(sibling);
+        try
+        {
+            var before = FileIdentity.Of(album);
+            var landed = MoveAction.MoveInto(album, sibling);
+            // A rename keeps the folder's identity; a copy would not.
+            Assert.Equal(before, FileIdentity.Of(landed));
+            Assert.Equal("precious", File.ReadAllText(Path.Combine(landed, "photo.txt")));
+        }
+        finally
+        {
+            Cleanup(root);
+        }
+    }
+
+    [Fact]
+    public void ACopyFallbackRefusesATreeHoldingALinkBeforeCopying()
+    {
+        var root = NewRoot();
+        var (album, into, keep) = MakeAlbum(root);
+        var elsewhere = Path.Combine(root, "elsewhere");
+        Directory.CreateDirectory(elsewhere);
+        var target = Path.Combine(root, "copy");
+        try
+        {
+            RunCmd($"mklink /J \"{Path.Combine(into, "link")}\" \"{elsewhere}\"");
+            Assert.Throws<IOException>(() => MoveAction.CopyTree(album, target));
+            Assert.False(Directory.Exists(target));
+            Assert.Equal("precious", File.ReadAllText(keep));
+        }
+        finally
+        {
+            Cleanup(root);
+        }
+    }
+
     // --- RecentFolders ------------------------------------------------------
 
     [Fact]
