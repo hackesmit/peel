@@ -1064,7 +1064,7 @@ def annotate(job: Job) -> Result:
     img = load(source)
     try:
         base = to_rgba(img)
-        shapes = [_fit_shape(shape, base.size) for shape in shapes]
+        shapes = [fit for fit in (_fit_shape(shape, base.size) for shape in shapes) if fit is not None]
         overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
         for shape in shapes:
@@ -1125,8 +1125,12 @@ def _check_shapes(raw: Any) -> list[dict[str, Any]]:
     return shapes
 
 
-def _fit_shape(shape: dict[str, Any], size: tuple[int, int]) -> dict[str, Any]:
+def _fit_shape(shape: dict[str, Any], size: tuple[int, int]) -> dict[str, Any] | None:
     """Clamp a shape's line width and text size to the image.
+
+    Returns None for a box shape whose box does not touch the image at all:
+    pillow draws a box outline inside the box, so nothing of it would show,
+    and clamping it would squash it onto the image edge (hq-plct.2 review 3).
 
     Nothing wider than the image's diagonal can show more than a stroke that
     covers it, and pillow draws a wide outline one pixel ring at a time, so
@@ -1145,6 +1149,10 @@ def _fit_shape(shape: dict[str, Any], size: tuple[int, int]) -> dict[str, Any]:
         margin = fitted["width"]
         width, height = size
         left, top, right, bottom = shape["box"]
+        lo_x, hi_x = min(left, right), max(left, right)
+        lo_y, hi_y = min(top, bottom), max(top, bottom)
+        if hi_x < 0 or hi_y < 0 or lo_x > width - 1 or lo_y > height - 1:
+            return None
         fitted["box"] = (
             min(max(left, -margin), width + margin),
             min(max(top, -margin), height + margin),
