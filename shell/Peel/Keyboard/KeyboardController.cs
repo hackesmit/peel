@@ -28,6 +28,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using System.Windows.Threading;
+using Peel.Actions;
 using Peel.Engine;
 using Peel.Hooks;
 using Peel.Jobs;
@@ -262,11 +263,11 @@ internal sealed class KeyboardController
         }
         if (entry.IsShellAction)
         {
-            // Share, Float, Terminal and the rest are Windows UI, not engine
-            // work; the file-actions bead builds them. Same message the drop
-            // path gives.
-            Log.Write($"{entry.Id} is a shell action and is not built yet");
-            _jobs.Report($"{entry.Label} is not built yet.");
+            // Share, Float, Copy, Move and Terminal are Windows UI, not engine
+            // work; ActionHost performs them, the same as the drop path. OnKey
+            // runs on the UI thread (a WPF key event), which is where ActionHost
+            // needs to be called.
+            ActionHost.Run(entry, files, _jobs, _ui);
             return;
         }
         var parameters = new Dictionary<string, string>();
