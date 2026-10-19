@@ -178,6 +178,34 @@ def register(registry: Registry) -> None:
     _register_spreadsheets(registry)
     _register_subtitles(registry)
     _register_tools(registry)
+    _scope_gate_notes(registry)
+
+
+def _scope_gate_notes(registry: Registry) -> None:
+    """Give every docs runner a fresh set of gate notes for its own job.
+
+    The notes are reset when a runner starts and again when it ends, however
+    it ends, so a failed job can never lend its notes to a later result.
+    """
+    prefix = f"{RUNNER}:"
+    names = {a.runner[len(prefix):] for a in registry.all()
+             if isinstance(getattr(a, "runner", None), str) and a.runner.startswith(prefix)}
+    module = globals()
+    for name in names:
+        func = module.get(name)
+        if func is None or getattr(func, "_peel_gate_scoped", False):
+            continue
+
+        @functools.wraps(func)
+        def scoped(job: Job, _func: Any = func) -> Result:
+            token = _GATE_NOTES.set(())
+            try:
+                return _func(job)
+            finally:
+                _GATE_NOTES.reset(token)
+
+        scoped._peel_gate_scoped = True  # type: ignore[attr-defined]
+        module[name] = scoped
 
 
 def _register_documents(registry: Registry) -> None:
@@ -1828,7 +1856,9 @@ def _delimited_to_xlsx(job: Job, source: Path, src_ext: str) -> Result:
     book = Workbook()
     sheet = book.active
     sheet.title = _sheet_title(source.stem)
-    width = max((len(cells) for cells in rows), default=0)
+    # At least one column whenever there are records, so a file of blank lines
+    # still keeps one (empty) row per record.
+    width = max(max((len(cells) for cells in rows), default=0), 1 if rows else 0)
     for number, cells in enumerate(rows, start=1):
         cells = list(cells) + [""] * (width - len(cells))
         for column, text in enumerate(cells, start=1):

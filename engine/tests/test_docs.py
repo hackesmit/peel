@@ -1925,3 +1925,38 @@ def test_csv_trailing_empty_records_and_columns_survive_in_xlsx(tmp_path):
     assert res.ok, res.message
     ws = load_workbook(res.outputs[0]).active
     assert ws.max_row == 3 and ws.max_column == 3
+
+
+def test_csv_of_blank_lines_keeps_its_records_in_xlsx(tmp_path):
+    from openpyxl import load_workbook
+    from peel_engine.registry import load_registry
+
+    src = tmp_path / "blanks.csv"
+    src.write_bytes(b"\n\n")
+    res = load_registry().run("docs.sheet_to_xlsx", [src])
+    assert res.ok, res.message
+    ws = load_workbook(res.outputs[0]).active
+    assert ws.max_row == 2
+
+
+def test_gate_notes_do_not_leak_from_a_failed_job(tmp_path, monkeypatch):
+    from peel_engine.families import docs
+    from peel_engine.registry import load_registry
+
+    reg = load_registry()
+    action = next(a for a in reg.all() if a.id == "docs.sheet_to_xlsx")
+    name = action.runner.split(":")[1]
+    real = getattr(docs, name)
+
+    def failing(job):
+        docs._GATE_NOTES.set(docs._GATE_NOTES.get() + ("stale.docx (word/_rels/document.xml.rels)",))
+        raise docs.RunnerFailed("boom")
+
+    monkeypatch.setattr(docs, name, failing)
+    docs._scope_gate_notes(reg)
+    src = tmp_path / "a.csv"
+    src.write_bytes(b"x,y\n1,2\n")
+    assert not reg.run("docs.sheet_to_xlsx", [src]).ok
+    monkeypatch.setattr(docs, name, real)
+    res = reg.run("docs.sheet_to_xlsx", [src])
+    assert res.ok and "stale.docx" not in res.message
