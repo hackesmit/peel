@@ -17,17 +17,32 @@ internal sealed record DraggedFile(string Path, string Extension, bool IsDirecto
     /// Extensions are compared the way the engine normalises them: no dot,
     /// lower case. A folder has no extension.
     /// </summary>
-    internal static DraggedFile FromPath(string path)
+    internal static DraggedFile FromPath(string path) => Classify(path, Directory.Exists);
+
+    /// <summary>
+    /// Ask the filesystem. Slow on a dead network share, so the wheel only
+    /// calls this off the UI thread (FileClassifier).
+    /// </summary>
+    internal static DraggedFile Classify(string path, Func<string, bool> isDirectory)
     {
-        var isDirectory = false;
+        var folder = false;
         try
         {
-            isDirectory = Directory.Exists(path);
+            folder = isDirectory(path);
         }
         catch (Exception)
         {
             // An unreadable path is treated as a file; `peel run` reports it.
         }
+        return Make(path, folder);
+    }
+
+    /// <summary>A guess from the name alone, for when the filesystem is too slow to answer.</summary>
+    internal static DraggedFile Guess(string path) =>
+        Make(path, System.IO.Path.GetExtension(path).Length == 0);
+
+    private static DraggedFile Make(string path, bool isDirectory)
+    {
         var extension = isDirectory ? string.Empty : System.IO.Path.GetExtension(path).TrimStart('.').ToLowerInvariant();
         return new DraggedFile(path, extension, isDirectory);
     }

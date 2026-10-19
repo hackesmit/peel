@@ -9,14 +9,27 @@
 //   3. The child process gets UTF-8 forced on stdout, because Python under a
 //      redirected pipe on Windows otherwise picks the ANSI code page and
 //      mangles (or fails on) non ASCII file names.
+//
+// Every engine process runs in a kill on close job object of its own
+// (Jobs/ProcessJob.cs). The timeout covers the process exit and the draining
+// of both pipes, because a backend the engine started can inherit the pipes
+// and keep them open after the engine has exited; on expiry the whole job is
+// terminated, which closes the pipes and lets the readers finish.
+//
+// Windows caps a command line at 32767 characters. A drag of a few hundred
+// photos is longer than that, so past CommandLineBudget the paths go to a
+// temporary UTF-8 list file passed as --files-from, deleted afterwards.
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Peel.Jobs;
 
 namespace Peel.Engine;
 
@@ -31,6 +44,8 @@ internal sealed class EngineClient
     };
 
     private readonly Lazy<EngineLocation?> _location;
+    private readonly ConcurrentDictionary<ProcessJob, byte> _live = new();
+    private volatile bool _closed;
 
     internal EngineClient() => _location = new Lazy<EngineLocation?>(Locate, isThreadSafe: true);
 
@@ -38,7 +53,26 @@ internal sealed class EngineClient
 
     internal TimeSpan RunTimeout { get; init; } = TimeSpan.FromMinutes(30);
 
+    /// <summary>
+    /// Past this many characters the file paths go in a list file. Windows
+    /// allows 32767; the margin covers the executable, the prefix and quoting.
+    /// </summary>
+    internal int CommandLineBudget { get; init; } = 24000;
+
     internal EngineLocation? Location => _location.Value;
+
+    /// <summary>
+    /// Quitting: refuse new runs and end every engine process that is still
+    /// going, with everything it started. Safe to call from any thread.
+    /// </summary>
+    internal void KillAll()
+    {
+        _closed = true;
+        foreach (var job in _live.Keys)
+        {
+            job.Terminate();
+        }
+    }
 
     /// <summary>
     /// Where the CLI is. Only real executables are ever run. The installer
@@ -51,7 +85,9 @@ internal sealed class EngineClient
     private static EngineLocation? Locate()
     {
         var overridden = Environment.GetEnvironmentVariable("PEEL_CLI");
-        if (!string.IsNullOrWhiteSpace(overridden) && File.Exists(overridden))
+        // Only an .exe: a .cmd or .bat would be run through cmd.exe.
+        if (!string.IsNullOrWhiteSpace(overridden) && File.Exists(overridden)
+            && string.Equals(Path.GetExtension(overridden), ".exe", StringComparison.OrdinalIgnoreCase))
         {
             return new EngineLocation(overridden, Array.Empty<string>(), "PEEL_CLI");
         }
@@ -91,9 +127,8 @@ internal sealed class EngineClient
 
     internal async Task<OptionsResult> OptionsAsync(IReadOnlyList<string> files, CancellationToken token = default)
     {
-        var arguments = new List<string> { "options" };
-        arguments.AddRange(files);
-        var (output, error, code) = await RunProcessAsync(arguments, OptionsTimeout, token).ConfigureAwait(false);
+        var (output, error, code) = await RunProcessAsync(
+            new[] { "options" }, files, Array.Empty<string>(), OptionsTimeout, token).ConfigureAwait(false);
         if (code is null)
         {
             return OptionsResult.Failed(error, "shell_engine");
@@ -112,17 +147,17 @@ internal sealed class EngineClient
         IReadOnlyDictionary<string, string>? parameters = null,
         CancellationToken token = default)
     {
-        var arguments = new List<string> { "run", actionId };
-        arguments.AddRange(files);
+        var tail = new List<string>();
         if (parameters is not null)
         {
             foreach (var pair in parameters)
             {
-                arguments.Add("--param");
-                arguments.Add($"{pair.Key}={pair.Value}");
+                tail.Add("--param");
+                tail.Add($"{pair.Key}={pair.Value}");
             }
         }
-        var (output, error, code) = await RunProcessAsync(arguments, RunTimeout, token).ConfigureAwait(false);
+        var (output, error, code) = await RunProcessAsync(
+            new[] { "run", actionId }, files, tail, RunTimeout, token).ConfigureAwait(false);
         if (code is null)
         {
             return RunResult.Failed(error, "shell_engine");
@@ -169,12 +204,58 @@ internal sealed class EngineClient
     }
 
     /// <summary>
+    /// The arguments for one call: the paths inline when they fit, otherwise
+    /// a list file. Returns the list file path (to delete) or null.
+    /// </summary>
+    internal static string? Arrange(
+        EngineLocation location,
+        IReadOnlyList<string> head,
+        IReadOnlyList<string> files,
+        IReadOnlyList<string> tail,
+        int budget,
+        List<string> arguments)
+    {
+        arguments.Clear();
+        arguments.AddRange(location.Prefix);
+        arguments.AddRange(head);
+        var length = location.FileName.Length + 3;
+        foreach (var argument in arguments.Concat(files).Concat(tail))
+        {
+            // Quotes, a separating space and a little for escaped backslashes.
+            length += argument.Length + 4;
+        }
+        string? listFile = null;
+        if (length > budget && files.Count > 0)
+        {
+            var folder = Path.Combine(Path.GetTempPath(), "Peel");
+            Directory.CreateDirectory(folder);
+            listFile = Path.Combine(folder, $"files-{Guid.NewGuid():N}.txt");
+            var text = new StringBuilder();
+            foreach (var file in files)
+            {
+                text.Append(file).Append('\n');
+            }
+            File.WriteAllText(listFile, text.ToString(), new UTF8Encoding(false));
+            arguments.Add("--files-from");
+            arguments.Add(listFile);
+        }
+        else
+        {
+            arguments.AddRange(files);
+        }
+        arguments.AddRange(tail);
+        return listFile;
+    }
+
+    /// <summary>
     /// Returns stdout, stderr and the exit code. A null exit code means the
     /// process could not be started or had to be killed; stderr then holds the
     /// message to show.
     /// </summary>
     private async Task<(string Output, string Error, int? ExitCode)> RunProcessAsync(
-        IReadOnlyList<string> arguments,
+        IReadOnlyList<string> head,
+        IReadOnlyList<string> files,
+        IReadOnlyList<string> tail,
         TimeSpan timeout,
         CancellationToken token)
     {
@@ -185,7 +266,50 @@ internal sealed class EngineClient
                 "The Peel engine is not installed. Run install\\setup.ps1, then start Peel again.",
                 null);
         }
+        if (_closed)
+        {
+            return (string.Empty, "Peel is quitting.", null);
+        }
 
+        var arguments = new List<string>();
+        string? listFile;
+        try
+        {
+            listFile = Arrange(location, head, files, tail, CommandLineBudget, arguments);
+        }
+        catch (Exception error)
+        {
+            Log.Write("cannot write the file list for the engine", error);
+            return (string.Empty, $"Peel could not pass {files.Count} files to the engine: {error.Message}", null);
+        }
+        var what = $"{head[0]} {(head.Count > 1 ? head[1] : string.Empty)}".Trim();
+        try
+        {
+            return await RunListedAsync(location, arguments, what, timeout, token).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (listFile is not null)
+            {
+                try
+                {
+                    File.Delete(listFile);
+                }
+                catch (Exception error)
+                {
+                    Log.Write($"cannot delete the file list {listFile}", error);
+                }
+            }
+        }
+    }
+
+    private async Task<(string Output, string Error, int? ExitCode)> RunListedAsync(
+        EngineLocation location,
+        IReadOnlyList<string> arguments,
+        string what,
+        TimeSpan timeout,
+        CancellationToken token)
+    {
         var start = new ProcessStartInfo
         {
             FileName = location.FileName,
@@ -196,10 +320,6 @@ internal sealed class EngineClient
             StandardOutputEncoding = Encoding.UTF8,
             StandardErrorEncoding = Encoding.UTF8,
         };
-        foreach (var argument in location.Prefix)
-        {
-            start.ArgumentList.Add(argument);
-        }
         foreach (var argument in arguments)
         {
             start.ArgumentList.Add(argument);
@@ -208,6 +328,7 @@ internal sealed class EngineClient
         start.Environment["PYTHONUTF8"] = "1";
 
         var watch = Stopwatch.StartNew();
+        var job = ProcessJob.Create();
         using var process = new Process { StartInfo = start };
         try
         {
@@ -215,36 +336,107 @@ internal sealed class EngineClient
         }
         catch (Exception error)
         {
+            job?.Dispose();
             Log.Write($"cannot start the engine at {location.FileName}", error);
             return (string.Empty, $"Cannot start the Peel engine ({location.Description}): {error.Message}", null);
         }
 
+        if (job is not null)
+        {
+            if (job.Assign(process))
+            {
+                _live[job] = 0;
+            }
+            else
+            {
+                job.Dispose();
+                job = null;
+            }
+        }
+
         using var limit = CancellationTokenSource.CreateLinkedTokenSource(token);
         limit.CancelAfter(timeout);
-        var output = process.StandardOutput.ReadToEndAsync();
-        var error2 = process.StandardError.ReadToEndAsync();
+        var output = process.StandardOutput.ReadToEndAsync(limit.Token);
+        var errors = process.StandardError.ReadToEndAsync(limit.Token);
         try
         {
+            if (_closed)
+            {
+                // Quit arrived between the check above and the start.
+                throw new OperationCanceledException();
+            }
             await process.WaitForExitAsync(limit.Token).ConfigureAwait(false);
+            // The engine has exited, but a backend it started may still hold
+            // the pipes. The same deadline covers reading them to the end.
+            await Task.WhenAll(output, errors).WaitAsync(limit.Token).ConfigureAwait(false);
+            var stdout = await output.ConfigureAwait(false);
+            var stderr = await errors.ConfigureAwait(false);
+            Log.Write($"engine {what} exit={process.ExitCode} in {watch.ElapsedMilliseconds}ms");
+            return (stdout, stderr, process.ExitCode);
         }
         catch (OperationCanceledException)
         {
-            try
-            {
-                process.Kill(entireProcessTree: true);
-            }
-            catch (Exception)
-            {
-                // Already gone.
-            }
-            var reason = token.IsCancellationRequested ? "was cancelled" : $"took longer than {timeout.TotalSeconds:0} seconds";
-            Log.Write($"engine {string.Join(' ', arguments)} {reason}");
+            Stop(process, job);
+            await Observe(output, errors).ConfigureAwait(false);
+            var reason = _closed ? "was stopped because Peel quit"
+                : token.IsCancellationRequested ? "was cancelled"
+                : $"took longer than {timeout.TotalSeconds:0} seconds";
+            Log.Write($"engine {what} {reason}");
             return (string.Empty, $"The Peel engine {reason}.", null);
         }
+        finally
+        {
+            if (job is not null)
+            {
+                _live.TryRemove(job, out _);
+                // Kill on close: anything the engine left running goes too.
+                job.Dispose();
+            }
+        }
+    }
 
-        var stdout = await output.ConfigureAwait(false);
-        var stderr = await error2.ConfigureAwait(false);
-        Log.Write($"engine {arguments[0]} {(arguments.Count > 1 ? arguments[1] : string.Empty)} exit={process.ExitCode} in {watch.ElapsedMilliseconds}ms");
-        return (stdout, stderr, process.ExitCode);
+    /// <summary>End the engine and everything it started, then close our pipe ends.</summary>
+    private static void Stop(Process process, ProcessJob? job)
+    {
+        if (job is not null)
+        {
+            job.Terminate();
+        }
+        try
+        {
+            process.Kill(entireProcessTree: true);
+        }
+        catch (Exception)
+        {
+            // Already gone, or the job took it.
+        }
+        try
+        {
+            process.StandardOutput.Close();
+            process.StandardError.Close();
+        }
+        catch (Exception)
+        {
+        }
+    }
+
+    /// <summary>
+    /// Wait a moment for the readers to finish once their writers are dead,
+    /// and observe whatever they ended with so nothing is left unobserved.
+    /// </summary>
+    private static async Task Observe(params Task[] readers)
+    {
+        try
+        {
+            await Task.WhenAll(readers).WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // Cancelled, broken pipe or still blocked: all expected here.
+        }
+        foreach (var reader in readers)
+        {
+            _ = reader.Exception;
+        }
     }
 }

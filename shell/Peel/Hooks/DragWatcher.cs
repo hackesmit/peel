@@ -17,7 +17,8 @@ internal sealed class DragWatcher : IDisposable
         _ui = ui;
         _state = new DragStateMachine(
             Native.GetSystemMetrics(Native.SM_CXDRAG),
-            Native.GetSystemMetrics(Native.SM_CYDRAG));
+            Native.GetSystemMetrics(Native.SM_CYDRAG),
+            new WindowsDragProbe());
         _hooks.Mouse += OnMouse;
         _hooks.Key += OnKey;
     }
@@ -51,8 +52,12 @@ internal sealed class DragWatcher : IDisposable
                 return;
 
             case DragSignal.DragEnded:
-                Log.Write("drag end");
+                Log.Write(update.Note.Length > 0 ? $"drag end ({update.Note})" : "drag end");
                 Post(() => DragEnded?.Invoke());
+                return;
+
+            case DragSignal.WheelRefused:
+                Log.Write($"modifier {update.Modifier} tapped, no wheel: {update.Note}");
                 return;
 
             case DragSignal.Cancel:

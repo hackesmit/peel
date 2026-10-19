@@ -87,12 +87,156 @@ internal static class Native
     [DllImport("user32.dll")]
     private static extern short GetAsyncKeyState(int key);
 
+    internal const int SM_SWAPBUTTON = 23;
+
     /// <summary>
-    /// The physical state of the left button, asked of Windows rather than
+    /// The physical state of the primary button, asked of Windows rather than
     /// remembered from the hook. A low level hook that answers too slowly is
-    /// skipped silently, so a button up can go missing; this cannot.
+    /// skipped silently, and a button up over an elevated window or a secure
+    /// desktop never reaches a medium integrity hook, so a button up can go
+    /// missing; this cannot. GetAsyncKeyState reads physical buttons, so with
+    /// the buttons swapped the primary one is VK_RBUTTON.
     /// </summary>
-    internal static bool LeftButtonDown() => (GetAsyncKeyState(0x01) & 0x8000) != 0;
+    internal static bool LeftButtonDown()
+    {
+        var key = GetSystemMetrics(SM_SWAPBUTTON) != 0 ? 0x02 : 0x01;
+        return (GetAsyncKeyState(key) & 0x8000) != 0;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct GUITHREADINFO
+    {
+        public int Size;
+        public int Flags;
+        public IntPtr Active;
+        public IntPtr Focus;
+        public IntPtr Capture;
+        public IntPtr MenuOwner;
+        public IntPtr MoveSize;
+        public IntPtr Caret;
+        public RECT CaretRect;
+    }
+
+    internal const int GUI_INMOVESIZE = 0x00000002;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetGUIThreadInfo(uint threadId, ref GUITHREADINFO info);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr WindowFromPoint(POINT point);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder name, int size);
+
+    /// <summary>
+    /// GUI state of a thread (0 means the foreground thread). None of these
+    /// calls sends a message to the other process, so they cannot hang on a
+    /// window that has stopped responding; they are safe on the hook thread.
+    /// </summary>
+    internal static bool ThreadInfo(uint threadId, out GUITHREADINFO info)
+    {
+        info = new GUITHREADINFO { Size = Marshal.SizeOf<GUITHREADINFO>() };
+        return GetGUIThreadInfo(threadId, ref info);
+    }
+
+    /// <summary>The thread that owns the top level window under a screen point, or 0.</summary>
+    internal static uint ThreadAt(int x, int y)
+    {
+        var hwnd = WindowFromPoint(new POINT { X = x, Y = y });
+        return hwnd == IntPtr.Zero ? 0 : GetWindowThreadProcessId(hwnd, out _);
+    }
+
+    internal static string ClassOf(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero)
+        {
+            return string.Empty;
+        }
+        var name = new System.Text.StringBuilder(128);
+        return GetClassName(hwnd, name, name.Capacity) > 0 ? name.ToString() : string.Empty;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LASTINPUTINFO
+    {
+        public int Size;
+        public uint Time;
+    }
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
+
+    /// <summary>Tick count (GetTickCount clock) of the last input in this session, or null.</summary>
+    internal static uint? LastInputTick()
+    {
+        var info = new LASTINPUTINFO { Size = Marshal.SizeOf<LASTINPUTINFO>() };
+        return GetLastInputInfo(ref info) ? info.Time : null;
+    }
+
+    // Job objects: every engine process lives in one, so quitting or killing
+    // Peel takes the engine and anything it started down with it.
+    internal const int JobObjectExtendedLimitInformation = 9;
+    internal const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    internal static extern IntPtr CreateJobObject(IntPtr attributes, string? name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info, int size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool CloseHandle(IntPtr handle);
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

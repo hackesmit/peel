@@ -41,12 +41,14 @@ written, and breaking one of them breaks the feature quietly.
   delivers `DragDrop` after the low level hook sees the button up; hiding at
   once turns the drop into a `DragLeave` and the user loses it. The wheel waits
   500 ms.
-- **The hole is cut only once the drag data has arrived** (or after 450 ms if
-  it never does). At the moment the wheel opens the pointer is at its centre,
-  so a window that already had a hole would never be offered the data.
+- **The hole is cut only once the drag data has arrived.** At the moment the
+  wheel opens the pointer is at its centre, so a window that already had a
+  hole would never be offered the data. Until then the window region is the
+  ring's whole disc, never the square, so a quick drop in a corner outside the
+  ring still falls through.
 
-A consequence worth knowing: the wheel reads "..." until the pointer reaches
-the ring, because that is when OLE offers the data. Moving towards a segment is
+A consequence worth knowing: the wheel reads "..." until the pointer moves,
+because that is when OLE offers the data. Moving towards a segment is
 exactly the motion that fills it in.
 
 Two safety nets sit behind them. `Wheel/StuckOverlayWatch.cs` asks Windows for
@@ -123,3 +125,41 @@ cannot leave a tray app behind.
 - Toasts are placed from the primary monitor's work area, so on a multi monitor
   setup with mixed scaling they can land slightly off. The wheel itself is per
   monitor DPI aware.
+
+## Which drags get a wheel (review round 1)
+
+- **Only file drags.** When the modifier is tapped, the hook asks Windows for
+  the physical primary button (GetAsyncKeyState); if it is up, a button up was
+  missed (released over an elevated window, Win+L, a UAC prompt) and the drag
+  is ended instead of opening a wheel. A window being moved or sized by its
+  title bar or border is refused too: Windows flags that thread with
+  GUI_INMOVESIZE, which `Hooks/WindowsDragProbe.cs` reads with
+  GetGUIThreadInfo, a call that sends no message and so cannot hang on a dead
+  window. WM_NCHITTEST was not used because it is a message to the other
+  process.
+- **The wheel steps aside for anything else.** If OLE offers data with no
+  file paths (text, a browser image, an Outlook attachment that is only
+  FileContents, which Peel does not support), the wheel is dismissed at once
+  and the next pointer move gives the drag back to the window below. If the
+  pointer moves over the wheel and no OLE drag ever enters it (text selection,
+  a rubber band), it leaves 350 ms later (`Wheel/ArrivalWatch.cs`).
+- **One drag, one session.** A new drag, or a fresh showing, ends the previous
+  session: wheel, timers, paths and pending `peel options` call. A drop is
+  accepted only if its own data names the paths the session read.
+- **No filesystem work in OLE callbacks.** Telling folders from files runs on
+  the thread pool with a 1.5 s deadline (`Wheel/FileClassifier.cs`); past it,
+  names decide, and `peel run` checks for real.
+
+## Engine processes
+
+- Each engine call runs in its own kill on close job object
+  (`Jobs/ProcessJob.cs`): a timeout, a cancel or Quit terminates the whole
+  tree, and if Peel itself dies Windows does it. The timeout covers reading
+  the pipes as well as the exit, since a backend can hold them open.
+- Past 24000 characters of command line the paths go to the engine in a
+  temporary UTF-8 list file (`peel options|run --files-from`), deleted after.
+- A result carrying `data.clipboard_text` (Copy Path) is put on the clipboard
+  on the UI thread, retried while another app holds it; the toast says so if
+  it never gets through.
+- The hooks are checked every 5 s against GetLastInputInfo and reinstalled if
+  Windows has silently dropped them (`Hooks/HookLiveness.cs`).

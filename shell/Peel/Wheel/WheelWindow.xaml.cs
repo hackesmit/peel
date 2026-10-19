@@ -1,8 +1,7 @@
 // The overlay: a topmost, never activated, per pixel transparent window that
 // is also an OLE drop target.
 //
-// Two things here are load bearing and were proven by the spike in
-// spikes/drag-overlay before any of this was written:
+// Load bearing, proven by the spike in spikes/drag-overlay:
 //
 //   * The window must not be hidden the moment the hook sees the button come
 //     up. OLE delivers DragDrop after that, and hiding first turns the drop
@@ -12,9 +11,18 @@
 //     region, so dropping in the middle reaches the window below and the
 //     normal Explorer drop happens, which is what "cancel" has to mean.
 //
-// The hole is cut only once the drag data has arrived. At the moment the wheel
-// opens the pointer is at the centre, so a window with a hole would never be
-// offered the data and the wheel would have nothing to show.
+// The window region is always the ring's disc, never the square: before the
+// drag data arrives it is the whole disc (the pointer starts at the centre and
+// the window has to be under it to be offered the data), and once the files
+// are known the hub is cut out. A drop in a square corner outside the ring
+// therefore always falls through.
+//
+// One showing of the wheel is one session. The paths it read from OLE belong
+// to that session only: HideNow forgets them, and a drop is accepted only when
+// the drop's own data names the same paths the session read. A drag whose
+// data carries no file paths dismisses the wheel at once, and so does a
+// gesture that moves over the wheel without OLE ever entering it (text
+// selection, a rubber band, a source OLE cannot reach this window from).
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -30,10 +38,16 @@ internal partial class WheelWindow : Window
 {
     private readonly WheelRenderer _renderer = new();
     private readonly DispatcherTimer _hideTimer;
-    private readonly DispatcherTimer _holeTimer;
+    private readonly DispatcherTimer _arrivalTimer;
     private readonly DispatcherTimer _dwellTimer;
+    private readonly ArrivalWatch _arrival = new(
+        Math.Max(8, 2 * Math.Max(Native.GetSystemMetrics(Native.SM_CXDRAG), Native.GetSystemMetrics(Native.SM_CYDRAG))));
+    private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
     private IntPtr _handle;
     private bool _holeCut;
+    private bool _rejected;
+    private int _shownX;
+    private int _shownY;
     private string[] _files = Array.Empty<string>();
 
     internal WheelWindow()
@@ -44,10 +58,9 @@ internal partial class WheelWindow : Window
         Root.Children.Add(_renderer);
 
         _hideTimer = Timer(TimeSpan.FromMilliseconds(500), () => HideNow("timer"));
-        // If the drag source never offers us data (an elevated window, or a
-        // source with no file format), cut the hole anyway so the user can
-        // still drop through the middle onto whatever is below.
-        _holeTimer = Timer(TimeSpan.FromMilliseconds(450), CutHole);
+        // Watches for a gesture that is not an OLE drag: see ArrivalWatch.
+        _arrivalTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(100) };
+        _arrivalTimer.Tick += (_, _) => OnArrivalTick();
         _dwellTimer = Timer(TimeSpan.FromMilliseconds(650), OnDwell);
 
         _handle = new WindowInteropHelper(this).EnsureHandle();
@@ -68,6 +81,9 @@ internal partial class WheelWindow : Window
 
     /// <summary>The pointer rested on the More segment: turn the page.</summary>
     internal event Action? MoreRequested;
+
+    /// <summary>The wheel went away and forgot its session. Carries the reason.</summary>
+    internal event Action<string>? Hidden;
 
     internal WheelPlan Plan => _renderer.Plan;
 
@@ -91,16 +107,21 @@ internal partial class WheelWindow : Window
         var side = (int)Math.Round(WheelGeometry.Default.Size * scale);
         var left = screenX - (side / 2);
         var top = screenY - (side / 2);
-        ClearHole();
         Native.SetWindowPos(_handle, Native.HWND_TOPMOST, left, top, side, side, Native.SWP_NOACTIVATE);
+        // Disc first, before the window is visible: no frame ever shows a
+        // hit testable square.
+        SetRegion(side, withHub: false);
         if (!IsVisible)
         {
             Show();
         }
         Native.SetWindowPos(_handle, Native.HWND_TOPMOST, left, top, side, side,
             Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW);
-        _holeTimer.Stop();
-        _holeTimer.Start();
+        _shownX = screenX;
+        _shownY = screenY;
+        _arrival.Reset();
+        _arrivalTimer.Stop();
+        _arrivalTimer.Start();
         Log.Write($"wheel shown at {screenX},{screenY} ({side}px, scale {scale:0.##})");
     }
 
@@ -126,24 +147,31 @@ internal partial class WheelWindow : Window
         _hideTimer.Start();
     }
 
+    /// <summary>
+    /// Take the wheel off the screen and forget the session, visible or not:
+    /// the paths of one drag must never serve another.
+    /// </summary>
     internal void HideNow(string reason)
     {
         _hideTimer.Stop();
-        _holeTimer.Stop();
+        _arrivalTimer.Stop();
         _dwellTimer.Stop();
+        _files = Array.Empty<string>();
+        _rejected = false;
+        _renderer.SetHot(-1);
         if (!IsVisible)
         {
             return;
         }
         Log.Write($"wheel hidden ({reason})");
         Hide();
-        ClearHole();
-        _files = Array.Empty<string>();
-        _renderer.SetHot(-1);
+        ClearRegion();
+        Hidden?.Invoke(reason);
     }
 
     private void OnDragEnter(object sender, DragEventArgs e)
     {
+        _arrival.Entered();
         TakeFiles(e);
         Track(e);
         e.Handled = true;
@@ -151,6 +179,7 @@ internal partial class WheelWindow : Window
 
     private void OnDragOver(object sender, DragEventArgs e)
     {
+        _arrival.Entered();
         if (_files.Length == 0)
         {
             TakeFiles(e);
@@ -168,47 +197,76 @@ internal partial class WheelWindow : Window
 
     private void OnDrop(object sender, DragEventArgs e)
     {
-        TakeFiles(e);
+        e.Handled = true;
+        // The drop's own data, read now. It has to name exactly the paths
+        // this session read on DragEnter; anything else is a drop from some
+        // other drag landing on a wheel that is still on screen.
+        var paths = DropData.FilePaths(e.Data);
+        if (_rejected || _files.Length == 0 || paths is null || !paths.SequenceEqual(_files, StringComparer.Ordinal))
+        {
+            Log.Write($"drop refused: the drop's data does not match this wheel's drag ({paths?.Length ?? 0} vs {_files.Length} file(s))");
+            e.Effects = DragDropEffects.None;
+            HideNow("drop without matching data");
+            return;
+        }
         var index = SegmentAt(e);
         var plan = _renderer.Plan;
         var segment = index >= 0 && index < plan.Count ? plan.Segments[index] : null;
-        Log.Write($"drop on {(segment is null ? "nothing" : segment.Label)} with {_files.Length} file(s)");
+        Log.Write($"drop on {(segment is null ? "nothing" : segment.Label)} with {paths.Length} file(s)");
         e.Effects = segment is { Runnable: true } ? DragDropEffects.Copy : DragDropEffects.None;
-        e.Handled = true;
         if (segment is not null)
         {
-            Dropped?.Invoke(segment, _files);
+            Dropped?.Invoke(segment, paths);
         }
         HideNow("dropped");
     }
 
+    /// <summary>
+    /// Read the paths once per session. No filesystem call happens here: this
+    /// runs inside OLE's callback while the source's drag loop waits on it.
+    /// </summary>
     private void TakeFiles(DragEventArgs e)
     {
-        if (_files.Length > 0)
+        if (_files.Length > 0 || _rejected)
         {
             return;
         }
-        string[]? paths = null;
-        try
+        var paths = DropData.FilePaths(e.Data);
+        if (paths is null)
         {
-            if (e.Data.GetDataPresent(DataFormats.FileDrop))
-            {
-                paths = e.Data.GetData(DataFormats.FileDrop) as string[];
-            }
-        }
-        catch (Exception error)
-        {
-            // A source can refuse to render a format it advertised.
-            Log.Write("cannot read the drag data", error);
-        }
-        if (paths is null || paths.Length == 0)
-        {
+            // Text, a browser image, an Outlook attachment (FileContents with
+            // no path): not something the engine can take. Leave at once so
+            // the window below gets the drag back on the next pointer move.
+            _rejected = true;
+            e.Effects = DragDropEffects.None;
+            Log.Write($"drag carries no file paths ({DropData.Describe(e.Data)}), wheel dismissed");
+            Dispatcher.BeginInvoke(DispatcherPriority.Send, () => HideNow("not a file drag"));
             return;
         }
         _files = paths;
+        _arrivalTimer.Stop();
         Log.Write($"drag carries {paths.Length} file(s): {string.Join("|", paths.Take(5))}");
         CutHole();
         FilesSeen?.Invoke(paths);
+    }
+
+    private void OnArrivalTick()
+    {
+        if (!IsVisible || _files.Length > 0)
+        {
+            _arrivalTimer.Stop();
+            return;
+        }
+        if (!Native.GetCursorPos(out var point))
+        {
+            return;
+        }
+        var distance = Math.Sqrt(Math.Pow(point.X - _shownX, 2) + Math.Pow(point.Y - _shownY, 2));
+        if (_arrival.ShouldGiveUp(distance, _clock.ElapsedMilliseconds))
+        {
+            Log.Write($"no OLE drag reached the wheel after the pointer moved {distance:0}px, not a file drag");
+            HideNow("no drag data");
+        }
     }
 
     private void Track(DragEventArgs e)
@@ -245,56 +303,57 @@ internal partial class WheelWindow : Window
         }
     }
 
-    /// <summary>
-    /// Cut the hub out of the window so a drop there falls through to the
-    /// window below. Called once the drag data has arrived.
-    /// </summary>
+    /// <summary>Cut the hub out of the disc, once the drag data has arrived.</summary>
     private void CutHole()
     {
-        _holeTimer.Stop();
-        if (_holeCut || !IsVisible)
+        if (_holeCut || !IsVisible || !Native.GetWindowRect(_handle, out var rect))
         {
             return;
         }
-        if (!Native.GetWindowRect(_handle, out var rect))
-        {
-            return;
-        }
-        var side = Math.Min(rect.Width, rect.Height);
+        var applied = SetRegion(Math.Min(rect.Width, rect.Height), withHub: true);
+        Log.Write($"hub hole cut={applied}");
+    }
+
+    /// <summary>
+    /// Make the window's hit region the ring's disc, with or without the hub
+    /// cut out. <paramref name="side"/> is the window side in physical pixels.
+    /// </summary>
+    private bool SetRegion(int side, bool withHub)
+    {
         if (side <= 0)
         {
-            return;
+            return false;
         }
         var scale = side / WheelGeometry.Default.Size;
         var centre = side / 2.0;
         var outer = WheelGeometry.Default.OuterRadius * scale;
-        var inner = WheelGeometry.Default.InnerRadius * scale;
-        var ring = Native.CreateEllipticRgn(
+        var region = Native.CreateEllipticRgn(
             (int)Math.Round(centre - outer), (int)Math.Round(centre - outer),
             (int)Math.Round(centre + outer), (int)Math.Round(centre + outer));
-        var hub = Native.CreateEllipticRgn(
-            (int)Math.Round(centre - inner), (int)Math.Round(centre - inner),
-            (int)Math.Round(centre + inner), (int)Math.Round(centre + inner));
-        var donut = Native.CreateRectRgn(0, 0, 1, 1);
-        Native.CombineRgn(donut, ring, hub, Native.RGN_DIFF);
+        if (withHub)
+        {
+            var inner = WheelGeometry.Default.InnerRadius * scale;
+            var hub = Native.CreateEllipticRgn(
+                (int)Math.Round(centre - inner), (int)Math.Round(centre - inner),
+                (int)Math.Round(centre + inner), (int)Math.Round(centre + inner));
+            var donut = Native.CreateRectRgn(0, 0, 1, 1);
+            Native.CombineRgn(donut, region, hub, Native.RGN_DIFF);
+            Native.DeleteObject(region);
+            Native.DeleteObject(hub);
+            region = donut;
+        }
         // SetWindowRgn takes ownership of the region it is given.
-        var applied = Native.SetWindowRgn(_handle, donut, true) != 0;
-        Native.DeleteObject(ring);
-        Native.DeleteObject(hub);
-        _holeCut = applied;
-        Log.Write($"hub hole cut={applied}");
+        var applied = Native.SetWindowRgn(_handle, region, true) != 0;
         if (!applied)
         {
-            Native.DeleteObject(donut);
+            Native.DeleteObject(region);
         }
+        _holeCut = applied && withHub;
+        return applied;
     }
 
-    private void ClearHole()
+    private void ClearRegion()
     {
-        if (!_holeCut)
-        {
-            return;
-        }
         Native.SetWindowRgn(_handle, IntPtr.Zero, false);
         _holeCut = false;
     }

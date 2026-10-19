@@ -19,6 +19,9 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Peel\Peel.csproj" />
+    <!-- Built alongside so the engine client tests have a real process to
+         drive; not referenced as an assembly. -->
+    <ProjectReference Include="..\tests\FakeEngine\FakeEngine.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

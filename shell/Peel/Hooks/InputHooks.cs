@@ -28,6 +28,7 @@ internal sealed class InputHooks : IDisposable
     private IntPtr _mouseHook;
     private IntPtr _keyHook;
     private long _worstTicks;
+    private int _lastEventTick = Environment.TickCount;
 
     internal InputHooks()
     {
@@ -43,6 +44,13 @@ internal sealed class InputHooks : IDisposable
     internal event Action<KeyHookEvent>? Key;
 
     internal bool Installed => _mouseHook != IntPtr.Zero && _keyHook != IntPtr.Zero;
+
+    /// <summary>
+    /// When a hook last ran, on the GetTickCount clock that GetLastInputInfo
+    /// uses, so the two can be compared. Every callback counts, also the ones
+    /// for events Peel ignores.
+    /// </summary>
+    internal uint LastEventTick => unchecked((uint)Volatile.Read(ref _lastEventTick));
 
     /// <summary>Worst time one hook callback has taken, in milliseconds.</summary>
     internal double WorstCallMs => Interlocked.Read(ref _worstTicks) * 1000.0 / Stopwatch.Frequency;
@@ -63,11 +71,45 @@ internal sealed class InputHooks : IDisposable
     private void Run()
     {
         _dispatcher = Dispatcher.CurrentDispatcher;
+        Install();
+        _ready.Set();
+        Dispatcher.Run();
+    }
+
+    private void Install()
+    {
         var module = Native.GetModuleHandle(null);
         _mouseHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, _mouseProc, module, 0);
         _keyHook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, _keyProc, module, 0);
-        _ready.Set();
-        Dispatcher.Run();
+        Volatile.Write(ref _lastEventTick, Environment.TickCount);
+    }
+
+    /// <summary>
+    /// Take both hooks off and put them back, on the hook thread. Windows
+    /// removes a low level hook without telling anyone when it times out too
+    /// often; App's liveness check calls this when input keeps arriving and
+    /// the hooks do not see it.
+    /// </summary>
+    internal void Reinstall(string reason)
+    {
+        var dispatcher = _dispatcher;
+        if (dispatcher is null)
+        {
+            return;
+        }
+        dispatcher.BeginInvoke(DispatcherPriority.Send, () =>
+        {
+            if (_mouseHook != IntPtr.Zero)
+            {
+                Native.UnhookWindowsHookEx(_mouseHook);
+            }
+            if (_keyHook != IntPtr.Zero)
+            {
+                Native.UnhookWindowsHookEx(_keyHook);
+            }
+            Install();
+            Log.Write($"hooks reinstalled ({reason}) mouse={_mouseHook != IntPtr.Zero} keyboard={_keyHook != IntPtr.Zero}");
+        });
     }
 
     private IntPtr OnMouse(int code, IntPtr wParam, IntPtr lParam)
@@ -118,6 +160,7 @@ internal sealed class InputHooks : IDisposable
 
     private void Record(long started)
     {
+        Volatile.Write(ref _lastEventTick, Environment.TickCount);
         var elapsed = Stopwatch.GetTimestamp() - started;
         if (elapsed > Interlocked.Read(ref _worstTicks))
         {
