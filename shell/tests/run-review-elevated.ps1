@@ -6,7 +6,11 @@ param(
     [string]$Dir = 'C:\peel-dev\review-e2e'
 )
 $ErrorActionPreference = 'Stop'
-$app = Join-Path $Root 'shell\Peel\bin\Release\net8.0-windows\Peel.exe'
+# Match the target framework folder (it gained a Windows SDK version with the
+# Share action), rather than naming one version.
+$app = Get-ChildItem -Path (Join-Path $Root 'shell\Peel\bin\Release') -Filter 'net8.0-windows*' -Directory |
+    ForEach-Object { Join-Path $_.FullName 'Peel.exe' } | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $app) { throw "build the shell first (dotnet build -c Release): no Peel.exe under shell\Peel\bin\Release\net8.0-windows*" }
 $driver = Join-Path $Root 'shell\tests\review-elevated-up.ps1'
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Remove-Item (Join-Path $Dir '*') -Recurse -Force -ErrorAction SilentlyContinue

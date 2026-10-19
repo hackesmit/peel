@@ -34,6 +34,10 @@
     <!-- The wheel maths, the drag state machine and the engine model are
          internal to the app and are what the unit tests exercise. -->
     <InternalsVisibleTo Include="Peel.Tests" />
+    <!-- The interactive action check (shell\tests\ActionProbe) drives the Alt
+         wheel actions directly in the logged on session, the same way the unit
+         tests drive their cores, so it reaches the internal action classes. -->
+    <InternalsVisibleTo Include="Peel.ActionProbe" />
   </ItemGroup>
 
 </Project>
