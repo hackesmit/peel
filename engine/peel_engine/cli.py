@@ -71,7 +71,9 @@ def read_file_list(path: Path) -> list[Path]:
     """The paths in a ``--files-from`` list, in order.
 
     UTF-8 with or without a byte order mark, LF or CRLF line ends. Blank lines
-    are skipped. A line is otherwise taken exactly as written.
+    are skipped. A line is otherwise taken exactly as written: the list is split
+    on "\n" only, never with str.splitlines(), because that also breaks at
+    U+0085, U+2028 and U+2029, which are legal in a Windows file name.
     """
     try:
         text = Path(path).read_text(encoding="utf-8-sig")
@@ -79,7 +81,8 @@ def read_file_list(path: Path) -> list[Path]:
         raise UsageError(f"cannot read the file list {path}: {exc}") from None
     except UnicodeDecodeError as exc:
         raise UsageError(f"the file list {path} is not UTF-8: {exc}") from None
-    return [Path(line) for line in text.splitlines() if line.strip()]
+    lines = (line[:-1] if line.endswith("\r") else line for line in text.split("\n"))
+    return [Path(line) for line in lines if line.strip()]
 
 
 def collect_files(args: argparse.Namespace) -> list[Path]:

@@ -28,7 +28,8 @@ internal sealed class InputHooks : IDisposable
     private IntPtr _mouseHook;
     private IntPtr _keyHook;
     private long _worstTicks;
-    private int _lastEventTick = Environment.TickCount;
+    private int _lastMouseTick = Environment.TickCount;
+    private int _lastKeyTick = Environment.TickCount;
 
     internal InputHooks()
     {
@@ -46,11 +47,15 @@ internal sealed class InputHooks : IDisposable
     internal bool Installed => _mouseHook != IntPtr.Zero && _keyHook != IntPtr.Zero;
 
     /// <summary>
-    /// When a hook last ran, on the GetTickCount clock that GetLastInputInfo
-    /// uses, so the two can be compared. Every callback counts, also the ones
-    /// for events Peel ignores.
+    /// When the mouse hook last ran, on the GetTickCount clock that
+    /// GetLastInputInfo uses, so the two can be compared. Every callback
+    /// counts, also the ones for events Peel ignores. Each hook has its own
+    /// clock, because Windows can remove one and leave the other.
     /// </summary>
-    internal uint LastEventTick => unchecked((uint)Volatile.Read(ref _lastEventTick));
+    internal uint LastMouseTick => unchecked((uint)Volatile.Read(ref _lastMouseTick));
+
+    /// <summary>When the keyboard hook last ran (see LastMouseTick).</summary>
+    internal uint LastKeyTick => unchecked((uint)Volatile.Read(ref _lastKeyTick));
 
     /// <summary>Worst time one hook callback has taken, in milliseconds.</summary>
     internal double WorstCallMs => Interlocked.Read(ref _worstTicks) * 1000.0 / Stopwatch.Frequency;
@@ -81,14 +86,16 @@ internal sealed class InputHooks : IDisposable
         var module = Native.GetModuleHandle(null);
         _mouseHook = Native.SetWindowsHookEx(Native.WH_MOUSE_LL, _mouseProc, module, 0);
         _keyHook = Native.SetWindowsHookEx(Native.WH_KEYBOARD_LL, _keyProc, module, 0);
-        Volatile.Write(ref _lastEventTick, Environment.TickCount);
+        Volatile.Write(ref _lastMouseTick, Environment.TickCount);
+        Volatile.Write(ref _lastKeyTick, Environment.TickCount);
     }
 
     /// <summary>
     /// Take both hooks off and put them back, on the hook thread. Windows
     /// removes a low level hook without telling anyone when it times out too
-    /// often; App's liveness check calls this when input keeps arriving and
-    /// the hooks do not see it.
+    /// often; App's liveness check calls this when input keeps arriving that a
+    /// hook does not see, while the user is idle as a routine refresh, and
+    /// again later whenever a reinstall left a hook missing.
     /// </summary>
     internal void Reinstall(string reason)
     {
@@ -132,7 +139,7 @@ internal sealed class InputHooks : IDisposable
         {
             Log.Write("mouse hook handler failed", error);
         }
-        Record(started);
+        Record(started, ref _lastMouseTick);
         return Native.CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
     }
 
@@ -152,15 +159,15 @@ internal sealed class InputHooks : IDisposable
         {
             Log.Write("key hook handler failed", error);
         }
-        Record(started);
+        Record(started, ref _lastKeyTick);
         // Peel never swallows a key. The modifier still reaches Explorer, so a
         // cancelled drag keeps whatever copy or move meaning the user chose.
         return Native.CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
     }
 
-    private void Record(long started)
+    private void Record(long started, ref int lastTick)
     {
-        Volatile.Write(ref _lastEventTick, Environment.TickCount);
+        Volatile.Write(ref lastTick, Environment.TickCount);
         var elapsed = Stopwatch.GetTimestamp() - started;
         if (elapsed > Interlocked.Read(ref _worstTicks))
         {

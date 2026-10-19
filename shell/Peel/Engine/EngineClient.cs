@@ -11,14 +11,23 @@
 //      mangles (or fails on) non ASCII file names.
 //
 // Every engine process runs in a kill on close job object of its own
-// (Jobs/ProcessJob.cs). The timeout covers the process exit and the draining
-// of both pipes, because a backend the engine started can inherit the pipes
-// and keep them open after the engine has exited; on expiry the whole job is
-// terminated, which closes the pipes and lets the readers finish.
+// (Jobs/ProcessJob.cs). It is created suspended and resumed only once it is in
+// the job and registered for KillAll (Jobs/ContainedProcess.cs); if either
+// fails, the engine is not run and the call returns an error. The timeout
+// covers the process exit and the draining of both pipes, because a backend
+// the engine started can inherit the pipes and keep them open after the
+// engine has exited; on expiry the whole job is terminated, which closes the
+// pipes and lets the readers finish.
+//
+// The whole call, list file and process creation included, runs on the thread
+// pool. The wheel calls OptionsAsync from inside an OLE drag callback, and an
+// async method runs synchronously up to its first real await, so without the
+// hop a slow %TEMP% or a slow CreateProcess would stall Explorer's drag.
 //
 // Windows caps a command line at 32767 characters. A drag of a few hundred
 // photos is longer than that, so past CommandLineBudget the paths go to a
-// temporary UTF-8 list file passed as --files-from, deleted afterwards.
+// temporary UTF-8 list file passed as --files-from, deleted afterwards (and,
+// should Peel die first, swept at the next start by ScavengeListFiles).
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
@@ -29,6 +38,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Peel.Hooks;
 using Peel.Jobs;
 
 namespace Peel.Engine;
@@ -45,6 +55,7 @@ internal sealed class EngineClient
 
     private readonly Lazy<EngineLocation?> _location;
     private readonly ConcurrentDictionary<ProcessJob, byte> _live = new();
+    private readonly CancellationTokenSource _shutdown = new();
     private volatile bool _closed;
 
     internal EngineClient() => _location = new Lazy<EngineLocation?>(Locate, isThreadSafe: true);
@@ -61,6 +72,17 @@ internal sealed class EngineClient
 
     internal EngineLocation? Location => _location.Value;
 
+    /// <summary>Makes the kill on close job for one engine process. Tests swap it.</summary>
+    internal Func<ProcessJob?> CreateJob { get; init; } = ProcessJob.Create;
+
+    /// <summary>Called with the pid while the process is still suspended. Tests only.</summary>
+    internal Action<int>? AfterCreate { get; init; }
+
+    /// <summary>Called on the thread that prepares the call, before anything else. Tests only.</summary>
+    internal Action? BeforeLaunch { get; init; }
+
+    internal static string ListFolder => Path.Combine(Path.GetTempPath(), "Peel");
+
     /// <summary>
     /// Quitting: refuse new runs and end every engine process that is still
     /// going, with everything it started. Safe to call from any thread.
@@ -68,6 +90,15 @@ internal sealed class EngineClient
     internal void KillAll()
     {
         _closed = true;
+        try
+        {
+            // Options calls and runs alike: every pending call ends now.
+            _shutdown.Cancel();
+        }
+        catch (AggregateException error)
+        {
+            Log.Write("cancelling the engine calls failed", error);
+        }
         foreach (var job in _live.Keys)
         {
             job.Terminate();
@@ -213,7 +244,8 @@ internal sealed class EngineClient
         IReadOnlyList<string> files,
         IReadOnlyList<string> tail,
         int budget,
-        List<string> arguments)
+        List<string> arguments,
+        Action<string, string>? write = null)
     {
         arguments.Clear();
         arguments.AddRange(location.Prefix);
@@ -227,7 +259,7 @@ internal sealed class EngineClient
         string? listFile = null;
         if (length > budget && files.Count > 0)
         {
-            var folder = Path.Combine(Path.GetTempPath(), "Peel");
+            var folder = ListFolder;
             Directory.CreateDirectory(folder);
             listFile = Path.Combine(folder, $"files-{Guid.NewGuid():N}.txt");
             var text = new StringBuilder();
@@ -235,7 +267,24 @@ internal sealed class EngineClient
             {
                 text.Append(file).Append('\n');
             }
-            File.WriteAllText(listFile, text.ToString(), new UTF8Encoding(false));
+            write ??= (path, contents) => File.WriteAllText(path, contents, new UTF8Encoding(false));
+            try
+            {
+                write(listFile, text.ToString());
+            }
+            catch
+            {
+                // A full disk can leave half a list behind: never keep it.
+                try
+                {
+                    File.Delete(listFile);
+                }
+                catch (Exception error)
+                {
+                    Log.Write($"cannot delete the partial file list {listFile}", error);
+                }
+                throw;
+            }
             arguments.Add("--files-from");
             arguments.Add(listFile);
         }
@@ -248,17 +297,67 @@ internal sealed class EngineClient
     }
 
     /// <summary>
+    /// Delete list files a killed or crashed Peel left in %TEMP%\Peel (which
+    /// is this user's own temp folder). Only files-*.txt older than
+    /// <paramref name="olderThan"/>, so a list another Peel call is using right
+    /// now is never touched. Returns how many were deleted.
+    /// </summary>
+    internal static int ScavengeListFiles(TimeSpan olderThan, string? folder = null)
+    {
+        folder ??= ListFolder;
+        var deleted = 0;
+        try
+        {
+            if (!Directory.Exists(folder))
+            {
+                return 0;
+            }
+            var cutoff = DateTime.UtcNow - olderThan;
+            foreach (var file in Directory.EnumerateFiles(folder, "files-*.txt"))
+            {
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(file) < cutoff)
+                    {
+                        File.Delete(file);
+                        deleted++;
+                    }
+                }
+                catch (Exception error)
+                {
+                    Log.Write($"cannot delete the stale file list {file}", error);
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            Log.Write("cannot sweep the stale file lists", error);
+        }
+        return deleted;
+    }
+
+    /// <summary>
     /// Returns stdout, stderr and the exit code. A null exit code means the
     /// process could not be started or had to be killed; stderr then holds the
-    /// message to show.
+    /// message to show. Always continues on the thread pool: nothing of the
+    /// call runs on the caller's thread.
     /// </summary>
-    private async Task<(string Output, string Error, int? ExitCode)> RunProcessAsync(
+    private Task<(string Output, string Error, int? ExitCode)> RunProcessAsync(
+        IReadOnlyList<string> head,
+        IReadOnlyList<string> files,
+        IReadOnlyList<string> tail,
+        TimeSpan timeout,
+        CancellationToken token) =>
+        Task.Run(() => RunProcessOnPoolAsync(head, files, tail, timeout, token), CancellationToken.None);
+
+    private async Task<(string Output, string Error, int? ExitCode)> RunProcessOnPoolAsync(
         IReadOnlyList<string> head,
         IReadOnlyList<string> files,
         IReadOnlyList<string> tail,
         TimeSpan timeout,
         CancellationToken token)
     {
+        BeforeLaunch?.Invoke();
         var location = _location.Value;
         if (location is null)
         {
@@ -310,113 +409,85 @@ internal sealed class EngineClient
         TimeSpan timeout,
         CancellationToken token)
     {
-        var start = new ProcessStartInfo
+        var environment = new Dictionary<string, string>
         {
-            FileName = location.FileName,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            StandardOutputEncoding = Encoding.UTF8,
-            StandardErrorEncoding = Encoding.UTF8,
+            ["PYTHONIOENCODING"] = "utf-8",
+            ["PYTHONUTF8"] = "1",
         };
-        foreach (var argument in arguments)
-        {
-            start.ArgumentList.Add(argument);
-        }
-        start.Environment["PYTHONIOENCODING"] = "utf-8";
-        start.Environment["PYTHONUTF8"] = "1";
 
         var watch = Stopwatch.StartNew();
-        var job = ProcessJob.Create();
-        using var process = new Process { StartInfo = start };
+        var job = CreateJob();
+        if (job is null)
+        {
+            // Fail closed: an engine Peel cannot end must not run.
+            Log.Write($"engine {what} not run: no job object");
+            return (string.Empty,
+                "Peel could not set up the Windows job that ends the engine with Peel, so it did not run the engine. See the log.",
+                null);
+        }
+
+        ContainedProcess process;
         try
         {
-            process.Start();
+            process = ContainedProcess.Start(location.FileName, arguments, environment, job, AfterCreate, () =>
+            {
+                // Owned before it runs: from here KillAll reaches it.
+                _live[job] = 0;
+                if (_closed)
+                {
+                    throw new OperationCanceledException("Peel is quitting.");
+                }
+            });
         }
         catch (Exception error)
         {
-            job?.Dispose();
+            _live.TryRemove(job, out _);
+            job.Dispose();
+            if (error is OperationCanceledException)
+            {
+                return (string.Empty, "Peel is quitting.", null);
+            }
             Log.Write($"cannot start the engine at {location.FileName}", error);
             return (string.Empty, $"Cannot start the Peel engine ({location.Description}): {error.Message}", null);
         }
 
-        if (job is not null)
+        using (process)
         {
-            if (job.Assign(process))
+            using var limit = CancellationTokenSource.CreateLinkedTokenSource(token, _shutdown.Token);
+            limit.CancelAfter(timeout);
+            var output = new StreamReader(process.StandardOutput, Encoding.UTF8).ReadToEndAsync(limit.Token);
+            var errors = new StreamReader(process.StandardError, Encoding.UTF8).ReadToEndAsync(limit.Token);
+            try
             {
-                _live[job] = 0;
+                await process.WaitForExitAsync(limit.Token).ConfigureAwait(false);
+                // The engine has exited, but a backend it started may still hold
+                // the pipes. The same deadline covers reading them to the end.
+                await Task.WhenAll(output, errors).WaitAsync(limit.Token).ConfigureAwait(false);
+                var stdout = await output.ConfigureAwait(false);
+                var stderr = await errors.ConfigureAwait(false);
+                Log.Write($"engine {what} exit={process.ExitCode} in {watch.ElapsedMilliseconds}ms");
+                return (stdout, stderr, process.ExitCode);
             }
-            else
+            catch (OperationCanceledException)
             {
-                job.Dispose();
-                job = null;
+                // End the engine and everything it started, then close our
+                // pipe ends so the readers return.
+                job.Terminate();
+                process.Kill();
+                process.ClosePipes();
+                await Observe(output, errors).ConfigureAwait(false);
+                var reason = _closed ? "was stopped because Peel quit"
+                    : token.IsCancellationRequested ? "was cancelled"
+                    : $"took longer than {timeout.TotalSeconds:0} seconds";
+                Log.Write($"engine {what} {reason}");
+                return (string.Empty, $"The Peel engine {reason}.", null);
             }
-        }
-
-        using var limit = CancellationTokenSource.CreateLinkedTokenSource(token);
-        limit.CancelAfter(timeout);
-        var output = process.StandardOutput.ReadToEndAsync(limit.Token);
-        var errors = process.StandardError.ReadToEndAsync(limit.Token);
-        try
-        {
-            if (_closed)
-            {
-                // Quit arrived between the check above and the start.
-                throw new OperationCanceledException();
-            }
-            await process.WaitForExitAsync(limit.Token).ConfigureAwait(false);
-            // The engine has exited, but a backend it started may still hold
-            // the pipes. The same deadline covers reading them to the end.
-            await Task.WhenAll(output, errors).WaitAsync(limit.Token).ConfigureAwait(false);
-            var stdout = await output.ConfigureAwait(false);
-            var stderr = await errors.ConfigureAwait(false);
-            Log.Write($"engine {what} exit={process.ExitCode} in {watch.ElapsedMilliseconds}ms");
-            return (stdout, stderr, process.ExitCode);
-        }
-        catch (OperationCanceledException)
-        {
-            Stop(process, job);
-            await Observe(output, errors).ConfigureAwait(false);
-            var reason = _closed ? "was stopped because Peel quit"
-                : token.IsCancellationRequested ? "was cancelled"
-                : $"took longer than {timeout.TotalSeconds:0} seconds";
-            Log.Write($"engine {what} {reason}");
-            return (string.Empty, $"The Peel engine {reason}.", null);
-        }
-        finally
-        {
-            if (job is not null)
+            finally
             {
                 _live.TryRemove(job, out _);
                 // Kill on close: anything the engine left running goes too.
                 job.Dispose();
             }
-        }
-    }
-
-    /// <summary>End the engine and everything it started, then close our pipe ends.</summary>
-    private static void Stop(Process process, ProcessJob? job)
-    {
-        if (job is not null)
-        {
-            job.Terminate();
-        }
-        try
-        {
-            process.Kill(entireProcessTree: true);
-        }
-        catch (Exception)
-        {
-            // Already gone, or the job took it.
-        }
-        try
-        {
-            process.StandardOutput.Close();
-            process.StandardError.Close();
-        }
-        catch (Exception)
-        {
         }
     }
 

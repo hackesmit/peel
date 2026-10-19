@@ -30,6 +30,7 @@ public partial class App : Application
     private DispatcherTimer? _hookReport;
     private JobRunner? _jobs;
     private readonly HookLiveness _liveness = new();
+    private Native.POINT? _lastCursor;
     private double _reportedWorst;
 
     protected override void OnStartup(StartupEventArgs e)
@@ -66,6 +67,16 @@ public partial class App : Application
 
         _engine = new EngineClient();
         Log.Write($"engine: {_engine.Location?.Description ?? "not found"}");
+        // File lists a killed Peel left behind hold full path names: sweep the
+        // ones older than a day, off the UI thread.
+        _ = Task.Run(() =>
+        {
+            var swept = EngineClient.ScavengeListFiles(TimeSpan.FromDays(1));
+            if (swept > 0)
+            {
+                Log.Write($"deleted {swept} stale file list(s) from {EngineClient.ListFolder}");
+            }
+        });
 
         _toasts = new ToastHost();
         var jobs = new JobRunner(_engine, _toasts, Dispatcher);
@@ -129,19 +140,29 @@ public partial class App : Application
     }
 
     /// <summary>
-    /// Windows can take a low level hook away without a word. If input keeps
-    /// arriving that the hooks never saw, put them back.
+    /// Windows can take a low level hook away without a word, one hook at a
+    /// time. HookLiveness judges each hook on its own evidence; this gathers
+    /// it and reinstalls both when asked, also after a failed reinstall.
     /// </summary>
     private void CheckHooksAlive()
     {
-        if (_hooks is null || !_hooks.Installed || Native.LastInputTick() is not { } lastInput)
+        if (_hooks is null || Native.LastInputTick() is not { } lastInput)
         {
             return;
         }
-        var lastHook = _hooks.LastEventTick;
-        if (_liveness.Check(unchecked((uint)Environment.TickCount), lastInput, lastHook))
+        Native.POINT? cursor = Native.GetCursorPos(out var point) ? point : null;
+        var moved = cursor is { } now && _lastCursor is { } before && (now.X != before.X || now.Y != before.Y);
+        _lastCursor = cursor;
+        var reason = _liveness.Check(new HookSample(
+            unchecked((uint)Environment.TickCount),
+            _hooks.Installed,
+            lastInput,
+            _hooks.LastMouseTick,
+            _hooks.LastKeyTick,
+            moved));
+        if (reason is not null)
         {
-            _hooks.Reinstall($"input at {lastInput} but the last hook call at {lastHook}");
+            _hooks.Reinstall(reason);
         }
     }
 
