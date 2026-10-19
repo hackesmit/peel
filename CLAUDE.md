@@ -13,6 +13,8 @@ copy Tangerine's binary, code, icons or other assets. Own names and own icons.
   Tests generate their fixture files (ffmpeg testsrc, pillow images, etc.) at
   run time; do not commit binary fixtures larger than 50 KB.
 - `shell/`: C# .NET 8 WPF tray app, Windows only. Built on George.
+  How it works, how to build it and how to run its GUI tests:
+  shell/README.md. Unit tests: `dotnet test -c Release` in `shell/`.
 - `install/`: George setup (winget, venv, startup entry).
 
 ## Working on George from hqbox

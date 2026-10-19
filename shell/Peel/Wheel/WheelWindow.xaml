@@ -1,0 +1,23 @@
+<Window x:Class="Peel.Wheel.WheelWindow"
+        x:ClassModifier="internal"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Peel wheel"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        ShowInTaskbar="False"
+        ShowActivated="False"
+        Topmost="True"
+        ResizeMode="NoResize"
+        AllowDrop="True"
+        Focusable="False"
+        UseLayoutRounding="True"
+        SnapsToDevicePixels="True"
+        WindowStartupLocation="Manual">
+    <!-- A Transparent background is hit testable in WPF; a null one is not,
+         and the drag would never reach the window. The hub is cut out of the
+         window with a region instead, so a drop there goes to whatever is
+         underneath. -->
+    <Grid x:Name="Root" Background="Transparent" />
+</Window>

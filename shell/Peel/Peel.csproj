@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>Peel</AssemblyName>
+    <RootNamespace>Peel</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\peel.ico</ApplicationIcon>
+    <Version>0.1.0</Version>
+    <!-- The tray app is long lived and must not be the reason a drag feels slow. -->
+    <TieredPGO>true</TieredPGO>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- WFAC010 tells WinForms apps to set the DPI mode in code. Peel is a WPF
+         app that borrows WinForms only for the tray icon, and WPF reads its
+         per monitor awareness from the manifest, so the manifest stays. -->
+    <NoWarn>$(NoWarn);WFAC010</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Content Include="Assets\peel.ico" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The wheel maths, the drag state machine and the engine model are
+         internal to the app and are what the unit tests exercise. -->
+    <InternalsVisibleTo Include="Peel.Tests" />
+  </ItemGroup>
+
+</Project>
