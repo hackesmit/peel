@@ -958,3 +958,209 @@ def test_metadata_writes_a_location_a_strict_reader_accepts(real, make_image):
     assert (gps[3], tuple(float(part) for part in gps[4])) == ("W", (116.0, 36.0, 0.0))
     minutes_and_seconds = tuple(gps[2])[1:] + tuple(gps[4])[1:]
     assert all(float(part) < 60 for part in minutes_and_seconds)
+
+
+# --- review round 1 (hq-plct.2) ---------------------------------------------
+
+
+def _icc() -> bytes:
+    from PIL import ImageCms
+
+    return ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+
+
+def _animated(path: Path, fmt: str, frames: int = 3) -> Path:
+    Image = image.pillow()
+    shots = [Image.new("RGBA", (24, 16), (60 * i, 255 - 60 * i, 40, 255)) for i in range(frames)]
+    shots[0].save(path, format=fmt, save_all=True, append_images=shots[1:], duration=80, loop=0)
+    return path
+
+
+def test_metadata_strip_drops_comment_xmp_and_text_but_keeps_the_icc_profile(real, tmp_path):
+    needs("jpg")
+    Image = image.pillow()
+    source = tmp_path / "grapes.jpg"
+    exif = Image.Exif()
+    exif[0x010E] = "Vendimia"
+    Image.new("RGB", (20, 20), (90, 20, 60)).save(
+        source,
+        exif=exif,
+        comment=b"shot at Jane Roe's house",
+        xmp=b"<x:xmpmeta>Jane Roe</x:xmpmeta>",
+        icc_profile=_icc(),
+    )
+
+    result = real.run("image.metadata", [source], {"action": "strip"})
+
+    assert result.ok, result.message
+    data = result.outputs[0].read_bytes()
+    assert b"Jane Roe" not in data
+    assert exif_of(result.outputs[0]) == ({}, {})
+    with Image.open(result.outputs[0]) as out:
+        assert out.info.get("icc_profile") == _icc()
+        assert "comment" not in out.info
+
+
+def test_metadata_strip_drops_png_text_chunks(real, tmp_path):
+    from PIL import PngImagePlugin
+
+    Image = image.pillow()
+    source = tmp_path / "shot.png"
+    text = PngImagePlugin.PngInfo()
+    text.add_text("Author", "Jane Roe")
+    Image.new("RGB", (10, 10)).save(source, pnginfo=text)
+
+    result = real.run("image.metadata", [source], {"action": "strip"})
+
+    assert result.ok, result.message
+    assert b"Jane Roe" not in result.outputs[0].read_bytes()
+
+
+def test_redact_keeps_the_icc_profile(real, tmp_path):
+    needs("jpg")
+    Image = image.pillow()
+    source = tmp_path / "id.jpg"
+    Image.new("RGB", (40, 40), (200, 100, 50)).save(source, icc_profile=_icc())
+
+    result = real.run(
+        "image.redact", [source], {"regions": [{"x": 0, "y": 0, "w": 10, "h": 10}], "mode": "box"}
+    )
+
+    assert result.ok, result.message
+    with Image.open(result.outputs[0]) as out:
+        assert out.info.get("icc_profile") == _icc()
+
+
+@pytest.mark.parametrize(
+    ("mode", "values", "middle"),
+    [
+        ("F", [i / 255 for i in range(256)], 128),
+        ("I", [i * 256 for i in range(256)], 128),
+        ("I;16B", [i * 256 for i in range(256)], 128),
+    ],
+)
+def test_deep_images_are_scaled_not_clipped(real, tmp_path, mode, values, middle):
+    needs("jpg")
+    Image = image.pillow()
+    source = tmp_path / "deep.tiff"
+    ramp = Image.new(mode, (256, 1))
+    ramp.putdata(values)
+    ramp.save(source)
+
+    result = real.run("image.to_jpg", [source], {})
+
+    assert result.ok, result.message
+    with Image.open(result.outputs[0]) as out:
+        assert abs(out.convert("L").getpixel((128, 0)) - middle) <= 8
+
+
+def test_a_16_bit_png_stays_16_bit_when_converted_to_tiff(real, tmp_path):
+    needs("tiff")
+    Image = image.pillow()
+    source = tmp_path / "scan.png"
+    ramp = Image.new("I;16", (256, 1))
+    ramp.putdata([i * 256 for i in range(256)])
+    ramp.save(source)
+
+    result = real.run("image.to_tiff", [source], {})
+
+    assert result.ok, result.message
+    with Image.open(result.outputs[0]) as out:
+        assert out.mode in image.DEEP_MODES
+        assert out.getpixel((128, 0)) == 128 * 256
+
+
+def test_an_svg_too_big_to_render_is_refused(real, tmp_path):
+    pytest.importorskip("fitz", reason="the size check is on the PyMuPDF path")
+    source = tmp_path / "huge.svg"
+    source.write_text(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="60000" height="60000">'
+        '<rect width="10" height="10"/></svg>'
+    )
+
+    result = real.run("image.to_png", [source], {})
+
+    assert not result.ok
+    assert "pixel limit" in result.message
+
+
+def test_annotate_clamps_an_absurd_width_and_text_size(real, make_image):
+    import time
+
+    needs("png")
+    source = make_image("shot.png", size=(60, 40))
+    shapes = [
+        {"type": "rect", "x": 5, "y": 5, "w": 20, "h": 20, "width": 10**9},
+        {"type": "text", "x": 1, "y": 1, "text": "hi", "size": 10**9},
+    ]
+
+    started = time.monotonic()
+    result = real.run("image.annotate", [source], {"shapes": shapes})
+
+    assert result.ok, result.message
+    assert time.monotonic() - started < 10
+    assert opened(result.outputs[0])[0].size == (60, 40)
+
+
+def test_a_transparent_png_flattens_onto_white_as_bmp(real, tmp_path):
+    needs("bmp")
+    Image = image.pillow()
+    source = tmp_path / "logo.png"
+    Image.new("RGBA", (4, 4), (255, 0, 0, 0)).save(source)
+
+    result = real.run("image.to_bmp", [source], {})
+
+    assert result.ok, result.message
+    out, fmt = opened(result.outputs[0])
+    assert fmt == "BMP"
+    assert out.convert("RGB").getpixel((0, 0)) == (255, 255, 255)
+
+
+def test_an_animated_png_keeps_every_frame_as_webp(real, tmp_path):
+    needs("webp")
+    source = _animated(tmp_path / "spin.png", "PNG", frames=3)
+
+    result = real.run("image.to_webp", [source], {})
+
+    assert result.ok, result.message
+    assert "3 frames" in result.message
+    Image = image.pillow()
+    with Image.open(result.outputs[0]) as out:
+        assert out.n_frames == 3
+
+
+def test_an_animated_webp_to_jpg_says_it_kept_the_first_frame(real, tmp_path):
+    needs("webp")
+    source = _animated(tmp_path / "spin.webp", "WEBP", frames=4)
+
+    result = real.run("image.to_jpg", [source], {})
+
+    assert result.ok, result.message
+    assert "4 frames" in result.message and "first frame" in result.message
+
+
+def test_compress_keeps_an_animated_webp_animated(real, tmp_path):
+    needs("webp")
+    source = _animated(tmp_path / "spin.webp", "WEBP", frames=3)
+
+    result = real.run("image.compress", [source], {"quality": 40})
+
+    assert result.ok, result.message
+    assert "All 3 frames kept" in result.message
+    Image = image.pillow()
+    with Image.open(result.outputs[0]) as out:
+        assert out.n_frames == 3
+
+
+def test_metadata_set_on_a_jpeg_keeps_its_quantisation_tables(real, make_image):
+    needs("jpg")
+    Image = image.pillow()
+    source = make_image("grapes.jpg", size=(32, 32), quality=55)
+    with Image.open(source) as before:
+        tables = before.quantization
+
+    result = real.run("image.metadata", [source], {"action": "set", "title": "Vendimia"})
+
+    assert result.ok, result.message
+    with Image.open(result.outputs[0]) as after:
+        assert after.quantization == tables
