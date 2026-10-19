@@ -15,6 +15,9 @@ drag:   the real thing. Explorer drag, modifier tap, drop on a segment, and the
         aims at has to exist in the registry on this machine.
 render: the wheel drawing and its paging, against the fake engine in
         tests\FakeEngine. Writes screenshots and runs nothing.
+keyboard: the keyboard path. Select a file in Explorer, press the global hotkey
+        (Ctrl+Alt+Enter), drive the highlight with the arrow keys, press Enter,
+        and the engine writes the file. No drag, no mouse past the first click.
 
 Daniel has to be logged in at the console. If the session is locked, Explorer
 may not be visible to UI Automation, and the run reports that rather than
@@ -22,7 +25,7 @@ guessing.
 #>
 param(
     [string]$Root = (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)),
-    [ValidateSet('drag', 'render')]
+    [ValidateSet('drag', 'render', 'keyboard')]
     [string]$Test = 'drag',
     [string]$Source = 'sample.txt',
     [string]$Segment = 'MD',
@@ -37,6 +40,11 @@ if (-not (Test-Path $app)) { throw "build the shell first (dotnet build -c Relea
 if ($Test -eq 'drag') {
     $script = Join-Path $Root 'shell\tests\e2e-drag.ps1'
     $dir = 'C:\peel-dev\e2e'
+    $arguments = '-Dir "{0}" -App "{1}" -Source "{2}" -Segment "{3}" -Expect "{4}"' -f $dir, $app, $Source, $Segment, $Expect
+}
+elseif ($Test -eq 'keyboard') {
+    $script = Join-Path $Root 'shell\tests\e2e-keyboard.ps1'
+    $dir = 'C:\peel-dev\e2e-keyboard'
     $arguments = '-Dir "{0}" -App "{1}" -Source "{2}" -Segment "{3}" -Expect "{4}"' -f $dir, $app, $Source, $Segment, $Expect
 }
 else {
