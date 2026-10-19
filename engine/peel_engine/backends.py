@@ -159,6 +159,22 @@ BACKENDS: tuple[Backend, ...] = (
         module="pdf2docx",
         install="pip install pdf2docx",
     ),
+    Backend(
+        name="openpyxl",
+        kind=MODULE,
+        label="openpyxl",
+        used_for="spreadsheet reading and writing",
+        module="openpyxl",
+        install="pip install openpyxl",
+    ),
+    Backend(
+        name="python_pptx",
+        kind=MODULE,
+        label="python-pptx",
+        used_for="writing PPTX slides",
+        module="pptx",
+        install="pip install python-pptx",
+    ),
 )
 
 BY_NAME: dict[str, Backend] = {b.name: b for b in BACKENDS}

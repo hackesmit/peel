@@ -18,6 +18,9 @@ render:  the wheel drawing and its paging, against the fake engine in
 editors: each image editor, opened from the tools wheel by a real drag, driven
          with UI Automation, applied, and its output checked pixel by pixel or
          tag by tag. Uses the installed engine and its venv python.
+keyboard: the keyboard path. Select a file in Explorer, press the global hotkey
+         (Ctrl+Alt+Enter), drive the highlight with the arrow keys, press Enter,
+         and the engine writes the file. No drag, no mouse past the first click.
 
 Daniel has to be logged in at the console. If the session is locked, Explorer
 may not be visible to UI Automation, and the run reports that rather than
@@ -25,7 +28,7 @@ guessing.
 #>
 param(
     [string]$Root = (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)),
-    [ValidateSet('drag', 'render', 'editors')]
+    [ValidateSet('drag', 'render', 'editors', 'keyboard')]
     [string]$Test = 'drag',
     [string]$Source = 'sample.txt',
     [string]$Segment = 'MD',
@@ -51,6 +54,11 @@ elseif ($Test -eq 'editors') {
     $check = Join-Path $Root 'shell\tests\e2e-editors-check.py'
     $arguments = '-Dir "{0}" -App "{1}" -Check "{2}"' -f $dir, $app, $check
     if ($Engine) { $arguments += ' -Peel "{0}"' -f $Engine }
+}
+elseif ($Test -eq 'keyboard') {
+    $script = Join-Path $Root 'shell\tests\e2e-keyboard.ps1'
+    $dir = 'C:\peel-dev\e2e-keyboard'
+    $arguments = '-Dir "{0}" -App "{1}" -Source "{2}" -Segment "{3}" -Expect "{4}"' -f $dir, $app, $Source, $Segment, $Expect
 }
 else {
     $script = Join-Path $Root 'shell\tests\e2e-wheel-render.ps1'
