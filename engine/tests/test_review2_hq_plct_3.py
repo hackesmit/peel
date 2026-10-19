@@ -1,7 +1,7 @@
 """Adversarial review checks for hq-plct.3 (av family), round 2.
 
-Not collected by default. Run:
-    cd engine && python3 -m pytest -q tests/review2_hq_plct_3.py
+Collected with the suite since round 3 (renamed from review2_hq_plct_3.py).
+Run alone: cd engine && python3 -m pytest -q tests/test_review2_hq_plct_3.py
 
 BLOCKING (R2-B1): av.probe() runs ffprobe with text=True and no encoding, so
 Python decodes ffprobe's UTF-8 JSON with the locale code page. On George
@@ -17,7 +17,9 @@ The *_real tests fail on George as is. The *_cp1252 tests reproduce the
 Windows decode on any OS by giving av's subprocess.run the encoding Windows
 would pick.
 
-NON-BLOCKING checks are marked xfail(strict=False) so they report, not block.
+Round 3 (Daniel approved) fixed R2-B1 and three of the non-blocking notes
+(join flips, late video start, ignored interval); their checks now pass as
+plain tests. Round 3 additions are at the end of the file.
 """
 
 from __future__ import annotations
@@ -138,7 +140,6 @@ def test_a_tag_with_an_accented_capital_does_not_hide_the_audio_cp1252(reg, tmp_
 # --- NON-BLOCKING ------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=False, reason="non-blocking: flips are not in the join signature")
 def test_join_does_not_copy_a_flipped_display_matrix_over_a_plain_rotated_clip(reg, tmp_path):
     base = tmp_path / "base.mp4"
     ff("-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=1",
@@ -164,13 +165,86 @@ def late(tmp_path):
     return path
 
 
-@pytest.mark.xfail(strict=False, reason="non-blocking: bounds ignore the video start_time")
 def test_snapshot_inside_a_late_starting_video_is_accepted(reg, late):
     r = reg.run("av.video_snapshot", [late], {"time": 2.5})
     assert r.ok, r.message
 
 
-@pytest.mark.xfail(strict=False, reason="non-blocking: bounds ignore the video start_time")
 def test_split_every_second_of_a_late_starting_video(reg, late):
     r = reg.run("av.video_split", [late], {"every": 1})
     assert r.ok, r.message
+
+
+# --- round 3 additions -------------------------------------------------------
+
+
+def _streams_of(path: Path, kind: str) -> list[dict]:
+    return [s for s in probe_utf8(path).get("streams", []) if s.get("codec_type") == kind]
+
+
+def test_snapshot_every_second_of_a_late_video_saves_each_second_once(reg, late):
+    r = reg.run("av.video_snapshot", [late], {"every": 1})
+    assert r.ok, r.message
+    # Video runs 1 to 3 s: frames at 1 s and 2 s, no duplicate of the first.
+    assert len(r.outputs) == 2, r.message
+    assert r.outputs[0].read_bytes() != r.outputs[1].read_bytes()
+
+
+def test_snapshot_before_a_late_video_shows_its_first_frame(reg, late):
+    r = reg.run("av.video_snapshot", [late], {"time": 0.2})
+    assert r.ok, r.message
+
+
+def test_snapshot_past_a_late_video_is_refused(reg, late):
+    r = reg.run("av.video_snapshot", [late], {"time": 3.2})
+    assert not r.ok
+
+
+def test_split_part_one_of_a_late_video_keeps_its_audio(reg, late):
+    r = reg.run("av.video_split", [late], {"at": ["1.5"]})
+    assert r.ok, r.message
+    audio = _streams_of(r.outputs[0], "audio")
+    assert audio, "part 1 has no audio"
+    assert float(audio[0].get("start_time", 0)) < 0.05, audio[0].get("start_time")
+    assert float(audio[0]["duration"]) > 1.4, audio[0]["duration"]
+    assert _streams_of(r.outputs[0], "video")
+
+
+def test_split_at_a_cut_before_a_late_video_is_refused(reg, late):
+    r = reg.run("av.video_split", [late], {"at": ["0.5"]})
+    assert not r.ok
+
+
+def test_join_still_copies_two_identically_flipped_clips(reg, tmp_path):
+    base = tmp_path / "base.mp4"
+    ff("-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=1",
+       "-c:v", "libx264", "-pix_fmt", "yuv420p", str(base))
+    flips = []
+    for name in ("a", "b"):
+        out = tmp_path / f"{name}.mp4"
+        ff("-display_rotation", "90", "-display_hflip", "-i", str(base), "-c", "copy", str(out))
+        flips.append(out)
+    r = reg.run("av.video_join", flips, {})
+    assert r.ok, r.message
+    assert display_matrix(r.outputs[0]) == display_matrix(flips[0])
+
+
+def test_snapshot_every_with_no_duration_says_the_interval_was_ignored(reg, tmp_path):
+    src = tmp_path / "piped.mkv"
+    # Matroska written to a pipe carries no duration anywhere.
+    data = subprocess.run(
+        [shutil.which("ffmpeg"), "-v", "error", "-f", "lavfi",
+         "-i", "testsrc=size=160x120:rate=25:duration=2", "-c:v", "libx264",
+         "-pix_fmt", "yuv420p", "-f", "matroska", "-live", "1", "pipe:1"],
+        capture_output=True, check=True,
+    ).stdout
+    src.write_bytes(data)
+    info = probe_utf8(src)
+    durations = [info.get("format", {}).get("duration")]
+    durations += [s.get("duration") for s in info.get("streams", [])]
+    durations += [(s.get("tags") or {}).get("DURATION") for s in info.get("streams", [])]
+    if any(durations):
+        pytest.skip(f"this ffmpeg still writes a duration: {durations}")
+    r = reg.run("av.video_snapshot", [src], {"every": 0.5})
+    assert r.ok, r.message
+    assert "ignored" in r.message, r.message

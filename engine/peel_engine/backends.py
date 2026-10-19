@@ -326,7 +326,10 @@ def version(name: str) -> str:
         return _module_version(backend) if backend and backend.kind == MODULE else ""
     args = [str(found)] + ([backend.version_arg] if backend.version_arg else [])
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        proc = subprocess.run(
+            args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+        )
     except (OSError, subprocess.SubprocessError):
         return ""
     text = (proc.stdout or proc.stderr or "").strip()
