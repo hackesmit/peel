@@ -127,7 +127,7 @@ internal abstract class EditorWindowBase : Window
                 e.Handled = true;
                 CancelAndClose();
                 break;
-            case Key.Enter when !HandlesEnter(Keyboard.FocusedElement):
+            case Key.Enter when !HandlesEnter(System.Windows.Input.Keyboard.FocusedElement):
                 e.Handled = true;
                 ApplyAndClose();
                 break;

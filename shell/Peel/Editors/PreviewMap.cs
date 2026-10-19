@@ -42,13 +42,30 @@ internal readonly struct PreviewMap
     internal Size ViewSize => new(ImageWidth * Scale, ImageHeight * Scale);
 
     /// <summary>
-    /// A point on the preview as an image pixel, clamped into the image. The
-    /// clamp matters: the user drags past the edge of the picture constantly,
-    /// and the engine refuses a crop box that leaves the image.
+    /// A point on the preview as a position on the image, in continuous image
+    /// coordinates clamped to [0, width] x [0, height]. These are pixel
+    /// BOUNDARIES, not pixel indices: x = width is the right edge of the last
+    /// column, which is where a drag past the edge has to land, or the last
+    /// column and row of a redaction survive. Rounding to whole pixels is the
+    /// caller's job (PixelBox floors the near edges and ceils the far ones, so
+    /// a region only ever grows). The clamp matters too: the user drags past
+    /// the edge of the picture constantly, and the engine refuses a box that
+    /// leaves the image.
     /// </summary>
     internal Point ToImage(Point view) => new(
-        Math.Clamp(Math.Floor(view.X / Scale), 0, ImageWidth - 1),
-        Math.Clamp(Math.Floor(view.Y / Scale), 0, ImageHeight - 1));
+        Math.Clamp(Finite(view.X) / Scale, 0, ImageWidth),
+        Math.Clamp(Finite(view.Y) / Scale, 0, ImageHeight));
+
+    /// <summary>
+    /// A point on the preview as the index of the pixel under it, clamped into
+    /// the image. For the tools that place a point (pen, arrow, text), where
+    /// "the pixel under the pointer" is the meaning, not an edge.
+    /// </summary>
+    internal Point ToPixel(Point view) => new(
+        Math.Clamp(Math.Floor(Finite(view.X) / Scale), 0, ImageWidth - 1),
+        Math.Clamp(Math.Floor(Finite(view.Y) / Scale), 0, ImageHeight - 1));
+
+    private static double Finite(double value) => double.IsFinite(value) ? value : 0;
 
     /// <summary>The same, unclamped, for a drag that is allowed to overshoot.</summary>
     internal Point ToImageRaw(Point view) => new(view.X / Scale, view.Y / Scale);

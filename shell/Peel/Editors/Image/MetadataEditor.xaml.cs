@@ -19,6 +19,7 @@ namespace Peel.Editors.Image;
 internal partial class MetadataEditor : EditorWindowBase
 {
     private readonly MetadataFields _fields;
+    private readonly bool _canClearLocation;
     private bool _stripping;
 
     internal MetadataEditor(string path, MetadataFields fields, ParamSchema schema)
@@ -34,6 +35,7 @@ internal partial class MetadataEditor : EditorWindowBase
                 name, fields.Format, fields.Width, fields.Height)
             : name;
 
+        _canClearLocation = schema.Declares("clear_location");
         LabelTitle.Text = schema.Label("title", "Title");
         LabelAuthor.Text = schema.Label("author", "Author");
         LabelLatitude.Text = schema.Label("latitude", "Latitude");
@@ -98,7 +100,7 @@ internal partial class MetadataEditor : EditorWindowBase
         _fields.Author = FieldAuthor.Text;
         _fields.Latitude = FieldLatitude.Text;
         _fields.Longitude = FieldLongitude.Text;
-        if (_fields.TrySet(out var parameters, out var problem))
+        if (_fields.TrySet(out var parameters, out var problem, _canClearLocation))
         {
             return parameters;
         }

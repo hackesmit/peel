@@ -194,7 +194,7 @@ internal partial class EditEditor : EditorWindowBase
         slider.ValueChanged += (_, args) =>
         {
             Set(name, args.NewValue);
-            _readouts[name].Text = args.NewValue.ToString("0.00", CultureInfo.InvariantCulture);
+            _readouts[name].Text = EditPlan.Readout(Factor(name));
             // Coalesce: a slider drag raises this on every pixel of travel.
             _settle.Stop();
             _settle.Start();
@@ -207,7 +207,7 @@ internal partial class EditEditor : EditorWindowBase
 
         var readout = new TextBlock
         {
-            Text = _plan.Default(name).ToString("0.00", CultureInfo.InvariantCulture),
+            Text = EditPlan.Readout(_plan.Default(name)),
             Style = (Style)FindResource("EditorText"),
             MinWidth = 38,
         };
@@ -217,6 +217,13 @@ internal partial class EditEditor : EditorWindowBase
         Sliders.Children.Add(readout);
         _readouts[name] = readout;
     }
+
+    private double Factor(string name) => name switch
+    {
+        "brightness" => _plan.Brightness,
+        "contrast" => _plan.Contrast,
+        _ => _plan.Saturation,
+    };
 
     private void Set(string name, double value)
     {

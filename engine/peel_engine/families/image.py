@@ -302,6 +302,8 @@ def register(registry: Registry) -> None:
             Param("author", "string", "Author"),
             Param("latitude", "float", "Latitude", minimum=-90.0, maximum=90.0),
             Param("longitude", "float", "Longitude", minimum=-180.0, maximum=180.0),
+            Param("clear_location", "bool", "Clear location", default=False,
+                  help="With set: remove the GPS location and keep every other tag."),
         ),
         runner="peel_engine.families.image:metadata",
     )
@@ -1231,6 +1233,13 @@ def _draw_arrow(draw, shape: dict[str, Any]) -> None:
     draw.polygon([(x2, y2), *wings], fill=shape["color"])
 
 
+#: The smallest pixelation block image.redact uses, in pixels. Text set at
+#: ordinary sizes has strokes and counters well under this, so a block this
+#: big averages a glyph away. A region smaller than one block becomes a single
+#: averaged block.
+REDACT_MIN_BLOCK = 12
+
+
 def redact(job: Job) -> Result:
     """Hide regions for good, with a blur that cannot be undone or a black box.
 
@@ -1265,7 +1274,12 @@ def redact(job: Job) -> Result:
             left, top, right, bottom = box
             region = out.crop(box)
             span_w, span_h = right - left, bottom - top
-            step = max(2, min(span_w, span_h) // 6)
+            # The block size and the blur follow the LARGER side, with a floor.
+            # Taken from the shorter side, a 600 by 20 line of text got 3
+            # pixel cells and a 3 pixel blur, and its letters stayed legible.
+            # Six blocks across the long side and at least REDACT_MIN_BLOCK
+            # pixels each leave nothing glyph sized in any direction.
+            step = max(REDACT_MIN_BLOCK, max(span_w, span_h) // 6)
             small = region.resize(
                 (max(1, span_w // step), max(1, span_h // step)), Image.Resampling.BOX
             )
@@ -1481,12 +1495,20 @@ def _edited_exif(img, params: dict[str, Any]):
     author = params["author"]
     latitude = params["latitude"]
     longitude = params["longitude"]
+    # set keeps every tag it is not given, so without this a user who empties
+    # the location boxes in the editor would save a file that still says where
+    # it was taken. clear_location drops the GPS directory and nothing else.
+    clear_location = bool(params.get("clear_location"))
     if (latitude is None) != (longitude is None):
         raise InvalidParams("a location needs both a latitude and a longitude")
-    if not title and not author and latitude is None:
-        raise InvalidParams("give a title, an author or a location to set")
+    if clear_location and latitude is not None:
+        raise InvalidParams("clear_location and a new location contradict each other; send one")
+    if not title and not author and latitude is None and not clear_location:
+        raise InvalidParams("give a title, an author, a location or clear_location to set")
 
     exif = img.getexif()
+    if clear_location and TAG_GPS_IFD in exif:
+        del exif[TAG_GPS_IFD]
     if title:
         exif[TAG_DESCRIPTION] = title
         exif[TAG_XP_TITLE] = title.encode("utf-16-le") + b"\x00\x00"

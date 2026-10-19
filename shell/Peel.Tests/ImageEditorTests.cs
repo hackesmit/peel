@@ -34,7 +34,7 @@ public class ImageEditorTests
           {"id": "image.edit", "family": "tool", "label": "Edit", "group": "Images", "inputs": ["jpg", "jpeg", "png", "webp", "heic", "heif", "tiff", "tif", "avif", "bmp"], "output_ext": "same", "mode": "each", "needs_editor": true, "min_files": 1, "max_files": null, "accepts_dirs": false, "handled_by": "engine", "params": [{"name": "rotate", "type": "enum", "label": "Rotate", "default": 0, "required": false, "choices": [0, 90, 180, 270], "minimum": null, "maximum": null, "help": "Degrees clockwise."}, {"name": "flip", "type": "enum", "label": "Flip", "default": "none", "required": false, "choices": ["none", "horizontal", "vertical"], "minimum": null, "maximum": null, "help": ""}, {"name": "brightness", "type": "float", "label": "Brightness", "default": 1.0, "required": false, "choices": [], "minimum": 0.0, "maximum": 4.0, "help": ""}, {"name": "contrast", "type": "float", "label": "Contrast", "default": 1.0, "required": false, "choices": [], "minimum": 0.0, "maximum": 4.0, "help": ""}, {"name": "saturation", "type": "float", "label": "Saturation", "default": 1.0, "required": false, "choices": [], "minimum": 0.0, "maximum": 4.0, "help": ""}], "backends": ["pillow"], "missing_backends": [], "available": true},
           {"id": "image.annotate", "family": "tool", "label": "Annotate", "group": "Images", "inputs": ["jpg", "jpeg", "png", "webp", "heic", "heif", "tiff", "tif", "avif", "bmp"], "output_ext": "same", "mode": "each", "needs_editor": true, "min_files": 1, "max_files": 1, "accepts_dirs": false, "handled_by": "engine", "params": [{"name": "shapes", "type": "json", "label": "Shapes", "default": null, "required": true, "choices": [], "minimum": null, "maximum": null, "help": "A list of shapes. pen: points, color, width. arrow: from, to, color, width. rect: x, y, w, h, color, width, fill. text: x, y, text, color, size."}], "backends": ["pillow"], "missing_backends": [], "available": true},
           {"id": "image.redact", "family": "tool", "label": "Redact", "group": "Images", "inputs": ["jpg", "jpeg", "png", "webp", "heic", "heif", "tiff", "tif", "avif", "bmp"], "output_ext": "same", "mode": "each", "needs_editor": true, "min_files": 1, "max_files": 1, "accepts_dirs": false, "handled_by": "engine", "params": [{"name": "regions", "type": "json", "label": "Regions", "default": null, "required": true, "choices": [], "minimum": null, "maximum": null, "help": "A list of {x, y, w, h} rectangles to hide."}, {"name": "mode", "type": "enum", "label": "Hide with", "default": "blur", "required": false, "choices": ["blur", "box"], "minimum": null, "maximum": null, "help": ""}], "backends": ["pillow"], "missing_backends": [], "available": true},
-          {"id": "image.metadata", "family": "tool", "label": "Metadata", "group": "Images", "inputs": ["jpg", "jpeg", "png", "webp", "tiff", "tif", "heic", "heif", "avif"], "output_ext": "same", "mode": "each", "needs_editor": true, "min_files": 1, "max_files": 1, "accepts_dirs": false, "handled_by": "engine", "params": [{"name": "action", "type": "enum", "label": "Action", "default": "view", "required": false, "choices": ["view", "strip", "set"], "minimum": null, "maximum": null, "help": ""}, {"name": "title", "type": "string", "label": "Title", "default": null, "required": false, "choices": [], "minimum": null, "maximum": null, "help": ""}, {"name": "author", "type": "string", "label": "Author", "default": null, "required": false, "choices": [], "minimum": null, "maximum": null, "help": ""}, {"name": "latitude", "type": "float", "label": "Latitude", "default": null, "required": false, "choices": [], "minimum": -90.0, "maximum": 90.0, "help": ""}, {"name": "longitude", "type": "float", "label": "Longitude", "default": null, "required": false, "choices": [], "minimum": -180.0, "maximum": 180.0, "help": ""}], "backends": ["pillow"], "missing_backends": [], "available": true}]}]}
+          {"id": "image.metadata", "family": "tool", "label": "Metadata", "group": "Images", "inputs": ["jpg", "jpeg", "png", "webp", "tiff", "tif", "heic", "heif", "avif"], "output_ext": "same", "mode": "each", "needs_editor": true, "min_files": 1, "max_files": 1, "accepts_dirs": false, "handled_by": "engine", "params": [{"name": "action", "type": "enum", "label": "Action", "default": "view", "required": false, "choices": ["view", "strip", "set"], "minimum": null, "maximum": null, "help": ""}, {"name": "title", "type": "string", "label": "Title", "default": null, "required": false, "choices": [], "minimum": null, "maximum": null, "help": ""}, {"name": "author", "type": "string", "label": "Author", "default": null, "required": false, "choices": [], "minimum": null, "maximum": null, "help": ""}, {"name": "latitude", "type": "float", "label": "Latitude", "default": null, "required": false, "choices": [], "minimum": -90.0, "maximum": 90.0, "help": ""}, {"name": "longitude", "type": "float", "label": "Longitude", "default": null, "required": false, "choices": [], "minimum": -180.0, "maximum": 180.0, "help": ""}, {"name": "clear_location", "type": "bool", "label": "Clear location", "default": false, "required": false, "choices": [], "minimum": null, "maximum": null, "help": "With set: remove the GPS location and keep every other tag."}], "backends": ["pillow"], "missing_backends": [], "available": true}]}]}
     ], "warnings": []}
     """;
 
@@ -46,7 +46,7 @@ public class ImageEditorTests
 
     private static ActionEntry Entry(string id) => Entries[id];
 
-    private static ParamSchema Schema(string id) => new(Entry(id));
+    internal static ParamSchema Schema(string id) => new(Entry(id));
 
     // --- the schema the windows are built from -----------------------------
 
@@ -97,11 +97,15 @@ public class ImageEditorTests
         Assert.Equal(0.2, map.Scale, 6);
         Assert.Equal(800, map.ViewSize.Width, 6);
         Assert.Equal(600, map.ViewSize.Height, 6);
-        Assert.Equal(new Point(0, 0), map.ToImage(new Point(0, 0)));
-        Assert.Equal(new Point(2000, 1500), map.ToImage(new Point(400, 300)));
+        Assert.Equal(new Point(0, 0), map.ToPixel(new Point(0, 0)));
+        Assert.Equal(new Point(2000, 1500), map.ToPixel(new Point(400, 300)));
         // Past the edge of the picture, because that is where a drag ends.
-        Assert.Equal(new Point(3999, 2999), map.ToImage(new Point(9999, 9999)));
+        Assert.Equal(new Point(3999, 2999), map.ToPixel(new Point(9999, 9999)));
+        Assert.Equal(new Point(0, 0), map.ToPixel(new Point(-50, -50)));
+        // As an edge, a drag past the corner reaches the full size.
+        Assert.Equal(new Point(4000, 3000), map.ToImage(new Point(9999, 9999)));
         Assert.Equal(new Point(0, 0), map.ToImage(new Point(-50, -50)));
+        Assert.Equal(102.5, map.ToImage(new Point(20.5, 0)).X, 6);
         var box = map.ToView(1000, 500, 200, 100);
         Assert.Equal(new Rect(200, 100, 40, 20), box);
     }

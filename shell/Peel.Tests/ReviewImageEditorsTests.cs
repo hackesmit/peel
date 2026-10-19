@@ -74,8 +74,12 @@ public class ReviewImageEditorsTests
         fields.Latitude = string.Empty;
         fields.Longitude = string.Empty;
         var ok = fields.TrySet(out var parameters, out _);
+        // Round 1 fix: the engine gained clear_location, which removes the GPS
+        // directory and keeps every other tag; sending it is the "something
+        // that removes the location" this test asks for.
         Assert.False(
-            ok && !parameters.ContainsKey("latitude"),
+            ok && !parameters.ContainsKey("latitude")
+               && !(parameters.TryGetValue("clear_location", out var clear) && clear == "true"),
             "set was sent without the location the user removed, so the engine keeps the old GPS: "
             + JsonSerializer.Serialize(parameters));
     }

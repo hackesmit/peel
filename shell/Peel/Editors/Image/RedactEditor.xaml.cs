@@ -113,8 +113,15 @@ internal partial class RedactEditor : EditorWindowBase
         {
             return;
         }
-        Redraw(PixelBox.FromDrag(_from, _map.ToImage(e.GetPosition(Overlay)), _map.ImageWidth, _map.ImageHeight));
+        Redraw(Region(_from, _map.ToImage(e.GetPosition(Overlay))));
     }
+
+    /// <summary>
+    /// The region a drag means, in file pixels: rounded outward, then grown
+    /// until it is visible on the preview. This one value is both drawn and
+    /// sent, so the cover on screen is never bigger than what is destroyed.
+    /// </summary>
+    private Int32Rect Region(Point from, Point to) => PixelBox.Covering(_map, from, to);
 
     private void OnUp(object sender, MouseButtonEventArgs e)
     {
@@ -124,12 +131,13 @@ internal partial class RedactEditor : EditorWindowBase
         }
         _drawing = false;
         Overlay.ReleaseMouseCapture();
-        var box = PixelBox.FromDrag(_from, _map.ToImage(e.GetPosition(Overlay)), _map.ImageWidth, _map.ImageHeight);
+        var to = _map.ToImage(e.GetPosition(Overlay));
+        var dragged = PixelBox.FromDrag(_from, to, _map.ImageWidth, _map.ImageHeight);
         // A click with no drag is not a region: the engine would hide a single
         // pixel and the user would think nothing happened.
-        if (box.Width >= 2 && box.Height >= 2)
+        if (dragged.Width >= 2 && dragged.Height >= 2)
         {
-            _plan.Add(box);
+            _plan.Add(Region(_from, to));
         }
         Redraw();
         e.Handled = true;
@@ -153,11 +161,15 @@ internal partial class RedactEditor : EditorWindowBase
 
     private void Show(Int32Rect region, double opacity)
     {
+        // Exactly the region's footprint, never enlarged here: Region already
+        // grew the region itself when it was too small to see, so the cover
+        // and the pixels sent are the same rectangle. A WPF Rectangle draws
+        // its stroke inside its bounds, so the outline adds nothing outside.
         var view = _map.ToView(region.X, region.Y, region.Width, region.Height);
         var block = new Rectangle
         {
-            Width = Math.Max(1, view.Width),
-            Height = Math.Max(1, view.Height),
+            Width = view.Width,
+            Height = view.Height,
             Fill = new SolidColorBrush(Color.FromRgb(0x10, 0x10, 0x14)),
             Stroke = (Brush)FindResource("EditorAccent"),
             StrokeThickness = 1,

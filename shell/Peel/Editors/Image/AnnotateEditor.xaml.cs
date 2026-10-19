@@ -188,7 +188,7 @@ internal partial class AnnotateEditor : EditorWindowBase
 
     private void OnDown(object sender, MouseButtonEventArgs e)
     {
-        var at = _map.ToImage(e.GetPosition(Overlay));
+        var at = _map.ToPixel(e.GetPosition(Overlay));
         if (_tool == ShapeKind.Text)
         {
             Place(at);
@@ -209,7 +209,7 @@ internal partial class AnnotateEditor : EditorWindowBase
         {
             return;
         }
-        var at = _map.ToImage(e.GetPosition(Overlay));
+        var at = _map.ToPixel(e.GetPosition(Overlay));
         if (_tool == ShapeKind.Pen)
         {
             var last = _stroke[^1];
@@ -229,7 +229,7 @@ internal partial class AnnotateEditor : EditorWindowBase
         }
         _drawing = false;
         Overlay.ReleaseMouseCapture();
-        var at = _map.ToImage(e.GetPosition(Overlay));
+        var at = _map.ToPixel(e.GetPosition(Overlay));
         if (Pending(at) is { } shape)
         {
             _plan.Add(shape);
