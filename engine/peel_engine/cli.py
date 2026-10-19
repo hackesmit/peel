@@ -10,6 +10,17 @@ Three commands, one JSON object on stdout each, exit 0 when ``ok`` is true and
 Errors come back as ``{"ok": false, "message": ..., "code": ...}``. A traceback
 is printed only with ``PEEL_DEBUG=1`` set, because the shell shows ``message``
 to the user in a toast.
+
+That holds for misuse too: a missing or unknown subcommand, a missing action
+id or file list, a flag without its value or a ``--param`` that is not
+``KEY=VALUE`` all answer ``{"ok": false, "code": "usage", ...}`` on stdout with
+exit 1. argparse never prints its own usage text or exits 2. Only ``--help``
+and ``--version``, which a person types and the shell never sends, print plain
+text (exit 0).
+
+``peel options`` does not check that the files exist; the shell only ever
+passes paths it was just handed by a drag. A missing file is reported by
+``peel run`` (code ``missing_file``).
 """
 
 from __future__ import annotations
@@ -27,8 +38,27 @@ from .result import InvalidParams, PeelError
 PROG = "peel"
 
 
+class UsageError(PeelError):
+    """The command line itself is wrong. Stable code for the shell: usage."""
+
+    code = "usage"
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse that raises instead of printing usage and exiting 2.
+
+    Sub parsers inherit this class, so every level reports through it.
+    """
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        usage = " ".join(self.format_usage().split())
+        if usage.lower().startswith("usage: "):
+            usage = usage[len("usage: "):]
+        raise UsageError(f"{self.prog}: {message}", usage=usage)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog=PROG, description="Peel engine")
+    parser = _Parser(prog=PROG, description="Peel engine")
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
     parser.add_argument("--indent", type=int, default=None, help="pretty print the JSON")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -88,7 +118,7 @@ def parse_params(pairs: Sequence[str], params_file: Path | None = None) -> dict[
     for pair in pairs:
         key, sep, value = pair.partition("=")
         if not sep or not key:
-            raise InvalidParams(f"bad --param {pair!r}, expected KEY=VALUE")
+            raise InvalidParams(f"bad --param {pair!r}, expected KEY=VALUE", code="usage")
         if value.startswith("@"):
             path = Path(value[1:])
             try:
@@ -118,8 +148,10 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    indent: int | None = None
     try:
+        args = parser.parse_args(argv)
+        indent = args.indent
         payload = _dispatch(args)
     except PeelError as exc:
         payload = exc.to_result().to_dict()
@@ -134,7 +166,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "message": f"{type(exc).__name__}: {exc}",
             "code": "internal",
         }
-    print(json.dumps(payload, indent=args.indent, ensure_ascii=False))
+    print(json.dumps(payload, indent=indent, ensure_ascii=False))
     return 0 if payload.get("ok") else 1
 
 

@@ -7,11 +7,29 @@ exist. The shell renders exactly what ``peel options`` returns.
 An entry names its runner as a dotted ``module:function`` string, resolved only
 when the action actually runs, so listing options never imports a heavy
 dependency.
+
+Output contract for runners (every family bead relies on this):
+
+* ``job.output_path()`` (and ``job.reserve()``) CLAIM the name on disk before
+  returning it: the file is created empty with an exclusive create, so two peel
+  processes running at the same time can never be handed the same path. A
+  directory output is claimed with ``directory=True`` (an exclusive mkdir).
+* The runner then fills the claimed path in place. Python writes just open it
+  (``"wb"``). External tools must be told to overwrite the empty placeholder:
+  ``ffmpeg -y``, ``7z -y``; ImageMagick and vips overwrite by default. Tools
+  that choose their own output name (``soffice --convert-to``, ``pandoc`` with
+  extracted media) write into a temporary folder and the runner moves the
+  result onto the claim with ``os.replace``. Never delete and recreate a
+  claim, that reopens the race.
+* After the runner, any claim that is not in ``result.outputs`` and is still
+  empty is removed, and on a failed run every claim still empty is removed, so
+  a failure never leaves a zero byte file next to the source.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -110,7 +128,10 @@ class Param:
             result: Any = int(str(value).strip()) if not isinstance(value, bool) else int(value)
             return self._check_range(result)
         if self.type == "float":
-            return self._check_range(float(value))
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError(f"expected a finite number, got {value!r}")
+            return self._check_range(number)
         if self.type == "bool":
             if isinstance(value, bool):
                 return value
@@ -153,6 +174,8 @@ class Param:
 def _parse_timecode(value: Any) -> float:
     """Seconds from a number or an ``HH:MM:SS.mmm`` / ``MM:SS`` string."""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not math.isfinite(value):
+            raise ValueError(f"not a timecode: {value!r}")
         return float(value)
     text = str(value).strip()
     if not text:
@@ -163,6 +186,8 @@ def _parse_timecode(value: Any) -> float:
     total = 0.0
     for part in parts:
         total = total * 60 + float(part)
+    if not math.isfinite(total):
+        raise ValueError(f"not a timecode: {text!r}")
     return total
 
 
@@ -309,7 +334,10 @@ class Job:
     inputs: list[Path]
     params: dict[str, Any] = field(default_factory=dict)
     out_dir: Path | None = None
+    #: Names promised within this batch (shared across the jobs of one run).
     _reserved: list[Path] = field(default_factory=list, repr=False)
+    #: Paths this job claimed on disk, for cleanup after a failed run.
+    _claimed: list[Path] = field(default_factory=list, repr=False)
 
     @property
     def source(self) -> Path:
@@ -322,9 +350,12 @@ class Job:
         ext: str | None = None,
         tag: str | None = None,
         suffix: str = "",
+        directory: bool = False,
     ) -> Path:
-        """Reserve and return the next free output path for this job.
+        """Claim and return the next free output path for this job.
 
+        The path exists (an empty file, or an empty folder with ``directory``)
+        when this returns; see the output contract at the top of the module.
         ``suffix`` is appended to the stem before the extension, for runners
         that write several files from one source (page splits, snapshots).
         """
@@ -336,16 +367,39 @@ class Job:
         if suffix:
             name_tag = f"{name_tag} {suffix}" if name_tag else suffix
         path = naming.output_path(
-            source, extension, tag=name_tag, out_dir=self.out_dir, reserved=self._reserved
+            source,
+            extension,
+            tag=name_tag,
+            out_dir=self.out_dir,
+            reserved=self._reserved,
+            directory=directory,
         )
-        self._reserved.append(path)
+        self._remember(path)
         return path
 
-    def reserve(self, path: Path) -> Path:
-        """Reserve a path the runner built itself, so a sibling cannot take it."""
-        unique = naming.unique_path(Path(path), reserved=self._reserved)
-        self._reserved.append(unique)
+    def reserve(self, path: Path, *, directory: bool = False) -> Path:
+        """Claim a path the runner built itself (or the next free variant)."""
+        unique = naming.unique_path(Path(path), reserved=self._reserved, directory=directory)
+        self._remember(unique)
         return unique
+
+    def _remember(self, path: Path) -> None:
+        self._reserved.append(path)
+        self._claimed.append(path)
+
+    def release_unused(self, keep: Sequence[Path] = (), *, failed: bool = False) -> None:
+        """Remove claims not in ``keep``.
+
+        After a good run only claims that are still empty go. After a failed
+        run every claimed file not in ``keep`` goes, half written ones too: the
+        exclusive create means nobody else can have written them. A claimed
+        folder is only removed while empty.
+        """
+        kept = {naming.path_key(p) for p in keep}
+        for path in self._claimed:
+            if naming.path_key(path) in kept:
+                continue
+            naming.release(path, only_if_empty=not failed)
 
 
 class Registry:
@@ -354,6 +408,17 @@ class Registry:
     def __init__(self) -> None:
         self._actions: dict[str, Action] = {}
         self._labels: set[tuple[str, str, str]] = set()
+        #: Families that failed to load, as ``{code, module, message}``.
+        self.warnings: list[dict[str, str]] = []
+
+    def snapshot(self) -> tuple[dict[str, Action], set[tuple[str, str, str]]]:
+        """State to roll back to if a family fails half way through."""
+        return dict(self._actions), set(self._labels)
+
+    def restore(self, state: tuple[dict[str, Action], set[tuple[str, str, str]]]) -> None:
+        actions, labels = state
+        self._actions = dict(actions)
+        self._labels = set(labels)
 
     def register(self, action: Action) -> Action:
         if action.id in self._actions:
@@ -422,7 +487,12 @@ class Registry:
                     ],
                 }
             )
-        return {"ok": True, "files": [str(p) for p in paths], "wheels": wheels}
+        return {
+            "ok": True,
+            "files": [str(p) for p in paths],
+            "wheels": wheels,
+            "warnings": list(self.warnings),
+        }
 
     def run(
         self,
@@ -447,7 +517,17 @@ class Registry:
             backends.require(name)
         if out_dir is not None:
             out_dir = Path(out_dir)
-            out_dir.mkdir(parents=True, exist_ok=True)
+            if out_dir.exists() and not out_dir.is_dir():
+                raise UnsupportedInput(
+                    f"output folder {out_dir} is a file, not a folder", code="bad_out_dir"
+                )
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise UnsupportedInput(
+                    f"cannot create output folder {out_dir}: {exc.strerror or exc}",
+                    code="bad_out_dir",
+                ) from None
 
         if action.handled_by == SHELL:
             raise UnsupportedInput(
@@ -464,6 +544,14 @@ class Registry:
 
 
 def _call(runner: Callable[[Job], Result], job: Job) -> Result:
+    result = _invoke(runner, job)
+    # A failed run keeps nothing it claimed that is still empty; a good run
+    # drops only the empty claims it did not report as outputs.
+    job.release_unused(keep=result.outputs, failed=not result.ok)
+    return result
+
+
+def _invoke(runner: Callable[[Job], Result], job: Job) -> Result:
     try:
         result = runner(job)
     except PeelError as exc:
@@ -532,14 +620,18 @@ def validate_params(action: Action, given: dict[str, Any]) -> dict[str, Any]:
 _registry: Registry | None = None
 
 
-def load_registry(*, force: bool = False) -> Registry:
-    """Build the registry by discovering every family module. Cached."""
+def load_registry(*, force: bool = False, strict: bool = False) -> Registry:
+    """Build the registry by discovering every family module. Cached.
+
+    A family that fails to load is skipped and listed in ``warnings``; with
+    ``strict`` the failure is raised instead.
+    """
     global _registry
-    if _registry is None or force:
+    if _registry is None or force or strict:
         from .families import discover
 
         registry = Registry()
-        discover(registry)
+        discover(registry, strict=strict)
         _registry = registry
     return _registry
 

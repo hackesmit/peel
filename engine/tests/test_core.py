@@ -125,6 +125,46 @@ def test_a_double_extension_only_loses_the_last_part(make_file):
     assert naming.output_path(src, "zip").name == "site.tar.zip"
 
 
+def test_a_name_is_claimed_on_disk_before_it_is_returned(make_file):
+    src = make_file("claim.txt")
+    first = naming.output_path(src, "md")
+    assert first.exists() and first.stat().st_size == 0
+    assert naming.output_path(src, "md").name == "claim 2.md"
+
+
+def test_a_folder_output_is_claimed_with_mkdir(make_file):
+    src = make_file("pack.txt")
+    first = naming.output_path(src, "", directory=True)
+    assert first.is_dir() and first.name == "pack"
+    assert naming.output_path(src, "", directory=True).name == "pack 2"
+
+
+def test_reserved_names_compare_case_insensitively(make_file):
+    src = make_file("Case.txt")
+    promised = src.parent / "CASE.MD"
+    assert naming.output_path(src, "md", reserved=[promised]).name == "Case 2.md"
+
+
+def test_release_only_removes_an_empty_claim(make_file):
+    src = make_file("rel.txt")
+    empty = naming.output_path(src, "md")
+    full = naming.output_path(src, "md")
+    full.write_text("kept", encoding="utf-8")
+    naming.release(empty)
+    naming.release(full)
+    assert not empty.exists() and full.read_text(encoding="utf-8") == "kept"
+
+
+def test_concurrent_claims_never_share_a_name(make_file):
+    """Many threads racing for one name each get a different path."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    src = make_file("race.txt")
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        paths = list(pool.map(lambda _: naming.output_path(src, "md"), range(64)))
+    assert len({str(p) for p in paths}) == 64
+
+
 # --- params -----------------------------------------------------------------
 
 
@@ -147,6 +187,19 @@ def test_a_double_extension_only_loses_the_last_part(make_file):
 )
 def test_params_coerce_cli_strings(ptype, given, expected):
     assert Param("p", ptype, "P").coerce(given) == expected
+
+
+@pytest.mark.parametrize("given", ["nan", "inf", "-inf", "NaN", float("nan")])
+def test_a_float_param_must_be_finite(given):
+    param = Param(name="level", type="float", label="Level", minimum=0, maximum=1)
+    with pytest.raises(InvalidParams, match="finite"):
+        param.coerce(given)
+
+
+@pytest.mark.parametrize("given", ["inf", "1:inf", float("nan")])
+def test_a_timecode_must_be_finite(given):
+    with pytest.raises(InvalidParams):
+        Param(name="at", type="timecode", label="At").coerce(given)
 
 
 def test_an_enum_only_takes_its_choices():
@@ -475,6 +528,46 @@ def test_a_runner_blowing_up_becomes_a_message_not_a_traceback(registry, make_fi
     assert "Traceback" not in result.message
 
 
+def test_a_failed_run_leaves_no_claimed_file_behind(registry, make_file):
+    src = make_file("crash.txt")
+    result = registry.run("demo.half_write", [src])
+    assert result.ok is False and "encoder crashed" in result.message
+    assert sorted(p.name for p in src.parent.iterdir()) == ["crash.txt"]
+
+
+def test_a_good_run_drops_the_empty_claims_it_did_not_report(registry, make_file):
+    src = make_file("two.txt")
+    result = registry.run("demo.claim_two", [src])
+    assert result.ok is True
+    assert sorted(p.name for p in src.parent.iterdir()) == ["two (Two claims).out", "two.txt"]
+
+
+def test_a_tool_that_names_its_own_output_is_moved_onto_the_claim(registry, make_file):
+    src = make_file("doc.txt")
+    (src.parent / "doc.ext").write_text("older run", encoding="utf-8")
+    result = registry.run("demo.external", [src])
+    assert result.ok is True
+    assert result.outputs == [src.parent / "doc 2.ext"]
+    assert result.outputs[0].read_text(encoding="utf-8") == "from the tool"
+    assert (src.parent / "doc.ext").read_text(encoding="utf-8") == "older run"
+
+
+def test_a_folder_output_is_claimed_and_kept(registry, make_file):
+    src = make_file("bundle.txt")
+    result = registry.run("demo.extract", [src])
+    assert result.ok is True
+    assert result.outputs == [src.parent / "bundle"]
+    assert (src.parent / "bundle" / "inside.txt").exists()
+
+
+def test_an_out_dir_that_is_a_file_has_its_own_code(registry, make_file, tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("", encoding="utf-8")
+    with pytest.raises(UnsupportedInput) as info:
+        registry.run("demo.to_up", [make_file("a.txt")], out_dir=blocker)
+    assert info.value.code == "bad_out_dir"
+
+
 def test_a_runner_that_forgets_to_return_a_result_is_caught(registry, make_file):
     result = registry.run("demo.bad_return", [make_file("a.txt")])
     assert result.ok is False
@@ -602,7 +695,7 @@ def test_a_new_family_module_is_picked_up_without_touching_the_engine():
         load_registry(force=True)
 
 
-def test_a_family_module_without_register_is_a_loud_failure():
+def test_a_family_module_without_register_is_skipped_and_reported():
     probe = FAMILIES_DIR / "zz_broken.py"
     probe.write_text("VALUE = 1\n", encoding="utf-8")
     try:
@@ -610,11 +703,69 @@ def test_a_family_module_without_register_is_a_loud_failure():
 
         importlib.invalidate_caches()
         with pytest.raises(RuntimeError, match="has no register"):
-            load_registry(force=True)
+            load_registry(strict=True)
+        real = load_registry(force=True)
+        assert "text.to_md" in real
+        assert [w["module"] for w in real.warnings] == ["peel_engine.families.zz_broken"]
+        assert "has no register" in real.warnings[0]["message"]
     finally:
         probe.unlink()
         sys.modules.pop("peel_engine.families.zz_broken", None)
         load_registry(force=True)
+
+
+def test_the_shipped_families_load_with_no_warnings():
+    """The loud guard: a wheel label clash between real families fails CI."""
+    real = load_registry(strict=True)
+    assert real.warnings == []
+    assert load_registry(force=True).warnings == []
+
+
+def test_a_family_whose_register_raises_is_rolled_back_whole(make_file):
+    """A duplicate wheel label is fatal for that family only, and nothing it
+    registered before the clash is left on the wheel."""
+    probe = FAMILIES_DIR / "zz_clash.py"
+    probe.write_text(
+        textwrap.dedent(
+            '''
+            from peel_engine.registry import CONVERT
+
+
+            def register(registry):
+                registry.add(
+                    id="zz.first", family=CONVERT, label="Clash first", group="Clash",
+                    inputs=("txt",), output_ext="x", runner="peel_engine.families.zz_clash:run",
+                )
+                registry.add(
+                    id="zz.dup", family=CONVERT, label="MD", group="Documents",
+                    inputs=("txt",), output_ext="md", runner="peel_engine.families.zz_clash:run",
+                )
+            '''
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    try:
+        import importlib
+
+        importlib.invalidate_caches()
+        with pytest.raises(ValueError, match="duplicate wheel segment"):
+            load_registry(strict=True)
+        real = load_registry(force=True)
+        assert "zz.first" not in real and "zz.dup" not in real
+        assert "text.to_md" in real
+        options = real.options([make_file("a.txt")])
+        assert options["ok"] is True
+        assert "duplicate wheel segment" in options["warnings"][0]["message"]
+        report = check()
+        assert report["warnings"] and "failed to load" in report["message"]
+    finally:
+        probe.unlink()
+        sys.modules.pop("peel_engine.families.zz_clash", None)
+        load_registry(force=True)
+
+
+def test_options_always_carries_a_warnings_list(registry, make_file):
+    assert registry.options([make_file("a.txt")])["warnings"] == []
 
 
 # --- doctor -----------------------------------------------------------------
@@ -730,6 +881,40 @@ def test_cli_params_file_is_merged_and_pairs_win(tmp_path):
     params = tmp_path / "p.json"
     params.write_text('{"quality": 10, "mode": "box"}', encoding="utf-8")
     assert parse_params(["quality=90"], params) == {"quality": "90", "mode": "box"}
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        ["bogus"],
+        ["run"],
+        ["run", "text.to_md"],
+        ["run", "text.to_md", "a.txt", "--param"],
+        ["run", "text.to_md", "a.txt", "--param", "noequals"],
+        ["--indent", "x", "options"],
+        ["options", "--nope"],
+    ],
+)
+def test_cli_misuse_answers_one_json_object_with_code_usage(argv, capsys):
+    code = main(argv)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert code == 1
+    assert payload["ok"] is False and payload["code"] == "usage"
+    assert payload["message"]
+    assert captured.err == ""
+
+
+def test_windows_folder_variables_expand_with_fallbacks(monkeypatch):
+    for name in ("ProgramFiles", "PROGRAMFILES", "LOCALAPPDATA", "USERPROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    assert backends.expand_windows(r"%ProgramFiles%\x") == [r"C:\Program Files\x"]
+    assert backends.expand_windows(r"%LOCALAPPDATA%\x") == []
+    monkeypatch.setenv("ProgramFiles", r"D:\Apps")
+    monkeypatch.setenv("USERPROFILE", r"C:\Users\d")
+    assert backends.expand_windows(r"%ProgramFiles%\x") == [r"D:\Apps\x", r"C:\Program Files\x"]
+    assert backends.expand_windows(r"%LOCALAPPDATA%\x") == [r"C:\Users\d\AppData\Local\x"]
 
 
 @pytest.mark.parametrize("bad", ["quality", "=30", ""])

@@ -84,6 +84,39 @@ def needs_magick(job: Job) -> Result:
     return ok([], "never reached")
 
 
+def half_write_then_boom(job: Job) -> Result:
+    """Claims two names, half writes one, then dies like a crashed ffmpeg."""
+    first = job.output_path()
+    job.output_path(suffix="extra")
+    first.write_text("half", encoding="utf-8")
+    raise RuntimeError("encoder crashed")
+
+
+def claim_two_report_one(job: Job) -> Result:
+    used = job.output_path()
+    job.output_path(suffix="unused")
+    used.write_text("used", encoding="utf-8")
+    return ok([used], "one of two")
+
+
+def external_tool(job: Job) -> Result:
+    """The soffice pattern: the tool picks its own name, the runner moves it
+    onto the claim with os.replace."""
+    import os
+
+    target = job.output_path()
+    scratch = target.parent / ".peel-scratch-output"
+    scratch.write_text("from the tool", encoding="utf-8")
+    os.replace(scratch, target)
+    return ok([target], f"Wrote {target.name}")
+
+
+def extract_to_folder(job: Job) -> Result:
+    folder = job.output_path(ext="", directory=True)
+    (folder / "inside.txt").write_text("x", encoding="utf-8")
+    return ok([folder], f"Extracted to {folder.name}")
+
+
 # --- fixtures ---------------------------------------------------------------
 
 
@@ -214,6 +247,41 @@ def registry() -> Registry:
         output_ext="out",
         backends=("magick",),
         runner=f"{RUNNER}:needs_magick",
+    )
+    reg.add(
+        id="demo.half_write",
+        family=TOOL,
+        label="Crash",
+        group="Demo",
+        inputs=("txt",),
+        output_ext="out",
+        runner=f"{RUNNER}:half_write_then_boom",
+    )
+    reg.add(
+        id="demo.claim_two",
+        family=TOOL,
+        label="Two claims",
+        group="Demo",
+        inputs=("txt",),
+        output_ext="out",
+        runner=f"{RUNNER}:claim_two_report_one",
+    )
+    reg.add(
+        id="demo.external",
+        family=CONVERT,
+        label="External",
+        group="Demo",
+        inputs=("txt",),
+        output_ext="ext",
+        runner=f"{RUNNER}:external_tool",
+    )
+    reg.add(
+        id="demo.extract",
+        family=ACTION,
+        label="Extract",
+        group="Demo",
+        inputs=("txt",),
+        runner=f"{RUNNER}:extract_to_folder",
     )
     return reg
 
