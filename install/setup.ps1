@@ -21,7 +21,11 @@
 [CmdletBinding()]
 param(
     [string]$EnginePath = 'C:\peel-dev\main\engine',
-    [switch]$SkipWinget
+    [switch]$SkipWinget,
+    # Python for the venv, as the py launcher spells it: '3' (newest), '3.12'.
+    [string]$PythonVersion = '3',
+    # Delete and rebuild the venv, for example after changing -PythonVersion.
+    [switch]$RecreateVenv
 )
 
 $ErrorActionPreference = 'Stop'
@@ -116,12 +120,13 @@ $venvPeel = Join-Path $venv 'Scripts\peel.exe'
 
 New-Item -ItemType Directory -Force -Path $peelHome, $binDir | Out-Null
 
+if ($RecreateVenv -and (Test-Path $venv)) {
+    Write-Step "removing venv at $venv (-RecreateVenv)"
+    Remove-Item -Recurse -Force $venv
+}
 if (-not (Test-Path $venvPy)) {
-    Write-Step "creating venv at $venv"
-    # `py -3` is the newest installed CPython. Peel's module backends have
-    # verified wheels on 3.14; if a future wheel breaks, install 3.12 with
-    # `winget install Python.Python.3.12` and this picks the newest that works.
-    & py -3 -m venv $venv
+    Write-Step "creating venv at $venv with py -$PythonVersion"
+    & py "-$PythonVersion" -m venv $venv
     if (-not (Test-Path $venvPy)) { throw "venv creation failed at $venv" }
 } else {
     Write-Step "venv already present at $venv"
@@ -151,5 +156,15 @@ Add-ToUserPath $binDir
 
 # --- doctor ----------------------------------------------------------------
 Write-Step 'running peel doctor'
-& $venvPeel doctor
-exit $LASTEXITCODE
+$doctorJson = & $venvPeel doctor
+$doctorExit = $LASTEXITCODE
+$doctorJson
+if ($doctorExit -ne 0) { exit $doctorExit }
+# doctor reports ok even with gaps; fail the setup honestly when one is missing.
+$report = $doctorJson | Out-String | ConvertFrom-Json
+$missing = @($report.missing)
+if ($missing.Count -gt 0) {
+    Write-Step ("missing backends: " + ($missing -join ', '))
+    exit 2
+}
+exit 0
