@@ -16,6 +16,7 @@ finished George install, nothing here skips.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -1384,3 +1385,148 @@ def test_a_libreoffice_timeout_stops_the_whole_process_tree(registry, tmp_path, 
     assert not result.ok and result.code == "backend_timeout"
     time.sleep(8)
     assert [p.name for p in tmp_path.iterdir()] == ["a.txt"]
+
+
+# --- round 3: pandoc runs sandboxed on a staged copy -------------------------
+
+
+def _png(path: Path, colour=(10, 180, 10)) -> Path:
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (30, 20), colour).save(path, format="PNG")
+    return path
+
+
+def _epub_media(path: Path) -> list[str]:
+    with zipfile.ZipFile(path) as archive:
+        return [n for n in archive.namelist() if "/media/" in n]
+
+
+@needs_pandoc
+def test_images_beside_the_source_still_embed_in_html_and_epub(registry, tmp_path):
+    folder = tmp_path / "Imágenes de Ñandú"
+    _png(folder / "pic.png")
+    _png(folder / "raw.png", (200, 10, 10))
+    source = folder / "notes.md"
+    source.write_text("# Hi\n\n![a](pic.png)\n\n<img src=\"raw.png\">\n", encoding="utf-8")
+    html = run(registry, "docs.doc_to_html", source).outputs[0].read_text(encoding="utf-8")
+    assert html.count("data:image/png;base64") == 2
+    epub = run(registry, "docs.doc_to_epub", source).outputs[0]
+    assert len(_epub_media(epub)) == 2
+
+
+@needs_pandoc
+def test_a_stylesheet_inside_the_folder_still_brings_its_own_images(registry, tmp_path):
+    folder = tmp_path / "site"
+    _png(folder / "css" / "bg.png")
+    (folder / "css" / "look.css").write_text("body{background:url(bg.png)}", encoding="utf-8")
+    source = folder / "page.md"
+    source.write_text('<link rel="stylesheet" href="css/look.css">\n\nhi\n', encoding="utf-8")
+    html = run(registry, "docs.doc_to_html", source).outputs[0].read_text(encoding="utf-8")
+    assert "data:image/png;base64" in html
+
+
+@needs_pandoc
+@pytest.mark.skipif(os.name == "nt", reason="symlink creation needs privilege on Windows")
+def test_a_symlink_inside_the_folder_that_points_out_is_not_followed(registry, tmp_path):
+    secret, downloads = _secret(tmp_path)
+    os.symlink(secret.parent, downloads / "link")
+    source = downloads / "readme.md"
+    source.write_text("# hi\n\n![x](link/secret.png)\n", encoding="utf-8")
+    for action in ("docs.doc_to_docx", "docs.doc_to_html", "docs.doc_to_epub"):
+        assert not _leaks(run(registry, action, source).outputs[0]), action
+
+
+@needs_pandoc
+def test_a_network_path_counts_as_local_even_with_web_images_on(registry, tmp_path):
+    """//host/share is a Windows network path. On Linux //tmp/x is /tmp/x, so
+    the same reference doubles as a check that the path is never read."""
+    secret, downloads = _secret(tmp_path)
+    source = downloads / "readme.md"
+    double = "/" + secret.as_posix()
+    source.write_text(
+        f"# hi\n\n![x]({double})\n\n<img src=\"{double}\">\n\n"
+        f"![y](\\\\\\\\host\\\\share\\\\x.png)\n",
+        encoding="utf-8",
+    )
+    for action in ("docs.doc_to_html", "docs.doc_to_docx"):
+        result = run(registry, action, source, allow_remote=True)
+        assert not _leaks(result.outputs[0]), action
+        assert "outside" in result.message, result.message
+
+
+@needs_pandoc
+def test_web_images_are_embedded_when_the_run_allows_it(registry, tmp_path):
+    import http.server
+    import socketserver
+    import threading
+
+    picture = _png(tmp_path / "served.png").read_bytes()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(picture)))
+            self.end_headers()
+            self.wfile.write(picture)
+
+        def log_message(self, *args):
+            pass
+
+    server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/logo.png"
+    try:
+        folder = tmp_path / "doc"
+        folder.mkdir()
+        source = folder / "web.md"
+        source.write_text(f"![logo]({url})\n", encoding="utf-8")
+        html = run(registry, "docs.doc_to_html", source, allow_remote=True)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert "data:image/png;base64" in html.outputs[0].read_text(encoding="utf-8")
+
+
+def test_allow_remote_is_offered_only_where_a_web_image_can_land(registry):
+    for target in ("docx", "epub", "odt", "rtf", "pdf", "html"):
+        names = [p.name for p in registry.get(f"docs.doc_to_{target}").params]
+        assert names == ["allow_remote"], target
+    for target in ("txt", "md"):
+        assert registry.get(f"docs.doc_to_{target}").params == (), target
+
+
+def test_a_formula_with_a_cached_empty_result_is_a_blank_cell(registry, tmp_path):
+    """openpyxl reads a cached "" and a missing cached value both as None. The
+    cell type (t="str") tells them apart; no LibreOffice needed."""
+    pytest.importorskip("openpyxl")
+    from openpyxl import Workbook
+
+    book = Workbook()
+    sheet = book.active
+    sheet["A1"], sheet["B1"] = 1, '=IF(A1>5,"big","")'
+    raw = tmp_path / "raw.xlsx"
+    book.save(raw)
+    source = tmp_path / "book.xlsx"
+    with zipfile.ZipFile(raw) as src, zipfile.ZipFile(source, "w") as out:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename == "xl/worksheets/sheet1.xml":
+                data = data.replace(b'<c r="B1">', b'<c r="B1" t="str">')
+                assert b't="str"' in data
+            out.writestr(item, data)
+    rows = docs._read_workbook(source)
+    assert rows[0][1] == [[1, ""]]
+    # The same formula with no cached value at all is still not dropped.
+    assert docs._read_workbook(raw)[0][1] == [[1, '=IF(A1>5,"big","")']]
+
+
+def test_a_numeric_last_line_in_a_tight_vtt_cue_is_text(tmp_path):
+    source = tmp_path / "room.vtt"
+    source.write_text(
+        "WEBVTT\n\n00:00.000 --> 00:01.000\nRoom\n101\n00:01.000 --> 00:02.000\nnext\n",
+        encoding="utf-8",
+    )
+    assert [c.text for c in docs.read_cues(source)] == ["Room\n101", "next"]
