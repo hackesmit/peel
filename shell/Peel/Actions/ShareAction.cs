@@ -16,6 +16,7 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Threading;
 using Peel.Jobs;
 using Windows.ApplicationModel.DataTransfer;
 using Windows.Foundation;
@@ -38,18 +39,36 @@ internal static class ShareAction
     private static readonly Guid DataTransferManagerId =
         new(0xa5caee9b, 0x8708, 0x49d1, 0x8d, 0x36, 0x67, 0xd2, 0x5a, 0x8d, 0xa0, 0x0c);
 
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
     internal static void Run(IReadOnlyList<string> files, JobRunner jobs)
     {
+        if (!TryShow(files, out var error))
+        {
+            jobs.Report($"Share is not available: {error}");
+        }
+    }
+
+    /// <summary>
+    /// Raise the share sheet for the files. Returns false with the reason when
+    /// it cannot be raised (the bead's stop-when), so the caller can report it
+    /// and the scripted check can read it back.
+    /// </summary>
+    internal static bool TryShow(IReadOnlyList<string> files, out string error)
+    {
+        error = string.Empty;
         Window anchor;
         try
         {
             anchor = ShowAnchor();
         }
-        catch (Exception error)
+        catch (Exception ex)
         {
-            Log.Write("share: no anchor window", error);
-            jobs.Report($"Share could not open: {error.Message}");
-            return;
+            Log.Write("share: no anchor window", ex);
+            error = $"no anchor window: {ex.Message}";
+            return false;
         }
 
         try
@@ -95,15 +114,29 @@ internal static class ShareAction
             };
             manager.DataRequested += handler;
 
-            anchor.Deactivated += (_, _) => anchor.Dispatcher.BeginInvoke(() => anchor.Close());
+            // The share sheet is a separate system flyout anchored to this
+            // window; closing the window dismisses it, so the anchor must
+            // outlive the user's choice. It is not closed on deactivation (that
+            // fires the instant the sheet takes focus). A timer takes the 1x1
+            // invisible window down well after the sheet is done, and app exit
+            // closes it in any case.
+            var cleanup = new DispatcherTimer { Interval = TimeSpan.FromMinutes(2) };
+            cleanup.Tick += (_, _) =>
+            {
+                cleanup.Stop();
+                anchor.Close();
+            };
+            cleanup.Start();
             interop.ShowShareUIForWindow(hwnd);
             Log.Write($"share: share sheet raised for {files.Count} file(s)");
+            return true;
         }
-        catch (Exception error)
+        catch (Exception ex)
         {
-            Log.Write("share: the share sheet could not be raised from the tray process", error);
-            jobs.Report($"Share is not available: {error.Message}");
+            Log.Write("share: the share sheet could not be raised from the tray process", ex);
+            error = ex.Message;
             anchor.Close();
+            return false;
         }
     }
 
@@ -128,6 +161,10 @@ internal static class ShareAction
             Top = cursor.Y,
         };
         anchor.Show();
+        // The share sheet only appears for a foreground window, so take the
+        // foreground before raising it.
+        anchor.Activate();
+        SetForegroundWindow(new WindowInteropHelper(anchor).Handle);
         return anchor;
     }
 }

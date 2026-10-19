@@ -31,8 +31,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$app = Join-Path $Root 'shell\Peel\bin\Release\net8.0-windows\Peel.exe'
-if (-not (Test-Path $app)) { throw "build the shell first (dotnet build -c Release): $app" }
+# The output folder carries the target framework, which gained a Windows SDK
+# version when the Share action landed (net8.0-windows -> net8.0-windows10.0.x),
+# so match the folder rather than naming one version.
+$app = Get-ChildItem -Path (Join-Path $Root 'shell\Peel\bin\Release') -Filter 'net8.0-windows*' -Directory |
+    ForEach-Object { Join-Path $_.FullName 'Peel.exe' } | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $app) { throw "build the shell first (dotnet build -c Release): no Peel.exe under shell\Peel\bin\Release\net8.0-windows*" }
 
 if ($Test -eq 'drag') {
     $script = Join-Path $Root 'shell\tests\e2e-drag.ps1'
