@@ -28,10 +28,17 @@ Security:
   streamed, never the header sizes, and stop before writing past a limit. The
   7-Zip path refuses when the listed sizes exceed the budget, then watches the
   extract folder while 7-Zip runs and kills it on overflow.
-* Links. Tar hard links and symlinks that resolve inside the tree are written
-  as copies of their target (Windows cannot create symlinks without developer
-  mode). Members that are not files (devices, fifos) and links whose target is
-  missing are listed as skipped in the result message, never dropped silently.
+  A tar is read as a stream through a reader that charges every decompressed
+  byte (headers and skipped data too), and a PAX or GNU extended header over
+  1 MiB is refused before tarfile reads it. Every entry created on disk,
+  implicit parent folders included, counts once against max_members.
+* Links. Tar hard links and symlinks are resolved against the archive's own
+  namespace once every member is read, and written as copies of their target
+  (Windows cannot create symlinks without developer mode); a folder link
+  copies the target's whole resolved subtree. Members that are not files
+  (devices, fifos) and links that are missing, loop or point into their own
+  folder are listed as skipped in the result message, never dropped silently.
+  Conversions do the same for the symlinks 7-Zip writes.
 * A failed or refused Extract removes the folder this run claimed, so nothing
   half filled is left next to the source.
 """
@@ -62,6 +69,13 @@ GIB = 1 << 30
 RATIO_FLOOR = MIB
 #: Free disk space always kept back, whatever max_total_mb says.
 DISK_RESERVE = GIB
+#: Bytes a decompressed tar stream may run past max_total_mb (headers,
+#: padding, the end-of-archive record) before it is refused.
+STREAM_SLACK = 16 * MIB
+#: Largest PAX or GNU extended header read, and the longest chain of them
+#: before one member. Real ones are a few hundred bytes, one or two deep.
+MAX_TAR_META = MIB
+MAX_TAR_META_CHAIN = 8
 
 #: The extraction budget, as params on every entry that unpacks an archive.
 LIMIT_PARAMS = (
@@ -170,7 +184,10 @@ def _convert(job: Job, fmt: str) -> Result:
     ext = "tar.gz" if fmt == "gzip" else fmt
     target = job.output_path(source=_naming_source(job.source), ext=ext)
     scratch = job.scratch_dir(near=target)
-    skipped = _extract_archive(job.source, scratch, _Budget.for_job(job, scratch))
+    budget = _Budget.for_job(job, scratch)
+    skipped = _extract_archive(job.source, scratch, budget)
+    # 7-Zip may write real symlinks; the writers below see plain files only.
+    _flatten_links(scratch, budget, skipped)
     _make_archive(scratch, target, fmt)
     return ok([target], f"Repacked to {target.name}{_skipped_note(skipped)}")
 
@@ -202,19 +219,36 @@ def zip_up(job: Job) -> Result:
     """
     import zipfile
 
+    from ..naming import path_key
+
     target = job.output_path(source=job.source, ext="zip")
+    # The archive is built in a scratch folder and moved onto the claim at the
+    # end. Both can sit inside a dragged folder (the output goes beside the
+    # first item, which may live in a later item's tree), so the walk skips
+    # the claim and everything under the scratch folder: the zip never reads
+    # itself or its own staging file.
+    scratch = job.scratch_dir(near=target)
+    staging = scratch / "out.zip"
+    target_key = path_key(target)
+    scratch_key = path_key(scratch)
+
+    def ours(path: Path) -> bool:
+        key = path_key(path)
+        return key == target_key or key == scratch_key or key.startswith(scratch_key + os.sep)
+
     taken: set[str] = set()
     with zipfile.ZipFile(
-        target, "w", compression=zipfile.ZIP_DEFLATED, strict_timestamps=False
+        staging, "w", compression=zipfile.ZIP_DEFLATED, strict_timestamps=False
     ) as zf:
         for item in job.inputs:
             top = _unique_name(item.name, taken, folder=item.is_dir())
             if item.is_dir():
                 for path in sorted(item.rglob("*")):
-                    if path.is_file():
+                    if path.is_file() and not ours(path):
                         zf.write(path, f"{top}/{path.relative_to(item).as_posix()}")
             else:
                 zf.write(item, top)
+    os.replace(staging, target)
     count = len(job.inputs)
     noun = "item" if count == 1 else "items"
     return ok([target], f"Zipped {count} {noun} into {target.name}")
@@ -267,6 +301,7 @@ class _Budget:
     name: str
     used: int = 0
     count: int = 0
+    parsed: int = 0
     _total_is_disk: bool = field(default=False, repr=False)
 
     @classmethod
@@ -320,9 +355,33 @@ class _Budget:
             )
 
     def add_member(self, n: int = 1) -> None:
+        """Charge ``n`` entries created on disk (files, folders, implicit parents)."""
         self.count += n
         if self.count > self.members:
             self.refuse(f"it holds more than {self.members:,} entries (max_members)")
+
+    def note_parsed(self, n: int = 1) -> None:
+        """Count ``n`` entries read from the archive's index or headers.
+
+        A separate counter from ``add_member``: an entry is parsed once and
+        created once, and each side is held to max_members on its own, so a
+        link or a file is never charged twice against the same limit.
+        """
+        self.parsed += n
+        if self.parsed > self.members:
+            self.refuse(f"it holds more than {self.members:,} entries (max_members)")
+
+    def check_stream(self, read: int) -> None:
+        """Charge bytes read from a decompressed tar stream, headers included.
+
+        The stream carries file data plus 512-byte headers, padding and
+        extended headers, so it may run a little past the unpacked total; the
+        allowance is a fixed slack plus 1 KiB per entry parsed so far.
+        """
+        allowance = self.total + STREAM_SLACK + 1024 * self.parsed
+        if read > allowance:
+            self.check_total(self.total + 1)
+        self.check_ratio(read, self.packed, "the archive")
 
     def copy(self, src, out, name: str, packed: int | None = None, chunk: int = MIB) -> None:
         """Stream ``src`` to ``out``, refusing before any write past a limit.
@@ -369,18 +428,21 @@ def _extract_zip(source: Path, dest: Path, budget: _Budget) -> None:
     import zipfile
     import zlib
 
+    root = dest.resolve()
     try:
         with zipfile.ZipFile(source) as zf:
             infos = zf.infolist()
-            budget.add_member(len(infos))
+            budget.note_parsed(len(infos))
             # Every name is checked before anything is written.
             plan = [(info, _safe_target(dest, info.filename)) for info in infos]
             for info, target in plan:
                 if info.is_dir():
-                    target.mkdir(parents=True, exist_ok=True)
+                    _make_dirs(root, target, budget)
                     continue
                 budget.check_member(info.filename, info.file_size)
-                target.parent.mkdir(parents=True, exist_ok=True)
+                _make_dirs(root, target.parent, budget)
+                if not os.path.lexists(target):
+                    budget.add_member()
                 with zf.open(info) as src, open(target, "wb") as out:
                     budget.copy(src, out, info.filename, packed=info.compress_size)
     except zipfile.BadZipFile as exc:
@@ -391,42 +453,176 @@ def _extract_zip(source: Path, dest: Path, budget: _Budget) -> None:
         raise RunnerFailed(f"Cannot extract {source.name}: {_clean(exc)}") from None
 
 
-def _extract_tar(source: Path, dest: Path, budget: _Budget, skipped: list[str]) -> None:
-    import tarfile
+def _extract_tar(source: Path, dest: Path, budget: _Budget, skipped: list[str], opener=None) -> None:
+    """Extract a tar, plain or compressed, as a stream read against the budget.
 
-    links: list[tuple[str, Path, Path]] = []
+    The decompressed bytes go through ``_BudgetReader``, so every byte tarfile
+    reads (headers, skipped member data, extended headers) is charged before
+    the next block is decompressed, and ``_bounded_tarinfo`` refuses an
+    oversized PAX or GNU extended header before tarfile allocates it. Files
+    are written as they stream past; links are recorded in a logical tree and
+    written once the whole archive has been read.
+    """
+    import lzma
+    import tarfile
+    import zlib
+
+    root = dest.resolve()
+    tree = _TarTree()
     try:
-        with tarfile.open(source) as tf:
-            for member in tf:
-                budget.add_member()
-                target = _safe_target(dest, member.name)
-                if member.isdir():
-                    target.mkdir(parents=True, exist_ok=True)
-                    continue
-                if member.issym() or member.islnk():
-                    # A link whose target escapes the tree is the tar form of
-                    # zip-slip; it is refused here, before anything is copied.
-                    links.append((member.name, target, _link_origin(dest, member)))
-                    continue
-                if not member.isfile():
-                    skipped.append(f"{member.name} ({_tar_kind(member)})")
-                    continue
-                budget.check_member(member.name, member.size)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                extracted = tf.extractfile(member)
-                if extracted is None:  # pragma: no cover - isfile() above
-                    skipped.append(f"{member.name} (unreadable)")
-                    continue
-                with extracted as src, open(target, "wb") as out:
-                    budget.copy(src, out, member.name)
-    except (tarfile.TarError, EOFError) as exc:
+        with (opener or _tar_opener(source))(source, "rb") as raw:
+            reader = _BudgetReader(raw, budget)
+            with tarfile.open(fileobj=reader, mode="r|", tarinfo=_bounded_tarinfo()) as tf:
+                for member in tf:
+                    _read_tar_member(tf, member, dest, root, tree, budget, skipped)
+    except _TarMetaRefused as exc:
+        budget.refuse(str(exc))
+    except (tarfile.TarError, EOFError, lzma.LZMAError, zlib.error) as exc:
         raise RunnerFailed(f"{source.name} is not a valid tar: {_clean(exc)}") from None
     except OSError as exc:
         if isinstance(exc, (FileNotFoundError, PermissionError)) or exc.filename:
             raise
         # gzip, bz2 and lzma report a damaged stream as a bare OSError.
         raise RunnerFailed(f"{source.name} is corrupt: {_clean(exc)}") from None
-    _materialize_links(dest, links, budget, skipped)
+    _materialize_links(root, tree, budget, skipped)
+
+
+def _read_tar_member(tf, member, dest: Path, root: Path, tree: "_TarTree", budget: _Budget, skipped: list[str]) -> None:
+    budget.note_parsed()
+    target = _safe_target(dest, member.name)
+    key = _logical_key(dest, member.name)
+    if member.isdir():
+        tree.add(key, "dir", skipped)
+        _make_dirs(root, target, budget)
+        return
+    if member.issym() or member.islnk():
+        # A link whose target escapes the tree is the tar form of zip-slip; it
+        # is refused here, before anything is written.
+        kind = "sym" if member.issym() else "hard"
+        tree.add_link(key, kind, _link_key(dest, member), skipped)
+        return
+    if not member.isfile():
+        skipped.append(f"{member.name} ({_tar_kind(member)})")
+        tree.add(key, "other", skipped)
+        return
+    budget.check_member(member.name, member.size)
+    _make_dirs(root, target.parent, budget)
+    if not os.path.lexists(target):
+        budget.add_member()
+    tree.add(key, "file", skipped)
+    extracted = tf.extractfile(member)
+    if extracted is None:  # pragma: no cover - isfile() above
+        skipped.append(f"{member.name} (unreadable)")
+        return
+    with extracted as src, open(target, "wb") as out:
+        budget.copy(src, out, member.name)
+
+
+def _tar_opener(source: Path):
+    """The opener for a ``.tar`` file: plain, or compressed despite its name."""
+    import bz2
+    import gzip
+    import lzma
+
+    with open(source, "rb") as fh:
+        magic = fh.read(6)
+    if magic.startswith(b"\x1f\x8b"):
+        return gzip.open
+    if magic.startswith(b"BZh"):
+        return bz2.open
+    if magic.startswith(b"\xfd7zXZ\x00"):
+        return lzma.open
+    return open
+
+
+class _BudgetReader:
+    """A read-only stream that charges every byte read against the budget."""
+
+    def __init__(self, raw, budget: _Budget) -> None:
+        self.raw = raw
+        self.budget = budget
+        self.read_bytes = 0
+
+    def read(self, size: int = -1) -> bytes:
+        if size is None or size < 0:
+            parts = []
+            while True:
+                block = self.read(MIB)
+                if not block:
+                    return b"".join(parts)
+                parts.append(block)
+        data = self.raw.read(size)
+        self.read_bytes += len(data)
+        self.budget.check_stream(self.read_bytes)
+        return data
+
+
+class _TarMetaRefused(Exception):
+    """An extended tar header too large (or chained too deep) to read."""
+
+
+_BOUNDED_TARINFO = None
+
+
+def _bounded_tarinfo():
+    """A TarInfo class that refuses oversized PAX and GNU extended headers.
+
+    tarfile reads an extended header's whole declared payload into memory
+    before it returns the member it describes, so the size is checked here,
+    on the header block alone, before that read.
+    """
+    global _BOUNDED_TARINFO
+    if _BOUNDED_TARINFO is not None:
+        return _BOUNDED_TARINFO
+    import tarfile
+
+    extended = (
+        tarfile.GNUTYPE_LONGNAME,
+        tarfile.GNUTYPE_LONGLINK,
+        tarfile.XHDTYPE,
+        tarfile.XGLTYPE,
+        tarfile.SOLARIS_XHDTYPE,
+    )
+
+    class BoundedTarInfo(tarfile.TarInfo):
+        def _proc_member(self, tf):
+            if self.type not in extended:
+                return super()._proc_member(tf)
+            if self.size > MAX_TAR_META:
+                raise _TarMetaRefused(
+                    f"it has an extended tar header of {self.size:,} bytes "
+                    f"(peel reads at most {MAX_TAR_META // MIB} MB)"
+                )
+            depth = getattr(tf, "_peel_meta_depth", 0)
+            if depth >= MAX_TAR_META_CHAIN:
+                raise _TarMetaRefused(
+                    f"it chains more than {MAX_TAR_META_CHAIN} extended tar headers"
+                )
+            tf._peel_meta_depth = depth + 1
+            try:
+                return super()._proc_member(tf)
+            finally:
+                tf._peel_meta_depth = depth
+
+    _BOUNDED_TARINFO = BoundedTarInfo
+    return BoundedTarInfo
+
+
+def _looks_like_tar(head: bytes) -> bool:
+    """True when ``head`` is one valid tar header block (checksum and all).
+
+    This parses the 512 bytes only, never what an extended header declares,
+    so probing an untrusted stream costs one block.
+    """
+    import tarfile
+
+    if len(head) < 512 or not any(head):
+        return False
+    try:
+        tarfile.TarInfo.frombuf(head[:512], "utf-8", "surrogateescape")
+    except tarfile.HeaderError:
+        return False
+    return True
 
 
 def _extract_compressed(source: Path, dest: Path, budget: _Budget, skipped: list[str]) -> None:
@@ -434,22 +630,18 @@ def _extract_compressed(source: Path, dest: Path, budget: _Budget, skipped: list
     import bz2
     import gzip
     import lzma
-    import tarfile
 
     dest.mkdir(parents=True, exist_ok=True)
     ext = source.suffix.lower().lstrip(".")
     opener = {"gz": gzip.open, "tgz": gzip.open, "bz2": bz2.open, "xz": lzma.open}[ext]
     try:
-        # tarfile reads a zero block as an empty archive, so a compressed disk
-        # image (or a stream of zeros) would "extract" to nothing. A tar starts
-        # with a real header block.
         with opener(source, "rb") as probe:
             head = probe.read(512)
-        is_tar = any(head) and tarfile.is_tarfile(source)
+        is_tar = _looks_like_tar(head)
     except (OSError, EOFError, lzma.LZMAError):
         is_tar = False
     if is_tar:
-        _extract_tar(source, dest, budget, skipped)
+        _extract_tar(source, dest, budget, skipped, opener=opener)
         return
     inner = source.name[: -len(source.suffix)] or "data"
     budget.add_member()
@@ -539,6 +731,7 @@ def _watch_7z(args: list[str], source: Path, dest: Path, budget: _Budget, timeou
 
     def check() -> None:
         used, count, name, size = _tree_usage(dest)
+        budget.used = used
         budget.count = 0
         budget.add_member(count)
         budget.check_member(name, size)
@@ -578,8 +771,121 @@ def _watch_7z(args: list[str], source: Path, dest: Path, budget: _Budget, timeou
 # --- links ------------------------------------------------------------------
 
 
-def _link_origin(dest: Path, member) -> Path:
-    """The extracted path a tar link copies, refusing a link out of the tree.
+class _Unresolved(Exception):
+    """A link that leads nowhere; the text is the reason shown as Skipped."""
+
+
+_VISITING = object()
+#: Most links followed while resolving one path, as on Linux.
+MAX_LINK_HOPS = 40
+
+
+def _within(path: str, folder: str) -> bool:
+    """True when logical ``path`` is ``folder`` or lies under it."""
+    return folder == "" or path == folder or path.startswith(folder + "/")
+
+
+class _TarTree:
+    """The archive's own namespace: every member by its logical path.
+
+    Keys are member names normalised to forward slashes, "" for the root.
+    Parents that no member names are implicit folders. Links are resolved
+    here, against the archive, never against the partly written disk, so a
+    directory link sees every link inside its target whatever the member
+    order, and a loop is found instead of followed.
+    """
+
+    def __init__(self) -> None:
+        self.nodes: dict[str, tuple[str, str | None]] = {}
+        self.children: dict[str, set[str]] = {}
+        self.links: list[str] = []
+        self._memo: dict[str, object] = {}
+
+    def _register(self, key: str) -> None:
+        parts = key.split("/")
+        for i, part in enumerate(parts):
+            self.children.setdefault("/".join(parts[:i]), set()).add(part)
+
+    def add(self, key: str, kind: str, skipped: list[str]) -> None:
+        if not key:
+            return
+        old = self.nodes.get(key)
+        if old is not None and old[0] in ("sym", "hard"):
+            skipped.append(f"{key} (link over an existing name)")
+        self.nodes[key] = (kind, None)
+        self._register(key)
+
+    def add_link(self, key: str, kind: str, target: str, skipped: list[str]) -> None:
+        if not key or key in self.nodes or key in self.children:
+            skipped.append(f"{key or '.'} (link over an existing name)")
+            return
+        self.nodes[key] = (kind, target)
+        self.links.append(key)
+        self._register(key)
+
+    def kind(self, key: str) -> str | None:
+        if key == "":
+            return "dir"
+        node = self.nodes.get(key)
+        if node is not None:
+            if node[0] in ("sym", "hard") and key in self.children:
+                # Later members were written under the link's name, so on
+                # disk it is a real folder and the link cannot be placed.
+                return "dir"
+            return node[0]
+        return "dir" if key in self.children else None
+
+    def is_link(self, key: str) -> bool:
+        return self.kind(key) in ("sym", "hard")
+
+    def resolve(self, path: str, hops: int = 0) -> str:
+        """The logical path of the real entry ``path`` leads to."""
+        current = ""
+        parts = [p for p in path.split("/") if p]
+        for i, part in enumerate(parts):
+            candidate = f"{current}/{part}" if current else part
+            kind = self.kind(candidate)
+            if kind is None:
+                raise _Unresolved("link to a missing file")
+            if kind in ("sym", "hard"):
+                candidate = self.resolve_link(candidate, hops + 1)
+                kind = self.kind(candidate)
+            if i < len(parts) - 1 and kind != "dir":
+                raise _Unresolved("link to a missing file")
+            current = candidate
+        return current
+
+    def resolve_link(self, key: str, hops: int = 0) -> str:
+        memo = self._memo.get(key)
+        if memo is _VISITING:
+            raise _Unresolved("link loop")
+        if isinstance(memo, _Unresolved):
+            raise memo
+        if isinstance(memo, str):
+            return memo
+        if hops > MAX_LINK_HOPS:
+            raise _Unresolved("link loop")
+        self._memo[key] = _VISITING
+        try:
+            result = self.resolve(self.nodes[key][1] or "", hops)
+        except _Unresolved as exc:
+            self._memo[key] = exc
+            raise
+        self._memo[key] = result
+        return result
+
+
+def _logical_key(dest: Path, name: str) -> str:
+    """A member name as a logical tree key (validated like ``_safe_target``)."""
+    _safe_target(dest, name)
+    if not name or name in (".", "./"):
+        return ""
+    parts = [p for p in PureWindowsPath(name).parts if p not in ("", ".")]
+    return "/".join(parts)
+
+
+def _link_key(dest: Path, member) -> str:
+    """The logical path a tar link points at, refusing a link out of the tree.
 
     A hard link names its target from the archive root; a symlink is relative
     to the folder that holds it. Absolute targets are refused either way.
@@ -592,53 +898,130 @@ def _link_origin(dest: Path, member) -> Path:
     joined = posixpath.normpath(link)
     if joined == ".." or joined.startswith("../"):
         raise RunnerFailed(f"refused unsafe archive link: {member.name!r} -> {member.linkname!r}")
-    return _safe_target(dest, joined)
+    return _logical_key(dest, joined)
 
 
-def _materialize_links(
-    dest: Path, links: list[tuple[str, Path, Path]], budget: _Budget, skipped: list[str]
-) -> None:
-    """Write each link as a copy of what it points at.
+def _make_dirs(root: Path, folder: Path, budget: _Budget) -> None:
+    """Create ``folder`` and any missing parents, charging each one created."""
+    missing = []
+    path = folder
+    while path != root and not os.path.lexists(path):
+        missing.append(path)
+        path = path.parent
+    if not path.is_dir():
+        clash = path.relative_to(root).as_posix() if root in path.parents else path.name
+        raise RunnerFailed(f"Cannot extract {budget.name}: {clash} is both a file and a folder")
+    if missing:
+        budget.add_member(len(missing))
+        for path in reversed(missing):
+            path.mkdir()
 
-    Links to links resolve over several rounds; whatever never resolves is a
-    link to a missing member and is reported as skipped.
+
+def _materialize_links(root: Path, tree: _TarTree, budget: _Budget, skipped: list[str]) -> None:
+    """Write each link as a copy of what it resolves to in the archive.
+
+    A file link copies the file. A folder link copies the target's whole
+    logical subtree, links inside it included (resolved the same way), so the
+    copy is complete whatever order the members came in. A link that leads to
+    a missing entry, round in a loop, or into its own folder is listed as
+    skipped, never dropped silently.
     """
-    pending = links
-    while pending:
-        rest = []
-        for name, target, origin in pending:
-            if os.path.lexists(target):
-                skipped.append(f"{name} (link over an existing name)")
-            elif origin.is_file():
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with open(origin, "rb") as src, open(target, "wb") as out:
-                    budget.add_member()
-                    budget.copy(src, out, name)
-            elif origin.is_dir():
-                if origin == target or origin in target.parents:
-                    skipped.append(f"{name} (link to its own folder)")
-                else:
-                    _copy_tree(origin, target, budget, name)
-            else:
-                rest.append((name, target, origin))
-        if len(rest) == len(pending):
-            skipped.extend(f"{name} (link to a missing file)" for name, _, _ in rest)
-            break
-        pending = rest
+    for key in tree.links:
+        if not tree.is_link(key):
+            skipped.append(f"{key} (link over an existing name)")
+            continue
+        try:
+            canon = tree.resolve_link(key)
+        except _Unresolved as exc:
+            skipped.append(f"{key} ({exc})")
+            continue
+        kind = tree.kind(canon)
+        out = _safe_target(root, key)
+        if kind == "dir":
+            if _within(key, canon):
+                skipped.append(f"{key} (link to its own folder)")
+                continue
+            _copy_logical_dir(root, tree, canon, out, key, budget, skipped)
+        elif kind == "file":
+            _copy_logical_file(root, canon, out, key, budget)
+        else:
+            skipped.append(f"{key} (link to a skipped entry)")
 
 
-def _copy_tree(origin: Path, target: Path, budget: _Budget, name: str) -> None:
-    target.mkdir(parents=True, exist_ok=True)
-    for path in sorted(origin.rglob("*")):
-        rel = path.relative_to(origin)
-        out_path = target / rel
+def _copy_logical_file(root: Path, canon: str, out: Path, name: str, budget: _Budget) -> None:
+    _make_dirs(root, out.parent, budget)
+    if not os.path.lexists(out):
         budget.add_member()
-        if path.is_dir():
-            out_path.mkdir(parents=True, exist_ok=True)
-        elif path.is_file():
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "rb") as src, open(out_path, "wb") as out:
-                budget.copy(src, out, f"{name}/{rel.as_posix()}")
+    with open(_safe_target(root, canon), "rb") as src, open(out, "wb") as out_file:
+        budget.copy(src, out_file, name)
+
+
+def _copy_logical_dir(
+    root: Path, tree: _TarTree, canon: str, out: Path, name: str, budget: _Budget, skipped: list[str]
+) -> None:
+    """Copy the logical folder ``canon`` to ``out``, following its links.
+
+    ``anchors`` holds the folders each link in the current chain jumped to;
+    a link back to one of them (or to a folder above the current one) is a
+    loop and is skipped. Each copied entry is charged to the budget, so a
+    link that doubles a tree at every level stops at the limits.
+    """
+    work = [(canon, out, name, (canon,))]
+    while work:
+        folder, out_dir, out_name, anchors = work.pop()
+        _make_dirs(root, out_dir, budget)
+        for child in sorted(tree.children.get(folder, ()), reverse=True):
+            src = f"{folder}/{child}" if folder else child
+            dst = out_dir / child
+            dst_name = f"{out_name}/{child}"
+            chain = anchors
+            kind = tree.kind(src)
+            if kind in ("sym", "hard"):
+                try:
+                    src = tree.resolve_link(src)
+                except _Unresolved as exc:
+                    skipped.append(f"{dst_name} ({exc})")
+                    continue
+                kind = tree.kind(src)
+                if kind == "dir":
+                    if _within(folder, src) or any(_within(a, src) for a in anchors):
+                        skipped.append(f"{dst_name} (link to its own folder)")
+                        continue
+                    chain = anchors + (src,)
+            if kind == "dir":
+                work.append((src, dst, dst_name, chain))
+            elif kind == "file":
+                _copy_logical_file(root, src, dst, dst_name, budget)
+            else:
+                skipped.append(f"{dst_name} (not a file)")
+
+
+def _flatten_links(tree: Path, budget: _Budget, skipped: list[str]) -> None:
+    """Replace the symlinks 7-Zip may write in a scratch tree before repacking.
+
+    A link to a file inside the tree becomes a copy of it. A folder link, a
+    dangling link or one that leaves the tree is removed and listed as
+    skipped, so a conversion never drops an entry silently.
+    """
+    root = os.path.realpath(tree)
+    for folder, dirs, files in os.walk(tree, followlinks=False):
+        for name in sorted(dirs + files):
+            path = os.path.join(folder, name)
+            if not os.path.islink(path):
+                continue
+            rel = Path(path).relative_to(tree).as_posix()
+            real = os.path.realpath(path)
+            inside = real == root or real.startswith(root + os.sep)
+            os.unlink(path)
+            if inside and os.path.isfile(real):
+                with open(real, "rb") as src, open(path, "wb") as out:
+                    budget.copy(src, out, rel)
+            elif inside and os.path.isdir(real):
+                skipped.append(f"{rel} (folder link)")
+            elif inside:
+                skipped.append(f"{rel} (link to a missing file)")
+            else:
+                skipped.append(f"{rel} (link out of the archive)")
 
 
 def _tar_kind(member) -> str:
