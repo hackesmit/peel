@@ -125,10 +125,10 @@ def test_r2_broken_family_leaves_run_and_doctor_working(tmp_path):
     probe.write_text("raise ImportError('fitz missing')\n", encoding="utf-8")
     try:
         importlib.invalidate_caches()
-        src = tmp_path / "a.txt"
-        src.write_text("hi", encoding="utf-8")
-        run = json.loads(_cli("run", "text.to_md", str(src), cwd=tmp_path).stdout)
-        assert run["ok"] is True and (tmp_path / "a.md").read_text() == "hi"
+        src = tmp_path / "a.srt"
+        src.write_text("1\n00:00:01,000 --> 00:00:02,000\nhello\n", encoding="utf-8")
+        run = json.loads(_cli("run", "docs.sub_to_txt", str(src), cwd=tmp_path).stdout)
+        assert run["ok"] is True and (tmp_path / "a.txt").read_text() == "hello\n"
         opts = json.loads(_cli("options", str(src), cwd=tmp_path).stdout)
         assert any(w["module"].endswith("zz_review2_raises") for w in opts["warnings"])
         doc = _cli("doctor", cwd=tmp_path)
@@ -142,9 +142,9 @@ def test_r2_broken_family_leaves_run_and_doctor_working(tmp_path):
 # B3 variants: every misuse answers one JSON object on stdout, exit 1.
 @pytest.mark.parametrize("argv", [
     (), ("doctor", "extra"), ("--indent",), ("--indent", "x", "options"),
-    ("run", "text.to_md", "a.txt", "--par", "k=v"),
-    ("run", "text.to_md", "a.txt", "--out-dir"),
-    ("run", "text.to_md", "a.txt", "--param", "=x"),
+    ("run", "docs.sub_to_txt", "a.srt", "--par", "k=v"),
+    ("run", "docs.sub_to_txt", "a.srt", "--out-dir"),
+    ("run", "docs.sub_to_txt", "a.srt", "--param", "=x"),
 ])
 def test_r2_misuse_is_json(tmp_path, argv):
     proc = _cli(*argv, cwd=tmp_path)
