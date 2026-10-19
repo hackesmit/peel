@@ -95,6 +95,9 @@ public sealed class Probe : Application
     private void Terminal(string[] files, StringBuilder report)
     {
         var folder = TerminalAction.FolderFor(files);
+        // The user's own Windows Terminal windows must survive the probe, so
+        // record the hosts already running and only kill ones that appear after.
+        var before = new HashSet<int>(Process.GetProcessesByName("WindowsTerminal").Select(p => p.Id));
         Process? process = null;
         var which = "wt.exe";
         try
@@ -116,10 +119,14 @@ public sealed class Probe : Application
         try
         {
             // wt.exe hands off to a WindowsTerminal.exe host and exits, so kill
-            // the terminal window by its host rather than the launcher.
+            // the terminal window by its host, but only the host this probe
+            // started, never a window the user already had open.
             foreach (var host in Process.GetProcessesByName("WindowsTerminal"))
             {
-                host.Kill(entireProcessTree: true);
+                if (!before.Contains(host.Id))
+                {
+                    host.Kill(entireProcessTree: true);
+                }
             }
             if (!process.HasExited)
             {
