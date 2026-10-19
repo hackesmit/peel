@@ -49,6 +49,16 @@ A consequence worth knowing: the wheel reads "..." until the pointer reaches
 the ring, because that is when OLE offers the data. Moving towards a segment is
 exactly the motion that fills it in.
 
+Two safety nets sit behind them. `Wheel/StuckOverlayWatch.cs` asks Windows for
+the physical mouse button twice a second rather than trusting the remembered
+drag state, because a low level hook that answers too slowly is skipped
+silently and the button up can simply go missing; a wheel left up with the
+button released is taken down within a few seconds. And the engine is only ever
+started as a real executable: the installer's `peel.cmd` shim is deliberately
+ignored, because a .cmd goes through cmd.exe, which parses its own command line
+after .NET has quoted the arguments, and a file named `a&calc&b.png` would then
+run calc.
+
 ## Build and test from hqbox
 
 ```

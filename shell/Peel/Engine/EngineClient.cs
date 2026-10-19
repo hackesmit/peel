@@ -41,9 +41,12 @@ internal sealed class EngineClient
     internal EngineLocation? Location => _location.Value;
 
     /// <summary>
-    /// Where the CLI is. The venv executable is preferred over the .cmd shim:
-    /// a .cmd goes through cmd.exe, whose own parsing of &amp; and ^ would break
-    /// on file names that legally contain them.
+    /// Where the CLI is. Only real executables are ever run. The installer
+    /// also writes a peel.cmd shim, and Peel deliberately ignores it: a .cmd
+    /// has to go through cmd.exe, which parses its own command line after
+    /// .NET has quoted the arguments, so a file called "a&amp;calc&amp;b.png" would
+    /// run calc. Every candidate below is started directly, with the paths as
+    /// real arguments, where no shell ever sees them.
     /// </summary>
     private static EngineLocation? Locate()
     {
@@ -83,11 +86,6 @@ internal sealed class EngineClient
             }
         }
 
-        var shim = Path.Combine(local, "Peel", "bin", "peel.cmd");
-        if (File.Exists(shim))
-        {
-            return new EngineLocation("cmd.exe", new[] { "/c", shim }, "peel.cmd shim");
-        }
         return null;
     }
 

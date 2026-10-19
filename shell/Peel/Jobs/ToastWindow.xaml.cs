@@ -35,6 +35,7 @@ internal partial class ToastWindow : Window
     private readonly DispatcherTimer _dismiss;
     private readonly Storyboard _pulse;
     private IReadOnlyList<string> _outputs = Array.Empty<string>();
+    private bool _closed;
 
     internal ToastWindow(string title, string message, ToastKind kind)
     {
@@ -51,7 +52,20 @@ internal partial class ToastWindow : Window
         _pulse.Children.Add(fade);
 
         _dismiss = new DispatcherTimer { Interval = TimeSpan.FromSeconds(6) };
-        _dismiss.Tick += (_, _) => Close();
+        _dismiss.Tick += (_, _) =>
+        {
+            _dismiss.Stop();
+            Close();
+        };
+        // Closing a window does not stop its timer or its animation: both hold
+        // the window alive, and a tray app that runs for weeks would collect
+        // one of each for every job.
+        Closed += (_, _) =>
+        {
+            _dismiss.Stop();
+            _pulse.Stop();
+            _closed = true;
+        };
 
         MouseLeftButtonUp += (_, _) => Reveal();
         MouseRightButtonUp += (_, _) => Close();
@@ -77,6 +91,11 @@ internal partial class ToastWindow : Window
     /// <summary>Swap a running toast to its outcome and start the countdown.</summary>
     internal void Finish(ToastKind kind, string message, IReadOnlyList<string> outputs)
     {
+        if (_closed)
+        {
+            // The user dismissed it while the job was still running.
+            return;
+        }
         _pulse.Stop();
         Accent.Opacity = 1;
         Accent.Fill = BrushFor(kind);

@@ -32,6 +32,7 @@ internal sealed class WheelController
     private readonly Dispatcher _ui;
     private readonly Dictionary<string, WheelCatalog> _cache = new(StringComparer.Ordinal);
     private readonly DispatcherTimer _watchdog;
+    private readonly StuckOverlayWatch _watch = new();
 
     private WheelCatalog _registry = WheelCatalog.From(null);
     private WheelCatalog _forFiles = WheelCatalog.From(null);
@@ -39,7 +40,6 @@ internal sealed class WheelController
     private CancellationTokenSource? _pending;
     private string _family = string.Empty;
     private int _page;
-    private bool _dragging;
 
     internal WheelController(
         EngineClient engine,
@@ -57,14 +57,16 @@ internal sealed class WheelController
         _window.Dropped += OnDropped;
         _window.MoreRequested += OnMoreRequested;
 
-        // A missed button up (Windows can drop a slow hook) must not leave an
-        // overlay sitting on the desktop.
-        _watchdog = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromSeconds(5) };
+        // A missed button up must not leave an overlay sitting on the desktop.
+        // The watch asks Windows for the physical button rather than trusting
+        // the drag state, because the state is exactly what a missed hook
+        // event gets wrong.
+        _watchdog = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromSeconds(2) };
         _watchdog.Tick += (_, _) =>
         {
-            if (_window.IsVisible && !_dragging)
+            if (_watch.Tick(_window.IsVisible, Native.LeftButtonDown()))
             {
-                _window.HideNow("watchdog, no drag in progress");
+                _window.HideNow("watchdog, the button is not down");
             }
         };
         _watchdog.Start();
@@ -72,7 +74,6 @@ internal sealed class WheelController
 
     internal void Attach(DragWatcher watcher)
     {
-        watcher.DragStarted += (_, _) => _dragging = true;
         watcher.DragEnded += OnDragEnded;
         watcher.WheelRequested += OnWheelRequested;
         watcher.Cancelled += () => _window.HideNow("escape");
@@ -234,7 +235,6 @@ internal sealed class WheelController
 
     private void OnDragEnded()
     {
-        _dragging = false;
         // OLE delivers the drop after the hook sees the button come up, so the
         // window stays up a moment longer. Hiding here would lose the drop.
         _window.HideAfter(TimeSpan.FromMilliseconds(500));

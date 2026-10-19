@@ -84,6 +84,16 @@ internal static class Native
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool GetCursorPos(out POINT point);
 
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int key);
+
+    /// <summary>
+    /// The physical state of the left button, asked of Windows rather than
+    /// remembered from the hook. A low level hook that answers too slowly is
+    /// skipped silently, so a button up can go missing; this cannot.
+    /// </summary>
+    internal static bool LeftButtonDown() => (GetAsyncKeyState(0x01) & 0x8000) != 0;
+
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
