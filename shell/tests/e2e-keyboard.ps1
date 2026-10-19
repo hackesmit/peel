@@ -17,7 +17,12 @@ Enter. When a family lands in the engine the same script covers it.
 Scenario A: select the source, press the hotkey, arrow to the named segment,
             Enter, expect the output next to the source.
 Scenario B: select again, press the hotkey, press Escape, expect the wheel gone
-            and nothing written.
+            and nothing written, and focus back on Explorer.
+Scenario C: press the hotkey and click the file at once (the wheel may never
+            get the keyboard), then press the hotkey again: the wheel opens
+            again, so the hotkey is never left dead. Escape closes it.
+Scenario D: press the hotkey and touch nothing: the wheel closes on its own
+            after the idle timeout (PEEL_KEYBOARD_IDLE_MS, 8 s here).
 
 The only mouse action is one click to select the file and give Explorer focus;
 there is no drag, so nothing is ever dropped.
@@ -85,6 +90,10 @@ public static class In {
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
   [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint f, UIntPtr e);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
+  public static string FgClass() { var c = new System.Text.StringBuilder(256); GetClassName(GetForegroundWindow(), c, 256); return c.ToString(); }
+  public static void Click() { mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero); System.Threading.Thread.Sleep(60); mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero); }
   public static void Place(int x, int y) { SetCursorPos(x, y); }
   public static void Down() { mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero); }
   public static void Up() { mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero); }
@@ -180,6 +189,7 @@ try {
 
     $env:PEEL_LOG = $peelLog
     $env:PEEL_EXIT_AFTER = '240'
+    $env:PEEL_KEYBOARD_IDLE_MS = '8000'
     $peelProcess = Start-Process $App -PassThru
     L "started $App as pid $($peelProcess.Id)"
     Check 'app starts' ((WaitLog 'peel shell start' 15000) -ne $null) 'peel shell start in the log'
@@ -252,6 +262,46 @@ try {
     $after = @(Get-ChildItem $test -File | ForEach-Object { $_.Name })
     $new = @($after | Where-Object { $before -notcontains $_ })
     Check 'a cancelled hotkey writes nothing' ($new.Count -eq 0) "new files: $($new -join ',')"
+
+    Start-Sleep -Milliseconds 600
+    Check 'Escape returns focus to Explorer' ([In]::FgClass() -eq 'CabinetWClass') "foreground class after Escape: $([In]::FgClass())"
+
+    # Scenario C: hotkey, then a click on Explorer at once, then the hotkey again.
+    $item = FindItem $Source
+    if (-not $item) { throw "$Source vanished from Explorer" }
+    SelectItem $item
+    $shownSeen = CountLog 'keyboard wheel shown at'
+    [In]::Hotkey()
+    [In]::Click()
+    L 'clicked Explorer right after the hotkey'
+    $shown = WaitLog 'keyboard wheel shown at (\d+),(\d+)' 6000 ($shownSeen + 1)
+    Start-Sleep -Milliseconds 1200
+    $visibleAfterClick = (CountLog 'keyboard wheel shown at') -gt (CountLog 'keyboard wheel hidden')
+    L ("after the click: shown=$($shown -ne $null) still open=$visibleAfterClick fg=$([In]::FgClass())")
+    Check 'an unfocused wheel does not stay open' ((-not $visibleAfterClick) -or ([In]::FgClass() -like 'HwndWrapper*')) "still open=$visibleAfterClick fg=$([In]::FgClass())"
+    $item = FindItem $Source
+    if ($item -and [In]::FgClass() -ne 'CabinetWClass') { SelectItem $item }
+    $shownSeen = CountLog 'keyboard wheel shown at'
+    [In]::Hotkey()
+    $again = WaitLog 'keyboard wheel shown at (\d+),(\d+)' 6000 ($shownSeen + 1)
+    Check 'the hotkey opens the wheel again after a click' ($again -ne $null) "$($again.Value)"
+    Check 'no press is ignored' ((CountLog 'ignored') -eq 0) "ignored lines: $(CountLog 'ignored')"
+    WaitLog 'keyboard wheel convert page 0: (.+)' 6000 | Out-Null
+    $hiddenSeen = CountLog 'keyboard wheel hidden \(escape\)'
+    [In]::Tap($VkEsc)
+    $closed = WaitLog 'keyboard wheel hidden \(escape\)' 4000 ($hiddenSeen + 1)
+    Check 'Escape closes the reopened wheel' ($closed -ne $null) "$($closed.Value)"
+
+    # Scenario D: the idle timeout.
+    Start-Sleep -Milliseconds 600
+    $item = FindItem $Source
+    if (-not $item) { throw "$Source vanished from Explorer" }
+    SelectItem $item
+    $shownSeen = CountLog 'keyboard wheel shown at'
+    [In]::Hotkey()
+    $shown = WaitLog 'keyboard wheel shown at (\d+),(\d+)' 6000 ($shownSeen + 1)
+    $timedOut = WaitLog 'keyboard wheel hidden \(timeout\)' 14000
+    Check 'an idle wheel closes after the timeout' (($shown -ne $null) -and ($timedOut -ne $null)) "$($timedOut.Value)"
 
     $text = PeelLog
     Check 'no unhandled exceptions' (-not ($text -match 'unhandled')) 'log has no unhandled exception'

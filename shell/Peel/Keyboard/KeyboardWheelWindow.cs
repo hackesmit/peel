@@ -11,12 +11,18 @@
 // cannot drift apart visually.
 //
 // Unlike the drag wheel this one takes focus: it is how the arrow keys, Enter
-// and Escape reach it. Losing focus (a click elsewhere, Alt+Tab) means the user
-// looked away, so the wheel dismisses itself, exactly as releasing a drag off
-// the ring does. A short grace window after it opens absorbs the one transient
-// deactivation that activating the window can itself cause.
+// and Escape reach it. Losing focus (a click elsewhere, Alt+Tab), never getting
+// it, a click outside the disc, or sitting idle means the user looked away, so
+// the wheel dismisses itself (KeyboardWheelLifetime decides; a 100 ms timer and
+// every Deactivated ask it). Every hide raises Hidden, so the controller resets
+// its open state on every close path, not only the ones it started.
+//
+// A tapped Alt switches wheels; on its own, Windows would also turn the Alt
+// key up into SC_KEYMENU and put the window in menu mode, which eats the next
+// arrow key. The window swallows the Alt key up and SC_KEYMENU while open.
 using System;
 using System.Windows;
+using System.Windows.Threading;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Interop;
@@ -30,8 +36,9 @@ internal sealed class KeyboardWheelWindow : Window
 {
     private readonly WheelRenderer _renderer = new();
     private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
+    private readonly KeyboardWheelLifetime _lifetime = new(IdleFromEnvironment());
+    private readonly DispatcherTimer _watch;
     private IntPtr _handle;
-    private long _readyAtMs;
 
     internal KeyboardWheelWindow()
     {
@@ -57,15 +64,28 @@ internal sealed class KeyboardWheelWindow : Window
         // because this window has to be able to take the keyboard.
         Native.SetWindowStyleEx(_handle, style | Native.WS_EX_TOOLWINDOW | Native.WS_EX_TOPMOST);
 
+        HwndSource.FromHwnd(_handle)?.AddHook(WndProc);
         PreviewKeyDown += OnPreviewKeyDown;
+        PreviewKeyUp += OnPreviewKeyUp;
         Deactivated += OnDeactivated;
+
+        _watch = new DispatcherTimer(DispatcherPriority.Input) { Interval = TimeSpan.FromMilliseconds(100) };
+        _watch.Tick += (_, _) => Watch();
     }
 
     /// <summary>A navigation key was pressed while the wheel had focus.</summary>
     internal event Action<NavKey>? KeyPressed;
 
-    /// <summary>The wheel lost focus after it had settled: treat as a cancel.</summary>
-    internal event Action? Dismissed;
+    /// <summary>The wheel must close on its own (focus lost, click outside, idle); the argument is why.</summary>
+    internal event Action<string>? Dismissed;
+
+    /// <summary>The wheel was hidden, by any path; the argument is why.</summary>
+    internal event Action<string>? Hidden;
+
+    internal IntPtr Handle => _handle;
+
+    /// <summary>The wheel is the foreground window, so it holds the keyboard.</summary>
+    internal bool IsForeground => IsVisible && KeyboardNative.GetForegroundWindow() == _handle;
 
     internal WheelPlan Plan => _renderer.Plan;
 
@@ -91,12 +111,10 @@ internal sealed class KeyboardWheelWindow : Window
             Show();
         }
         Native.SetWindowPos(_handle, Native.HWND_TOPMOST, left, top, side, side, Native.SWP_SHOWWINDOW);
+        _lifetime.Opened(_clock.ElapsedMilliseconds);
+        _watch.Start();
         Activate();
         Focus();
-        // The activation above can fire one Deactivated on the window we took
-        // focus from bouncing back; ignore deactivations for a moment so that
-        // transient does not close the wheel the instant it opens.
-        _readyAtMs = _clock.ElapsedMilliseconds + 250;
         Log.Write($"keyboard wheel shown at {screenX},{screenY} ({side}px, scale {scale:0.##})");
     }
 
@@ -106,10 +124,13 @@ internal sealed class KeyboardWheelWindow : Window
         {
             return;
         }
+        _watch.Stop();
+        _lifetime.Closed();
         Log.Write($"keyboard wheel hidden ({reason})");
         Hide();
         Native.SetWindowRgn(_handle, IntPtr.Zero, false);
         _renderer.SetHot(-1);
+        Hidden?.Invoke(reason);
     }
 
     private void OnPreviewKeyDown(object sender, KeyEventArgs e)
@@ -129,7 +150,35 @@ internal sealed class KeyboardWheelWindow : Window
             return;
         }
         e.Handled = true;
+        _lifetime.Activity(_clock.ElapsedMilliseconds);
         KeyPressed?.Invoke(key);
+    }
+
+    private static void OnPreviewKeyUp(object sender, KeyEventArgs e)
+    {
+        // Alt up would otherwise reach DefWindowProc as SC_KEYMENU (menu mode).
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+        if (key is Key.LeftAlt or Key.RightAlt)
+        {
+            e.Handled = true;
+        }
+    }
+
+    private IntPtr WndProc(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (!IsVisible)
+        {
+            return IntPtr.Zero;
+        }
+        if (message == KeyboardNative.WM_SYSCOMMAND && (wParam.ToInt64() & 0xFFF0) == KeyboardNative.SC_KEYMENU)
+        {
+            handled = true;
+        }
+        else if (message == KeyboardNative.WM_SYSKEYUP && wParam.ToInt64() == KeyboardNative.VK_MENU)
+        {
+            handled = true;
+        }
+        return IntPtr.Zero;
     }
 
     private static NavKey Map(KeyEventArgs e)
@@ -150,14 +199,54 @@ internal sealed class KeyboardWheelWindow : Window
         };
     }
 
-    private void OnDeactivated(object? sender, EventArgs e)
+    private void OnDeactivated(object? sender, EventArgs e) => Watch();
+
+    /// <summary>Ask the lifetime whether the wheel must close, and close it if so.</summary>
+    private void Watch()
     {
-        if (!IsVisible || _clock.ElapsedMilliseconds < _readyAtMs)
+        if (!IsVisible)
+        {
+            _watch.Stop();
+            return;
+        }
+        var reason = _lifetime.Check(_clock.ElapsedMilliseconds, IsForeground, ClickOutside());
+        if (reason is null)
         {
             return;
         }
-        Dismissed?.Invoke();
+        if (Dismissed is null)
+        {
+            HideNow(reason);
+            return;
+        }
+        Dismissed.Invoke(reason);
+        if (IsVisible)
+        {
+            HideNow(reason);
+        }
     }
+
+    private bool ClickOutside()
+    {
+        if (!KeyboardNative.AnyMouseButtonDown() || !Native.GetCursorPos(out var point))
+        {
+            return false;
+        }
+        if (!Native.GetWindowRect(_handle, out var rect))
+        {
+            return true;
+        }
+        // The disc is the window's inscribed circle (SetDisc clips to it).
+        var radius = (rect.Right - rect.Left) / 2.0;
+        var dx = point.X - ((rect.Left + rect.Right) / 2.0);
+        var dy = point.Y - ((rect.Top + rect.Bottom) / 2.0);
+        return (dx * dx) + (dy * dy) > radius * radius;
+    }
+
+    private static long IdleFromEnvironment() =>
+        long.TryParse(Environment.GetEnvironmentVariable("PEEL_KEYBOARD_IDLE_MS"), out var ms) && ms > 0
+            ? ms
+            : KeyboardWheelLifetime.DefaultIdleMs;
 
     /// <summary>Clip the window to the ring's disc so it is no bigger than the wheel.</summary>
     private void SetDisc(int side)

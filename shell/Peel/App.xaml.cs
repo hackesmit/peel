@@ -106,6 +106,11 @@ public partial class App : Application
         {
             _keyboard.Attach(_hotkey);
         }
+        else if (!_hotkey.DisabledByEnvironment)
+        {
+            Log.Write("hotkey conflict toast shown");
+            jobs.Report(HotkeyListener.ConflictMessage);
+        }
 
         _tray = new Tray(jobs, Status, Quit);
 

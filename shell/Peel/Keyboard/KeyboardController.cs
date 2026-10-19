@@ -12,8 +12,17 @@
 // A hotkey press is deliberate and rare, so unlike the drag wheel this one can
 // afford to ask the engine what the exact files allow before it draws: it opens
 // already knowing its segments, with no "reading the drag" state. One press at
-// a time; a generation number drops a slow engine answer whose press has been
-// superseded.
+// a time; a generation number drops a slow answer whose press has been
+// superseded. A press while the wheel is open closes it and reads again, so a
+// press always ends with a wheel over the current selection and the hotkey can
+// never be left dead by a wheel that lost the keyboard.
+//
+// The Explorer read runs on its own STA thread (ExplorerSelection.ReadAsync),
+// never on the UI thread that hosts the low level hooks. The modifier map is the
+// per-file catalog's merged with the full registry's (fetched once, lazily), the
+// same rule the drag path uses, so Shift, Ctrl and Alt reach every bound wheel.
+// After Escape, a run or a timeout, focus goes back to the Explorer window the
+// hotkey read from.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -38,6 +47,8 @@ internal sealed class KeyboardController
     private readonly WheelKeyboardNavigator _navigator = new();
 
     private int _generation;
+    private IntPtr _returnTo;
+    private WheelCatalog? _registry;
     private string[] _paths = Array.Empty<string>();
     private IReadOnlyList<DraggedFile> _files = Array.Empty<DraggedFile>();
     private WheelCatalog _catalog = WheelCatalog.From(null);
@@ -57,7 +68,8 @@ internal sealed class KeyboardController
         _editors = editors;
         _ui = ui;
         _window.KeyPressed += OnKey;
-        _window.Dismissed += () => Close("focus left the wheel");
+        _window.Dismissed += reason => Close(reason, restoreFocus: reason == "timeout");
+        _window.Hidden += _ => Reset();
     }
 
     internal void Attach(HotkeyListener hotkey) => hotkey.Pressed += OnHotkey;
@@ -65,34 +77,52 @@ internal sealed class KeyboardController
     /// <summary>On the UI thread (the hotkey source lives there).</summary>
     private void OnHotkey()
     {
+        var foreground = KeyboardNative.GetForegroundWindow();
         if (_window.IsVisible)
         {
-            // A second press while the wheel is open is a no-op: the open wheel
-            // already has the keyboard.
-            Log.Write("hotkey pressed while the keyboard wheel is open, ignored");
-            return;
+            // A press while the wheel is open reads the selection again. If the
+            // wheel itself is in front, the window to read is the one it was
+            // opened over.
+            if (foreground == _window.Handle)
+            {
+                foreground = _returnTo;
+            }
+            Log.Write("hotkey pressed while the keyboard wheel is open, reopening");
+            Close("hotkey pressed again", restoreFocus: false);
         }
-        var selection = ExplorerSelection.Read();
-        if (!selection.HasFiles)
-        {
-            Log.Write($"hotkey pressed, no files: {selection.Reason}");
-            _jobs.Report(selection.Reason);
-            return;
-        }
-        var paths = selection.Paths.ToArray();
         var generation = ++_generation;
-        Log.Write($"hotkey pressed, {paths.Length} file(s) selected");
-        _ = OpenAsync(paths, generation);
+        _returnTo = foreground;
+        _ = OpenAsync(foreground, generation);
     }
 
-    private async Task OpenAsync(string[] paths, int generation)
+    private async Task OpenAsync(IntPtr foreground, int generation)
     {
         try
         {
+            var selection = await ExplorerSelection.ReadAsync(foreground, ExplorerSelection.DefaultTimeout).ConfigureAwait(false);
+            if (!selection.HasFiles)
+            {
+                Log.Write($"hotkey pressed, no files: {selection.Reason}");
+                Report(selection.Reason);
+                return;
+            }
+            if (selection.Notice.Length > 0)
+            {
+                Report(selection.Notice);
+            }
+            var paths = selection.Paths.ToArray();
+            Log.Write($"hotkey pressed, {paths.Length} file(s) selected");
+
+            var registryTask = _registry is null ? _engine.OptionsAsync(Array.Empty<string>()) : null;
             var (files, _) = await FileClassifier.ClassifyAsync(paths, FileClassifier.DefaultDeadline).ConfigureAwait(false);
             var options = await _engine.OptionsAsync(paths).ConfigureAwait(false);
+            var registry = registryTask is null ? null : await registryTask.ConfigureAwait(false);
             await _ui.InvokeAsync(() =>
             {
+                if (registry is not null && registry.Ok)
+                {
+                    _registry = WheelCatalog.From(registry);
+                }
                 if (generation != _generation)
                 {
                     return;
@@ -110,6 +140,10 @@ internal sealed class KeyboardController
                         ? "Peel has nothing to offer for this file."
                         : "Peel has nothing to offer for these files.");
                     return;
+                }
+                if (_registry is not null)
+                {
+                    catalog = catalog.WithModifiersFrom(_registry);
                 }
                 _paths = paths;
                 _files = files;
@@ -131,14 +165,25 @@ internal sealed class KeyboardController
         }
     }
 
+    /// <summary>A toast from any thread: the toast windows live on the UI thread.</summary>
+    private void Report(string message)
+    {
+        Log.Write($"keyboard toast: {message}");
+        _ = _ui.InvokeAsync(() => _jobs.Report(message));
+    }
+
     /// <summary>Render a family's page, point the navigator at it and light the highlight.</summary>
     private void Draw(string family, int page)
     {
         _family = family;
         _page = page;
         var accent = WheelTheme.AccentFor(family);
-        var entries = WheelPlanner.Filter(WheelPlanner.Flatten(_catalog.Wheel(family)), _files);
-        var plan = WheelPlanner.Build(family, _catalog.LabelFor(family), entries, page);
+        // A family bound only in the registry (not offered for these files)
+        // still opens, from the registry's entries filtered by the files, as
+        // the drag wheel does.
+        var source = _catalog.Wheel(family) is null && _registry?.Wheel(family) is not null ? _registry : _catalog;
+        var entries = WheelPlanner.Filter(WheelPlanner.Flatten(source.Wheel(family)), _files);
+        var plan = WheelPlanner.Build(family, source.LabelFor(family), entries, page);
         _window.SetPlan(plan, accent);
         _navigator.SetPlan(plan);
         _window.SetHot(_navigator.Highlight);
@@ -172,7 +217,7 @@ internal sealed class KeyboardController
                 return;
 
             case NavAction.Cancel:
-                Close("escape");
+                Close("escape", restoreFocus: true);
                 return;
 
             default:
@@ -182,7 +227,7 @@ internal sealed class KeyboardController
 
     private void Switch(string modifier)
     {
-        var family = _catalog.FamilyForModifier(modifier);
+        var family = _catalog.FamilyForModifier(modifier) ?? _registry?.FamilyForModifier(modifier);
         if (family is null)
         {
             Log.Write($"no keyboard wheel is bound to {modifier}");
@@ -210,7 +255,7 @@ internal sealed class KeyboardController
         var entry = segment.Entry!;
         var files = _paths;
         // Take the wheel down before the job starts: the choice is made.
-        Close($"ran {entry.Id}");
+        Close($"ran {entry.Id}", restoreFocus: true);
         if (files.Length == 0)
         {
             return;
@@ -233,9 +278,27 @@ internal sealed class KeyboardController
         _jobs.Start(entry, files, parameters);
     }
 
-    private void Close(string reason)
+    /// <summary>
+    /// Take the wheel down. With <paramref name="restoreFocus"/>, and only when
+    /// the wheel held the foreground (so the user did not already move on), the
+    /// Explorer window the hotkey read from is brought back to the front.
+    /// </summary>
+    private void Close(string reason, bool restoreFocus)
     {
+        var hadForeground = _window.IsForeground;
+        var returnTo = _returnTo;
         _window.HideNow(reason);
+        Reset();
+        if (restoreFocus && hadForeground && returnTo != IntPtr.Zero && KeyboardNative.IsWindow(returnTo))
+        {
+            var ok = KeyboardNative.SetForegroundWindow(returnTo);
+            Log.Write($"keyboard focus returned to {returnTo.ToInt64()}: {ok}");
+        }
+    }
+
+    /// <summary>Forget the open wheel. Runs on every hide, whoever hid it.</summary>
+    private void Reset()
+    {
         _generation++;
         _paths = Array.Empty<string>();
         _files = Array.Empty<DraggedFile>();
