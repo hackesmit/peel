@@ -4,8 +4,10 @@
 //
 // Nothing is ever overwritten: a name already taken in the destination grows a
 // " 2", " 3", ... suffix, the same rule the engine uses for its outputs, so a
-// move never silently replaces a file. A move to another drive, which
-// Directory.Move cannot do in one step, falls back to a copy then a delete.
+// move never silently replaces a file. A folder move to another volume, which
+// cannot be one rename, falls back to a copy then a delete. Which volume a
+// folder is on, and whether a destination is inside the moved folder, are
+// decided from physical file identities (FileIdentity), never path strings.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -48,27 +50,6 @@ internal static class MoveAction
 
     private static bool TakenOnDisk(string path) => File.Exists(path) || Directory.Exists(path);
 
-    /// <summary>True when <paramref name="inner"/> is <paramref name="outer"/>
-    /// itself or sits beneath it, both compared as full paths.</summary>
-    internal static bool IsSameOrBeneath(string inner, string outer)
-    {
-        var a = Path.GetFullPath(inner).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        var b = Path.GetFullPath(outer).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase))
-        {
-            return true;
-        }
-        return a.StartsWith(b + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// <summary>True when both paths live on the same volume (drive or UNC share),
-    /// which is when <see cref="Directory.Move"/> can move a folder in one step.</summary>
-    private static bool SameVolume(string a, string b) =>
-        string.Equals(
-            Path.GetPathRoot(Path.GetFullPath(a)),
-            Path.GetPathRoot(Path.GetFullPath(b)),
-            StringComparison.OrdinalIgnoreCase);
-
     /// <summary>Move one file or folder into the destination, never overwriting.</summary>
     internal static string MoveInto(string source, string destDir)
     {
@@ -79,21 +60,24 @@ internal static class MoveAction
             // Moving a folder into itself or one of its own descendants is
             // never valid: the cross-volume fallback below would copy the tree
             // into a subfolder of the source and then delete the source, taking
-            // the copy with it. Refuse before touching anything.
-            if (IsSameOrBeneath(destDir, source))
+            // the copy with it. The test is physical (volume serial plus file
+            // index of the destination and each of its ancestors), so a UNC
+            // alias, subst drive, junction, short name or other case cannot
+            // slip past it. If the identities cannot be read it throws and
+            // nothing moves.
+            if (FileIdentity.IsSameOrBeneath(destDir, source))
             {
                 throw new IOException($"cannot move \"{name}\" into itself");
             }
-            if (SameVolume(source, target))
+            // Same volume serial: try the one step rename. Windows still says
+            // ERROR_NOT_SAME_DEVICE for the same disk reached locally and by a
+            // UNC alias, and that is the only case that falls through to the
+            // copy; every other rename failure is reported, never retried as a
+            // destructive copy. A different serial (another drive, a volume
+            // mounted in a folder, a network share) goes straight to the copy.
+            var sameVolume = FileIdentity.Of(source).VolumeSerial == FileIdentity.Of(destDir).VolumeSerial;
+            if (!sameVolume || !FileIdentity.TryRename(source, target))
             {
-                // Same volume: an atomic rename. If it fails it is a real error,
-                // reported as a failure; never fall back to a destructive copy.
-                Directory.Move(source, target);
-            }
-            else
-            {
-                // A different drive: Directory.Move cannot cross volumes, so
-                // copy the tree and only then remove the original.
                 CopyTree(source, target);
                 Directory.Delete(source, recursive: true);
             }
@@ -105,16 +89,37 @@ internal static class MoveAction
         return target;
     }
 
-    private static void CopyTree(string source, string target)
+    /// <summary>Copy a folder tree to a new place. Refuses a tree that holds a
+    /// junction or symbolic link before copying anything: copying would turn
+    /// the link into a plain empty folder, so the moved tree would silently
+    /// differ from the original.</summary>
+    internal static void CopyTree(string source, string target)
     {
-        Directory.CreateDirectory(target);
-        foreach (var dir in Directory.GetDirectories(source, "*", SearchOption.AllDirectories))
+        var entries = new DirectoryInfo(source).GetFileSystemInfos("*", SearchOption.AllDirectories);
+        foreach (var entry in entries)
         {
-            Directory.CreateDirectory(dir.Replace(source, target));
+            if (entry.Attributes.HasFlag(FileAttributes.ReparsePoint))
+            {
+                throw new IOException($"\"{Path.GetFileName(source)}\" contains a link ({entry.Name}); move it in Explorer instead");
+            }
         }
-        foreach (var file in Directory.GetFiles(source, "*", SearchOption.AllDirectories))
+        if (Directory.Exists(target) || File.Exists(target))
         {
-            File.Copy(file, file.Replace(source, target), overwrite: false);
+            throw new IOException($"\"{target}\" already exists");
+        }
+        Directory.CreateDirectory(target);
+        foreach (var entry in entries)
+        {
+            var copy = Path.Combine(target, Path.GetRelativePath(source, entry.FullName));
+            if (entry is DirectoryInfo)
+            {
+                Directory.CreateDirectory(copy);
+            }
+            else
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(copy)!);
+                File.Copy(entry.FullName, copy, overwrite: false);
+            }
         }
     }
 
