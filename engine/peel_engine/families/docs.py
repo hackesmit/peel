@@ -356,7 +356,17 @@ def _pandoc(source: Path, target: Path, *, src_ext: str = "", out_ext: str = "",
             f"Peel cannot convert {src_ext or _ext(source)} to {out_ext or _ext(target)}.",
             code="unsupported_pair",
         )
-    args = [str(exe), "--from", reader, "--to", writer, "--output", _abs(target)]
+    args = [
+        str(exe),
+        "--from", reader,
+        "--to", writer,
+        "--output", _abs(target),
+        # Where to look for a file the document links to relatively. pandoc
+        # searches its working directory by default, which is wherever the
+        # shell happened to start peel, so an image beside the source would be
+        # silently dropped without this.
+        f"--resource-path={os.path.dirname(_abs(source))}{os.pathsep}.",
+    ]
     if writer in ("html", "epub"):
         args += ["--standalone", "--metadata", f"title={source.stem}"]
     if writer == "html":
@@ -609,6 +619,14 @@ def pdf_to_xlsx(job: Job) -> Result:
     return ok([target], f"Wrote {target.name} ({tables_found} {noun} found)")
 
 
+#: Significant digits a spreadsheet can hold without rounding, because every
+#: number in it is a double.
+EXCEL_DIGITS = 15
+
+#: Characters Excel refuses in a sheet name. A file name may legally contain
+#: brackets, so this is stricter than the file name cleaner below.
+_BAD_IN_TITLE = re.compile(r"[\\/*?:\[\]]")
+
 #: Characters Excel refuses in a cell. Keeping tab and newline would break the
 #: row, so every control character goes.
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
@@ -800,6 +818,13 @@ def _safe_suffix(title: str, index: int) -> str:
     return cleaned[:60] if cleaned else f"sheet {index + 1}"
 
 
+def _sheet_title(text: str) -> str:
+    """A worksheet name Excel accepts: no \\ / * ? : [ ], 31 characters, not empty."""
+    cleaned = _BAD_IN_TITLE.sub(" ", text or "")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().strip("'")[:31].strip()
+    return cleaned or "Sheet1"
+
+
 def _delimited_to_xlsx(job: Job, source: Path, src_ext: str) -> Result:
     from openpyxl import Workbook
 
@@ -807,7 +832,7 @@ def _delimited_to_xlsx(job: Job, source: Path, src_ext: str) -> Result:
     target = job.output_path()
     book = Workbook()
     sheet = book.active
-    sheet.title = _safe_suffix(source.stem, 0)[:31] or "Sheet1"
+    sheet.title = _sheet_title(source.stem)
     for number, cells in enumerate(rows, start=1):
         _write_row(sheet, number, (_as_number(c) for c in cells))
     book.save(_abs(target))
@@ -821,6 +846,10 @@ def _as_number(text: Any) -> Any:
     an order number, a part code) and stays text, because turning 00731 into
     731 is data loss no undo gets back. So do an underscore, which Python would
     happily read as a digit group separator, and anything ending in a letter.
+
+    More than 15 significant digits stays text too: a spreadsheet keeps numbers
+    as doubles, so a 19 digit order number would come back out of Excel as
+    1234567890123460000.
     """
     if not isinstance(text, str):
         return text
@@ -829,6 +858,8 @@ def _as_number(text: Any) -> Any:
         return text
     digits = stripped.lstrip("+-")
     if len(digits) > 1 and digits[0] == "0" and not digits.startswith("0."):
+        return text
+    if len(digits.replace(".", "").replace(",", "")) > EXCEL_DIGITS:
         return text
     try:
         return int(stripped)
@@ -842,10 +873,19 @@ def _as_number(text: Any) -> Any:
 
 
 def _read_delimited(source: Path, delimiter: str) -> list[list[str]]:
-    import csv
+    """Rows of a CSV or TSV, quoted fields that span lines included.
 
-    text = _read_text(source)
-    return list(csv.reader(text.splitlines(), delimiter=delimiter))
+    The reader is given a stream rather than a list of lines: a field like
+    ``"first<newline>second"`` is one value, and splitting the text into lines
+    first would hand the reader two half rows and join them into ``firstsecond``.
+    ``newline=""`` keeps the line endings for the reader to interpret, as the
+    csv module's own documentation requires.
+    """
+    import csv
+    import io
+
+    stream = io.StringIO(_read_text(source), newline="")
+    return list(csv.reader(stream, delimiter=delimiter))
 
 
 def _write_delimited(target: Path, rows: Iterable[Sequence[Any]], delimiter: str) -> None:
@@ -859,10 +899,32 @@ def _write_delimited(target: Path, rows: Iterable[Sequence[Any]], delimiter: str
 
 
 def _read_workbook(path: Path) -> list[tuple[str, list[list[Any]]]]:
-    """Every sheet of an XLSX as (title, rows), values not formulas."""
+    """Every sheet of an XLSX as (title, rows): the values, not the formulas.
+
+    A workbook saved by a script and never opened in Excel has formulas with no
+    cached result, and asking for values alone gives back an empty cell. Rather
+    than report success over silently dropped data, the formula text is read in
+    a second pass and used wherever the value is missing. The second pass only
+    happens when the first one found a gap.
+    """
+    values = _sheet_rows(path, data_only=True)
+    if not any(cell == "" for _, rows in values for row in rows for cell in row):
+        return values
+    formulas = _sheet_rows(path, data_only=False)
+    for (_, rows), (_, backup) in zip(values, formulas):
+        for index, row in enumerate(rows):
+            if index >= len(backup):
+                break
+            for column, cell in enumerate(row):
+                if cell == "" and column < len(backup[index]):
+                    row[column] = backup[index][column]
+    return values
+
+
+def _sheet_rows(path: Path, *, data_only: bool) -> list[tuple[str, list[list[Any]]]]:
     from openpyxl import load_workbook
 
-    book = load_workbook(_abs(path), read_only=True, data_only=True)
+    book = load_workbook(_abs(path), read_only=True, data_only=data_only)
     try:
         sheets = []
         for sheet in book.worksheets:

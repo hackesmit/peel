@@ -759,6 +759,149 @@ def test_csv_to_pdf_goes_through_libreoffice(registry, work):
     assert out.read_bytes()[:5] == b"%PDF-"
 
 
+# --- spreadsheet and document edge cases found by the cross-vendor review ----
+#
+# Every one of these reproduced before the fix, and every one is silent data
+# loss rather than a crash, which is why the happy path tests missed them all.
+
+
+def test_a_quoted_field_that_spans_two_lines_stays_one_value(registry, tmp_path):
+    source = tmp_path / "multi.csv"
+    source.write_bytes(b'id,note\r\n1,"first\r\nsecond"\r\n')
+    out = run(registry, "docs.sheet_to_tsv", source).outputs[0]
+    body = out.read_text(encoding="utf-8-sig")
+    assert '"first\nsecond"' in body, "the newline inside the quoted field was eaten"
+    assert body.count("\t") == 2, "the field was split across two rows"
+
+
+def test_a_quoted_field_round_trips_back_through_csv(registry, tmp_path):
+    import csv
+    import io
+
+    source = tmp_path / "multi.tsv"
+    source.write_text('id\tnote\n1\t"first\nsecond"\n', encoding="utf-8")
+    out = run(registry, "docs.sheet_to_csv", source).outputs[0]
+    rows = list(csv.reader(io.StringIO(out.read_text(encoding="utf-8-sig"), newline="")))
+    assert rows == [["id", "note"], ["1", "first\nsecond"]]
+
+
+def test_brackets_in_a_file_name_do_not_break_the_sheet_name(registry, tmp_path):
+    """Windows allows [ ] in a file name; Excel forbids them in a sheet name."""
+    from openpyxl import load_workbook
+
+    source = tmp_path / "sales[2026].csv"
+    source.write_text("a,b\n1,2\n", encoding="utf-8")
+    out = run(registry, "docs.sheet_to_xlsx", source).outputs[0]
+    book = load_workbook(out)
+    assert book.sheetnames == ["sales 2026"]
+    assert book.active["A2"].value == 1
+
+
+@pytest.mark.parametrize(
+    "stem,title",
+    [
+        ("plan*2026?", "plan 2026"),
+        ("a/b:c\\d", "a b c d"),
+        ("", "Sheet1"),
+        ("[]", "Sheet1"),
+        ("x" * 50, "x" * 31),
+    ],
+)
+def test_a_sheet_name_is_always_one_excel_accepts(stem, title):
+    assert docs._sheet_title(stem) == title
+
+
+def test_a_formula_with_no_cached_result_is_exported_not_dropped(registry, tmp_path):
+    """A workbook written by a script and never opened in Excel has formulas
+    with no cached value. Exporting a blank cell and reporting success would be
+    silent data loss."""
+    from openpyxl import Workbook
+
+    source = tmp_path / "formula.xlsx"
+    book = Workbook()
+    book.active["A1"] = "=1+1"
+    book.active["B1"] = "label"
+    book.save(source)
+    out = run(registry, "docs.sheet_to_csv", source).outputs[0]
+    assert out.read_text(encoding="utf-8-sig").strip() == "=1+1,label"
+
+
+def test_a_cached_formula_result_is_preferred_over_the_formula(registry, tmp_path):
+    """When Excel did leave a cached value, that value is what belongs in the
+    CSV, not the formula text."""
+    from openpyxl import Workbook, load_workbook
+
+    import shutil
+
+    source = tmp_path / "cached.xlsx"
+    Workbook().save(source)
+    # openpyxl cannot write a cached result, so put one in the sheet XML the
+    # way Excel does: the formula in <f> and its last computed value in <v>.
+    staged = tmp_path / "staged.xlsx"
+    cell = (
+        b'<sheetData><row r="1"><c r="A1"><f>1+1</f><v>2</v></c></row></sheetData>'
+    )
+    with zipfile.ZipFile(source) as original, zipfile.ZipFile(staged, "w") as patched:
+        for item in original.infolist():
+            data = original.read(item.filename)
+            if item.filename == "xl/worksheets/sheet1.xml":
+                data = data.replace(b"<sheetData></sheetData>", cell)
+                assert cell in data, "the openpyxl sheet XML changed shape"
+            patched.writestr(item, data)
+    shutil.move(staged, source)
+    assert load_workbook(source, data_only=True).active["A1"].value == 2
+
+    out = run(registry, "docs.sheet_to_csv", source).outputs[0]
+    assert out.read_text(encoding="utf-8-sig").strip() == "2"
+
+
+def test_an_identifier_too_long_for_a_double_stays_text(registry, tmp_path):
+    """A spreadsheet holds numbers as doubles, so a 19 digit order number has
+    to stay text or it comes back as 1234567890123460000."""
+    from openpyxl import load_workbook
+
+    source = tmp_path / "ids.csv"
+    source.write_text("id\n1234567890123456789\n", encoding="utf-8")
+    out = run(registry, "docs.sheet_to_xlsx", source).outputs[0]
+    assert load_workbook(out).active["A2"].value == "1234567890123456789"
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("3", 3),
+        ("-2.5", -2.5),
+        ("00731", "00731"),
+        ("1_000", "1_000"),
+        ("3kg", "3kg"),
+        ("1234567890123456789", "1234567890123456789"),
+        ("123456789012345", 123456789012345),
+        ("0.5", 0.5),
+        ("", ""),
+        ("nan", "nan"),
+        ("inf", "inf"),
+    ],
+)
+def test_only_a_safe_number_is_written_as_a_number(text, expected):
+    assert docs._as_number(text) == expected
+
+
+@needs_pandoc
+def test_an_image_the_source_links_to_relatively_is_not_dropped(registry, tmp_path):
+    """pandoc searches its working directory for a relative link, and peel runs
+    from wherever the shell started it, not from the document's folder."""
+    from PIL import Image
+
+    folder = tmp_path / "elsewhere"
+    folder.mkdir()
+    Image.new("RGB", (60, 40), (10, 180, 10)).save(folder / "picture.png")
+    (folder / "notes.md").write_text("# Hi\n\n![](picture.png)\n", encoding="utf-8")
+    out = run(registry, "docs.doc_to_docx", folder / "notes.md").outputs[0]
+    with zipfile.ZipFile(out) as archive:
+        embedded = [n for n in archive.namelist() if "/media/" in n]
+    assert embedded, "the picture beside the source was silently dropped"
+
+
 # --- subtitles --------------------------------------------------------------
 
 
