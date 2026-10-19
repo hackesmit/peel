@@ -35,13 +35,13 @@ def test_review_a_family_that_raises_on_import_does_not_kill_options(tmp_path):
     probe.write_text("raise ImportError('pillow not installed')\n", encoding="utf-8")
     try:
         importlib.invalidate_caches()
-        src = tmp_path / "a.txt"
-        src.write_text("hi", encoding="utf-8")
+        src = tmp_path / "a.srt"
+        src.write_text("1\n00:00:01,000 --> 00:00:02,000\nhello\n", encoding="utf-8")
         proc = _cli("options", str(src), cwd=tmp_path)
         payload = json.loads(proc.stdout)
         ids = [e["id"] for w in payload.get("wheels", []) for g in w["groups"] for e in g["entries"]]
         assert payload["ok"] is True, payload
-        assert "text.to_md" in ids and "files.copy_path" in ids
+        assert "docs.sub_to_txt" in ids and "files.copy_path" in ids
     finally:
         probe.unlink()
         sys.modules.pop("peel_engine.families.zz_review_raises", None)
@@ -73,9 +73,9 @@ def test_review_two_overlapping_runs_do_not_overwrite_each_other(tmp_path):
     "argv",
     [
         ("run",),
-        ("run", "text.to_md"),
+        ("run", "docs.sub_to_txt"),
         ("bogus",),
-        ("run", "text.to_md", "a.txt", "--param"),
+        ("run", "docs.sub_to_txt", "a.srt", "--param"),
     ],
 )
 def test_review_bad_arguments_still_answer_in_json(tmp_path, argv):
@@ -88,11 +88,11 @@ def test_review_bad_arguments_still_answer_in_json(tmp_path, argv):
 # Non-blocking: an --out-dir that is an existing file comes back as code
 # "internal" with a Python exception name instead of a structured code.
 def test_review_out_dir_that_is_a_file_is_a_structured_error(tmp_path):
-    src = tmp_path / "a.txt"
-    src.write_text("hi", encoding="utf-8")
+    src = tmp_path / "a.srt"
+    src.write_text("1\n00:00:01,000 --> 00:00:02,000\nhello\n", encoding="utf-8")
     blocker = tmp_path / "out"
     blocker.write_text("", encoding="utf-8")
-    proc = _cli("run", "text.to_md", str(src), "--out-dir", str(blocker), cwd=tmp_path)
+    proc = _cli("run", "docs.sub_to_txt", str(src), "--out-dir", str(blocker), cwd=tmp_path)
     payload = json.loads(proc.stdout)
     assert payload["ok"] is False
     assert payload.get("code") != "internal", payload

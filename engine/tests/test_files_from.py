@@ -25,7 +25,7 @@ def test_options_reads_paths_from_a_list(make_file, tmp_path, capsys):
     code, payload = run_cli(["options", "--files-from", str(listing)], capsys)
     assert code == 0
     assert payload["files"] == [str(f) for f in files]
-    assert any(e["id"] == "text.to_md" for w in payload["wheels"] for g in w["groups"] for e in g["entries"])
+    assert any(e["id"] == "docs.doc_to_md" for w in payload["wheels"] for g in w["groups"] for e in g["entries"])
 
 
 def test_list_paths_come_before_command_line_paths(make_file, tmp_path, capsys):
@@ -50,7 +50,7 @@ def test_bom_crlf_blank_lines_and_unicode_names(make_file, tmp_path, capsys):
 def test_run_takes_its_files_from_a_list(make_file, tmp_path, capsys):
     sources = [make_file(f"s{i}.txt", "x") for i in range(4)]
     listing = write_list(tmp_path / "list.txt", sources)
-    code, payload = run_cli(["run", "text.to_md", "--files-from", str(listing)], capsys)
+    code, payload = run_cli(["run", "docs.doc_to_md", "--files-from", str(listing)], capsys)
     assert code == 0, payload
     assert payload["outputs"] == [str(s.with_suffix(".md")) for s in sources]
     for s in sources:
@@ -75,7 +75,7 @@ def test_a_list_longer_than_a_windows_command_line_works(tmp_path, capsys):
 def test_run_with_an_empty_list_and_no_files_is_a_usage_error(tmp_path, capsys):
     listing = tmp_path / "empty.txt"
     listing.write_text("\n\n", encoding="utf-8")
-    code, payload = run_cli(["run", "text.to_md", "--files-from", str(listing)], capsys)
+    code, payload = run_cli(["run", "docs.doc_to_md", "--files-from", str(listing)], capsys)
     assert code == 1
     assert payload["code"] == "usage"
 
