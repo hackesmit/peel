@@ -42,7 +42,7 @@ def test_run_through_the_list_converts_the_file_with_a_line_separator(make_file,
     listing = tmp_path / "list.txt"
     listing.write_bytes(f"{odd}\n".encode("utf-8"))
 
-    code = main(["run", "text.to_md", "--files-from", str(listing)])
+    code = main(["run", "docs.doc_to_md", "--files-from", str(listing)])
     payload = json.loads(capsys.readouterr().out)
 
     assert code == 0, payload

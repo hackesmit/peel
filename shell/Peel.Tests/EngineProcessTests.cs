@@ -124,7 +124,7 @@ public sealed class EngineProcessTests : IDisposable
         Assert.EndsWith(".txt", listFile);
         Assert.False(File.Exists(listFile), $"the list file was left behind: {listFile}");
 
-        var run = await new EngineClient().RunAsync("text.to_md", files, new Dictionary<string, string> { ["q"] = "1" });
+        var run = await new EngineClient().RunAsync("docs.doc_to_md", files, new Dictionary<string, string> { ["q"] = "1" });
         Assert.True(run.Ok, run.Message);
         Assert.False(File.Exists(run.Message));
     }
