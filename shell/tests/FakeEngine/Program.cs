@@ -43,7 +43,11 @@ if (mode == "echo")
         if (args[i] == "--files-from" && i + 1 < args.Length)
         {
             listFile = args[++i];
-            files.InsertRange(0, File.ReadAllText(listFile).Split('\n').Where(line => line.Length > 0));
+            // The engine's own rule: "\n" ends a line, one trailing "\r" is
+            // dropped, blank lines are skipped, nothing else splits a path.
+            files.InsertRange(0, File.ReadAllText(listFile).Split('\n')
+                .Select(line => line.EndsWith('\r') ? line[..^1] : line)
+                .Where(line => line.Trim().Length > 0));
         }
         else if (args[i] == "--param" && i + 1 < args.Length)
         {

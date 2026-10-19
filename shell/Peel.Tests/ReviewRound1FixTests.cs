@@ -124,30 +124,35 @@ public class ReviewRound1FixTests
         Assert.Null(DropData.FilePaths(null));
     }
 
+    // Both hooks dead: input arrives that neither hook saw. Idle refresh is
+    // pushed out of the way so only the live check is under test.
+    private static HookSample Both(uint now, uint input, uint hook) =>
+        new(now, true, input, hook, hook, CursorMoved: false);
+
     [Fact]
     public void HooksThatStopSeeingInputAreReinstalledAfterTwoChecks()
     {
-        var liveness = new HookLiveness(lagMs: 3000, spacingMs: 60000);
-        Assert.False(liveness.Check(10000, lastInput: 10000, lastHook: 9990));
-        Assert.False(liveness.Check(20000, lastInput: 19000, lastHook: 10000));
-        Assert.True(liveness.Check(25000, lastInput: 24000, lastHook: 10000));
+        var liveness = new HookLiveness(lagMs: 3000, spacingMs: 60000, refreshMs: uint.MaxValue / 4);
+        Assert.Null(liveness.Check(Both(10000, input: 10000, hook: 9990)));
+        Assert.Null(liveness.Check(Both(20000, input: 19000, hook: 10000)));
+        Assert.NotNull(liveness.Check(Both(25000, input: 24000, hook: 10000)));
         // Spaced out: not again within a minute.
-        Assert.False(liveness.Check(30000, lastInput: 29000, lastHook: 10000));
-        Assert.False(liveness.Check(35000, lastInput: 34000, lastHook: 10000));
-        Assert.True(liveness.Check(90000, lastInput: 89000, lastHook: 10000));
+        Assert.Null(liveness.Check(Both(30000, input: 29000, hook: 10000)));
+        Assert.Null(liveness.Check(Both(35000, input: 34000, hook: 10000)));
+        Assert.NotNull(liveness.Check(Both(90000, input: 89000, hook: 10000)));
     }
 
     [Fact]
     public void LiveHooksAndAWrappedClockAreNotAFault()
     {
-        var liveness = new HookLiveness(lagMs: 3000);
+        var liveness = new HookLiveness(lagMs: 3000, refreshMs: uint.MaxValue / 4);
         for (var i = 0; i < 5; i++)
         {
-            Assert.False(liveness.Check(5000, lastInput: 4000, lastHook: 4100));
+            Assert.Null(liveness.Check(Both(5000, input: 4000, hook: 4100)));
         }
         // The tick count wrapped between the hook call and the input.
-        Assert.False(liveness.Check(100, lastInput: 50, lastHook: uint.MaxValue - 10));
-        Assert.False(liveness.Check(200, lastInput: 60, lastHook: uint.MaxValue - 10));
+        Assert.Null(liveness.Check(Both(100, input: 50, hook: uint.MaxValue - 10)));
+        Assert.Null(liveness.Check(Both(200, input: 60, hook: uint.MaxValue - 10)));
     }
 
     private static RunResult WithClipboard(string text) => JsonSerializer.Deserialize<RunResult>(

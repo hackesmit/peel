@@ -68,17 +68,13 @@ internal static class ClipboardWriter
 
     /// <summary>
     /// One real attempt, on the calling STA thread. WinForms is asked for a
-    /// single try with no built in sleep, so the retry loop above stays the
-    /// only one and never blocks the thread. The text is read back so a write
-    /// another app overwrote at once is not reported as done.
+    /// single retry with no sleep, so the awaited loop above stays the only
+    /// real retry and the thread is never blocked. There is deliberately no
+    /// read back: Clipboard.GetText has its own synchronous contention retries
+    /// (about a second each), which would freeze the UI thread exactly when
+    /// another app holds the clipboard (lucy round 2). A successful
+    /// SetDataObject with copy=true has already flushed the text.
     /// </summary>
-    internal static void SetOnce(string text)
-    {
+    internal static void SetOnce(string text) =>
         System.Windows.Forms.Clipboard.SetDataObject(text, true, 1, 0);
-        var back = System.Windows.Forms.Clipboard.GetText();
-        if (!string.Equals(back, text, StringComparison.Ordinal))
-        {
-            throw new InvalidOperationException("the clipboard did not keep the text");
-        }
-    }
 }

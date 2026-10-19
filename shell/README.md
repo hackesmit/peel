@@ -148,18 +148,33 @@ cannot leave a tray app behind.
   accepted only if its own data names the paths the session read.
 - **No filesystem work in OLE callbacks.** Telling folders from files runs on
   the thread pool with a 1.5 s deadline (`Wheel/FileClassifier.cs`); past it,
-  names decide, and `peel run` checks for real.
+  names decide, and `peel run` checks for real. The engine call itself (list
+  file and process creation included) also starts on the thread pool, so
+  nothing synchronous runs inside a DragEnter.
 
 ## Engine processes
 
 - Each engine call runs in its own kill on close job object
   (`Jobs/ProcessJob.cs`): a timeout, a cancel or Quit terminates the whole
-  tree, and if Peel itself dies Windows does it. The timeout covers reading
-  the pipes as well as the exit, since a backend can hold them open.
+  tree, and if Peel itself dies Windows does it. The engine is created
+  suspended, put in the job and registered for Quit before its first thread
+  runs (`Jobs/ContainedProcess.cs`), so nothing it starts can escape the job.
+  If Windows refuses the job, the engine is not run and the toast says why.
+  Quit also cancels pending `peel options` calls. The timeout covers reading
+  the pipes as well as the exit, since a backend can hold them open. Only the
+  three pipe handles are inherited.
 - Past 24000 characters of command line the paths go to the engine in a
-  temporary UTF-8 list file (`peel options|run --files-from`), deleted after.
+  temporary UTF-8 list file (`peel options|run --files-from`), one path per
+  line ended by "\n" only, so U+0085, U+2028 and U+2029 (legal in a Windows
+  name) stay inside the path. It is deleted after the call, also when writing
+  it fails half way; lists a killed Peel left in `%TEMP%\Peel` are swept at
+  start up once they are a day old.
 - A result carrying `data.clipboard_text` (Copy Path) is put on the clipboard
-  on the UI thread, retried while another app holds it; the toast says so if
-  it never gets through.
-- The hooks are checked every 5 s against GetLastInputInfo and reinstalled if
-  Windows has silently dropped them (`Hooks/HookLiveness.cs`).
+  on the UI thread, one try at a time with an awaited pause between tries
+  while another app holds it; the toast says so if it never gets through.
+  There is no read back, because reading the clipboard blocks while it is busy.
+- Each hook is checked every 5 s on its own evidence (`Hooks/HookLiveness.cs`):
+  a cursor that moved while the mouse hook stayed quiet, or input that neither
+  hook saw, reinstalls both. A dead keyboard hook leaves no readable trace, so
+  both are also reinstalled once the user has been idle 15 s, at most every
+  10 minutes. A reinstall that leaves a hook missing is retried every 30 s.

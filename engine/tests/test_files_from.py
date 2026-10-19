@@ -93,3 +93,14 @@ def test_a_list_that_is_not_utf8_is_a_usage_error(tmp_path, capsys):
     code, payload = run_cli(["options", "--files-from", str(listing)], capsys)
     assert code == 1
     assert payload["code"] == "usage"
+
+
+def test_only_lf_and_crlf_end_a_line_in_the_list(make_file, tmp_path, capsys):
+    # U+0085, U+2028 and U+2029 are legal in a Windows name; str.splitlines()
+    # would break the path at each of them (hq-plct.7 review round 2).
+    odd = [make_file(f"acta{sep}final {i}.txt") for i, sep in enumerate(["\x85", "\u2028", "\u2029"])]
+    plain = make_file("plain.txt")
+    listing = write_list(tmp_path / "list.txt", [*odd, plain], newline="\r\n")
+    code, payload = run_cli(["options", "--files-from", str(listing)], capsys)
+    assert code == 0, payload
+    assert payload["files"] == [str(p) for p in [*odd, plain]]

@@ -9,12 +9,10 @@
 //   * Peel is killed or crashes: Windows closes the handle and the kill on
 //     close limit ends the tree.
 //
-// The process is assigned right after Process.Start returns. Children created
-// after that are in the job automatically. The window before it is the time
-// Python needs to import the engine, far longer than one system call, so an
-// engine cannot start a backend outside the job in practice.
+// The process is created suspended and assigned before its first thread runs
+// (ContainedProcess), so every child it ever starts is in the job too. If
+// Windows refuses the job or the assignment, the engine is not run at all.
 using System;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Peel.Hooks;
@@ -48,26 +46,20 @@ internal sealed class ProcessJob : IDisposable
         return new ProcessJob(handle);
     }
 
-    /// <summary>Put a started process in the job. False if Windows refused.</summary>
-    internal bool Assign(Process process)
+    /// <summary>Put a (suspended) process in the job. False if Windows refused.</summary>
+    internal bool Assign(IntPtr process, int processId)
     {
         var handle = _handle;
         if (handle == IntPtr.Zero)
         {
+            Log.Write($"cannot put engine pid {processId} in its job: the job is closed");
             return false;
         }
-        try
+        if (Native.AssignProcessToJobObject(handle, process))
         {
-            if (Native.AssignProcessToJobObject(handle, process.Handle))
-            {
-                return true;
-            }
-            Log.Write($"cannot put engine pid {process.Id} in its job, error {Marshal.GetLastWin32Error()}");
+            return true;
         }
-        catch (Exception error)
-        {
-            Log.Write("cannot put the engine in its job", error);
-        }
+        Log.Write($"cannot put engine pid {processId} in its job, error {Marshal.GetLastWin32Error()}");
         return false;
     }
 
