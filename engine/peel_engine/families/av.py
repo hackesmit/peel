@@ -402,7 +402,13 @@ def probe(path: Path) -> dict[str, Any]:
         "-of", "json", _arg(path),
     ]
     try:
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=120)
+        # ffprobe writes UTF-8 JSON. Without an explicit encoding Python uses
+        # the locale code page (cp1252 on Windows), which turns accented tags
+        # into mojibake or fails outright on bytes cp1252 cannot map.
+        proc = subprocess.run(
+            args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=120,
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         raise RunnerFailed(f"could not read {Path(path).name}: {exc}") from None
     if proc.returncode != 0:
@@ -482,14 +488,58 @@ def _video_timing(info: dict[str, Any]) -> tuple[float, float]:
     return duration, frame
 
 
+def _video_start(info: dict[str, Any]) -> float:
+    """Where the video track starts on the file's timeline, in seconds.
+
+    A clip can carry audio before its first frame (video stream start_time
+    later than the container's). ffmpeg's input ``-ss`` counts from the
+    container start, so this is the offset every seek and bound must add.
+    0.0 when either start time is missing.
+    """
+    streams = _streams(info, "video")
+    stream = streams[0] if streams else {}
+    try:
+        video = float(stream.get("start_time"))
+    except (TypeError, ValueError):
+        return 0.0
+    try:
+        container = float(info.get("format", {}).get("start_time"))
+    except (TypeError, ValueError):
+        container = 0.0
+    return max(0.0, video - container)
+
+
+def _video_window(info: dict[str, Any]) -> tuple[float, float, float]:
+    """(first frame, end of the video, length of one frame) on the file's
+    timeline, in seconds. The end is 0.0 when no duration can be read.
+
+    A duration read from the video track (or its Matroska DURATION tag) is
+    added to the track's start time. The container duration fallback already
+    counts from the container start, so it is used as the end as it is.
+    """
+    start = _video_start(info)
+    streams = _streams(info, "video")
+    stream = streams[0] if streams else {}
+    length = _seconds(stream.get("duration"))
+    if not length:
+        tags = stream.get("tags") or {}
+        length = _seconds(next((v for k, v in tags.items() if k.upper() == "DURATION"), None))
+    _, frame = _video_timing(info)
+    if length:
+        return start, start + length, frame
+    end = _seconds(info.get("format", {}).get("duration"))
+    return start, (end if end > start else 0.0), frame
+
+
 def _last_frame_start(info: dict[str, Any]) -> float:
     """The latest time a seek can ask for and still decode a frame: the start
-    of the last frame. 0.0 when the duration is unknown. Seeks are handed to
-    ffmpeg through ``_seek``, which rounds down, so they never pass it."""
-    duration, frame = _video_timing(info)
-    if not duration:
+    of the last frame, on the file's timeline. 0.0 when the duration is
+    unknown. Seeks are handed to ffmpeg through ``_seek``, which rounds down,
+    so they never pass it."""
+    start, end, frame = _video_window(info)
+    if not end:
         return 0.0
-    return max(0.0, duration - frame)
+    return max(start, end - frame)
 
 
 def _seek(seconds: float) -> str:
@@ -518,6 +568,35 @@ def _rotation(stream: dict[str, Any]) -> int:
     except (TypeError, ValueError):
         return 0
     return degrees % 360
+
+
+def _display_matrix(stream: dict[str, Any]) -> list[int] | None:
+    """The nine numbers of ffprobe's display matrix, or None when absent."""
+    for side in stream.get("side_data_list") or []:
+        text = side.get("displaymatrix")
+        if not text:
+            continue
+        numbers: list[int] = []
+        for line in str(text).splitlines():
+            _, _, values = line.partition(":")
+            for value in values.split():
+                try:
+                    numbers.append(int(value))
+                except ValueError:
+                    return None
+        return numbers if len(numbers) == 9 else None
+    return None
+
+
+def _flip(stream: dict[str, Any]) -> tuple[int, ...] | None:
+    """None for a clip that is not mirrored. For a mirrored clip (display
+    matrix with a negative determinant) the signs of the matrix's 2x2 part,
+    which tell the mirror axis and the rotation apart where ffprobe's rotation
+    figure alone cannot."""
+    m = _display_matrix(stream)
+    if m is None or m[0] * m[4] - m[1] * m[3] >= 0:
+        return None
+    return tuple((v > 0) - (v < 0) for v in (m[0], m[1], m[3], m[4]))
 
 
 def _frame_size(info: dict[str, Any], path: Path) -> tuple[int, int]:
@@ -633,6 +712,8 @@ def _ffmpeg(
                 stdout=subprocess.PIPE if progress is not None else subprocess.DEVNULL,
                 stderr=log,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except OSError as exc:
             raise RunnerFailed(f"could not start ffmpeg: {exc}") from None
@@ -989,13 +1070,19 @@ def video_trim(job: Job) -> Result:
 
 
 def _cut_points(
-    params: dict[str, Any], duration: float, last_cut: float | None = None
+    params: dict[str, Any],
+    duration: float,
+    last_cut: float | None = None,
+    first: float = 0.0,
 ) -> list[tuple[float, float]]:
     """Segment boundaries from ``at`` timestamps or an ``every`` interval.
 
-    ``duration`` is the video track's length. ``last_cut`` is the latest cut
-    that still leaves the next part a frame of its own (see
-    ``_last_frame_start``); a cut after it would write a part with no picture.
+    ``duration`` is where the video track ends on the file's timeline.
+    ``last_cut`` is the latest cut that still leaves the next part a frame of
+    its own (see ``_last_frame_start``); a cut after it would write a part with
+    no picture. ``first`` is where the video starts (see ``_video_start``): a
+    cut at or before it would leave part 1 with no picture, and an interval
+    counts from it.
     """
     from ..registry import _parse_timecode
 
@@ -1014,17 +1101,19 @@ def _cut_points(
                 raise InvalidParams(f"bad timestamp {item!r}: {exc}") from None
     elif every:
         step = float(every)
-        position = step
+        position = first + step
         while position < duration - 0.05:
             cuts.append(position)
             position += step
     else:
         raise InvalidParams("give timestamps to cut at, or an interval in seconds")
-    inside = sorted({round(c, 3) for c in cuts if 0 < c < duration and c <= limit})
+    inside = sorted(
+        {round(c, 3) for c in cuts if first + 1e-6 < c < duration and c <= limit}
+    )
     if not inside:
-        raise InvalidParams(
-            f"no cut falls inside the video, which is {duration:.2f}s long"
-        )
+        where = f"runs from {first:.2f}s to {duration:.2f}s" if first else (
+            f"is {duration:.2f}s long")
+        raise InvalidParams(f"no cut falls inside the video, which {where}")
     bounds = [0.0] + inside + [duration]
     return [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
 
@@ -1036,8 +1125,8 @@ def video_split(job: Job) -> Result:
     written, and a part with no video fails the job rather than shipping."""
     info = probe(job.source)
     _require_video(info, job.source)
-    video_length, _ = _video_timing(info)
-    segments = _cut_points(job.params, video_length, _last_frame_start(info))
+    first, video_length, _ = _video_window(info)
+    segments = _cut_points(job.params, video_length, _last_frame_start(info), first)
     total = max(_duration(info), video_length)
     ext = job.action.ext_for(job.source) or ""
     has_audio = bool(_streams(info, "audio"))
@@ -1050,7 +1139,10 @@ def video_split(job: Job) -> Result:
         length = (total - start) if last else (end - start)
         _ffmpeg(
             [
-                "-ss", _seek(start), "-i", job.source,
+                # Part 1 is read from the top with no seek: a seek to 0 lands
+                # on the first video keyframe and drops any audio before a
+                # late starting picture.
+                *(["-ss", _seek(start)] if start > 0 else []), "-i", job.source,
                 *([] if last else ["-t", f"{end - start:.3f}"]),
                 *_vcodec(ext, quality=quality), *_filters(),
                 *_acodec_for_video(ext, audio=has_audio),
@@ -1073,12 +1165,13 @@ def _join_signature(info: dict[str, Any]) -> tuple:
     video = _streams(info, "video")[:1]
     audio = _streams(info, "audio")[:1]
     return (
-        # Rotation is part of the shape: a stream copy keeps ONE display
-        # matrix for the whole file, so a portrait phone clip copied next to a
-        # landscape clip would play one of them sideways.
+        # Rotation and mirroring are part of the shape: a stream copy keeps
+        # ONE display matrix for the whole file, so a portrait phone clip
+        # copied next to a landscape clip would play one of them sideways, and
+        # a mirrored clip copied next to a plain one would mirror both.
         tuple(
             (s.get("codec_name"), s.get("width"), s.get("height"), s.get("pix_fmt"),
-             _rotation(s))
+             _rotation(s), _flip(s))
             for s in video
         ),
         tuple((s.get("codec_name"), s.get("sample_rate"), s.get("channels")) for s in audio),
@@ -1266,13 +1359,16 @@ def video_snapshot(job: Job) -> Result:
     _require_video(info, job.source)
     # Bounds come from the video track, not the container: audio that runs on
     # after the last frame has no picture to save.
-    duration, _ = _video_timing(info)
+    # The window is on the file's timeline: a video that starts after its
+    # audio is offset by its start time.
+    first, duration, _ = _video_window(info)
     last = _last_frame_start(info)
     every = job.params.get("every")
+    ignored = ""
     if every:
         step = float(every)
         times = []
-        position = 0.0
+        position = first
         while (duration and position <= last + 1e-6) or (not times):
             times.append(position)
             position += step
@@ -1281,6 +1377,11 @@ def video_snapshot(job: Job) -> Result:
                     f"an interval of {step:g}s over {duration:.0f}s would be more than "
                     "2000 frames. Use a longer interval."
                 )
+        if not duration:
+            ignored = (
+                f"; the length of {job.source.name} cannot be read, so the interval of "
+                f"{step:g}s was ignored"
+            )
     else:
         at = float(job.params.get("time") or 0.0)
         if duration and at >= duration:
@@ -1296,7 +1397,8 @@ def video_snapshot(job: Job) -> Result:
         target = job.output_path(suffix=suffix)
         # A time inside the last frame shows that frame, so the seek is held at
         # its start: a seek past it decodes nothing and ffmpeg still exits 0.
-        seek = min(at, last) if duration else at
+        # A time before the first frame shows the first frame.
+        seek = min(max(at, first), last) if duration else max(at, first)
         _ffmpeg(
             ["-ss", _seek(seek), "-i", job.source, "-frames:v", "1", "-update", "1", target],
             progress=progress.step(index, duration=max(duration, 0.001)),
@@ -1317,7 +1419,7 @@ def video_snapshot(job: Job) -> Result:
     noun = "frame" if len(outputs) == 1 else "frames"
     skipped = len(times) - len(outputs)
     note = f" ({skipped} past the last frame skipped)" if skipped else ""
-    return ok(outputs, f"Saved {len(outputs)} {noun}{note}")
+    return ok(outputs, f"Saved {len(outputs)} {noun}{note}{ignored}")
 
 
 # --- audio tools ------------------------------------------------------------
