@@ -94,7 +94,7 @@ def register(registry: Registry) -> None:
                 "json",
                 "Rotations",
                 default=None,
-                help='Per-page clockwise rotation, keyed by source page, e.g. {"1": 90, "3": 180}.',
+                help='Per-page clockwise rotation added to the page\'s current rotation, keyed by source page, e.g. {"1": 90, "3": 180}.',
             ),
         ),
         runner="peel_engine.families.pdf_tools:organize",
@@ -108,7 +108,7 @@ def _open(job: Job):
     try:
         doc = pymupdf.open(job.source)
     except Exception as exc:  # a corrupt or password-locked file
-        raise RunnerFailed(f"Cannot open {job.source.name}: {exc}") from None
+        raise RunnerFailed(f"Cannot open {job.source.name}: {_clean(exc)}") from None
     if not doc.is_pdf:
         doc.close()
         raise RunnerFailed(f"{job.source.name} is not a PDF")
@@ -130,8 +130,22 @@ def _save(doc, target) -> None:
     )
 
 
+def _clean(exc: BaseException) -> str:
+    """One line of an exception's text: MuPDF pads its errors with blank lines."""
+    text = " ".join(str(exc).split())
+    return text[:300] if text else type(exc).__name__
+
+
 def compress(job: Job) -> Result:
-    """Shrink a PDF: optionally downsample oversized images, then deflate."""
+    """Shrink a PDF: optionally downsample oversized images, then deflate.
+
+    When the rewrite is not smaller than the source (an already deflated file),
+    the output keeps the source's bytes unchanged and the message says the PDF
+    was already compact. The output still follows the naming rules, so the
+    shell always gets a ``(Compress)`` file back.
+    """
+    import shutil
+
     doc = _open(job)
     try:
         dpi = job.params["image_dpi"]
@@ -144,6 +158,11 @@ def compress(job: Job) -> Result:
         _save(doc, target)
     finally:
         doc.close()
+    before, after = job.source.stat().st_size, target.stat().st_size
+    if after >= before:
+        with open(job.source, "rb") as src, open(target, "wb") as out:
+            shutil.copyfileobj(src, out)
+        return ok([target], f"{job.source.name} is already compact; kept it as is in {target.name}")
     return ok([target], f"Compressed to {target.name}")
 
 
@@ -157,7 +176,7 @@ def merge(job: Job) -> Result:
             try:
                 part = pymupdf.open(path)
             except Exception as exc:
-                raise RunnerFailed(f"Cannot open {path.name}: {exc}") from None
+                raise RunnerFailed(f"Cannot open {path.name}: {_clean(exc)}") from None
             with part:
                 if not part.is_pdf:
                     raise RunnerFailed(f"{path.name} is not a PDF")
@@ -183,8 +202,10 @@ def split(job: Job) -> Result:
         for label, pages in groups:
             part = pymupdf.open()
             try:
-                for index in pages:
-                    part.insert_pdf(doc, from_page=index, to_page=index)
+                # Each group is one contiguous run, imported in one call so
+                # links between its pages survive (PyMuPDF drops a link whose
+                # destination is outside the range of a single insert_pdf).
+                part.insert_pdf(doc, from_page=pages[0], to_page=pages[-1])
                 target = job.output_path(ext="pdf", suffix=label)
                 _save(part, target)
             finally:
@@ -204,7 +225,8 @@ def organize(job: Job) -> Result:
         order = _page_order(job.params["pages"], count)
         rotations = _rotations(job.params["rotate"], count)
         for index, degrees in rotations.items():
-            doc[index].set_rotation(degrees)
+            page = doc[index]
+            page.set_rotation((page.rotation + degrees) % 360)
         doc.select(order)
         target = job.output_path()
         _save(doc, target)

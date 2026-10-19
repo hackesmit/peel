@@ -9,6 +9,7 @@ test does not need any backend and always runs.
 from __future__ import annotations
 
 import gzip
+import os
 import io
 import tarfile
 import zipfile
@@ -282,3 +283,382 @@ def test_zip_up_a_multi_file_drag_makes_one_archive(real, tmp_path):
     assert result.outputs[0].name == "one.zip"
     with zipfile.ZipFile(result.outputs[0]) as zf:
         assert set(zf.namelist()) == {"one.txt", "two.txt"}
+
+
+# --- decompression bombs (hq-plct.5 round 1) --------------------------------
+
+from peel_engine.families import archive as archive_mod  # noqa: E402
+
+MIB = 1 << 20
+
+
+def _zeros(size: int, chunk: int = MIB):
+    """Yield ``size`` zero bytes in chunks, so no fixture sits in memory whole."""
+    left = size
+    while left > 0:
+        n = min(chunk, left)
+        yield bytes(n)
+        left -= n
+
+
+def make_zip_bomb(path: Path, size: int = 32 * MIB) -> Path:
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+        with zf.open("zeros.bin", "w", force_zip64=True) as out:
+            for block in _zeros(size):
+                out.write(block)
+    return path
+
+
+class _ZeroReader(io.RawIOBase):
+    def __init__(self, size: int) -> None:
+        self.left = size
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buf) -> int:
+        n = min(len(buf), self.left)
+        buf[:n] = bytes(n)
+        self.left -= n
+        return n
+
+
+def make_tar_bomb(path: Path, size: int = 32 * MIB, mode: str = "w:gz") -> Path:
+    with tarfile.open(path, mode) as tf:
+        info = tarfile.TarInfo("zeros.bin")
+        info.size = size
+        tf.addfile(info, io.BufferedReader(_ZeroReader(size)))
+    return path
+
+
+def assert_refused(result, tmp_path: Path, leftover: str) -> None:
+    assert result.ok is False, result.message
+    assert result.code == "archive_too_large", result.message
+    assert "Refused" in result.message or "disk space" in result.message
+    assert not (tmp_path / leftover).exists(), "a refused extract left its folder behind"
+
+
+def test_a_zip_bomb_is_refused_by_the_default_ratio(real, tmp_path):
+    src = make_zip_bomb(tmp_path / "bomb.zip")
+    assert src.stat().st_size < 100_000
+    result = real.run("archive.extract", [src])
+    assert_refused(result, tmp_path, "bomb")
+    assert "max_ratio" in result.message
+
+
+def test_a_zip_over_the_total_limit_is_refused_on_streamed_bytes(real, tmp_path):
+    src = tmp_path / "many.zip"
+    with zipfile.ZipFile(src, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for n in range(3):
+            zf.writestr(f"part{n}.bin", os.urandom(MIB))  # incompressible, ratio 1
+    result = real.run("archive.extract", [src], {"max_total_mb": 2})
+    assert_refused(result, tmp_path, "many")
+    assert "max_total_mb" in result.message
+
+
+def test_a_zip_with_too_many_members_is_refused_before_writing(real, tmp_path):
+    src = make_zip(tmp_path / "crowd.zip", {f"f{n}.txt": "x" for n in range(20)})
+    result = real.run("archive.extract", [src], {"max_members": 10})
+    assert_refused(result, tmp_path, "crowd")
+    assert "max_members" in result.message
+
+
+def test_a_zip_member_over_the_member_limit_is_refused(real, tmp_path):
+    src = tmp_path / "big.zip"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("big.bin", os.urandom(2 * MIB))
+    result = real.run("archive.extract", [src], {"max_member_mb": 1})
+    assert_refused(result, tmp_path, "big")
+    assert "max_member_mb" in result.message
+
+
+def test_a_gzip_tar_bomb_is_refused(real, tmp_path):
+    src = make_tar_bomb(tmp_path / "bomb.tar.gz")
+    assert src.stat().st_size < 100_000
+    result = real.run("archive.extract", [src])
+    assert_refused(result, tmp_path, "bomb")
+
+
+def test_a_bzip2_tar_bomb_is_refused_early(real, tmp_path):
+    src = make_tar_bomb(tmp_path / "deep.tar.bz2", size=256 * MIB, mode="w:bz2")
+    assert src.stat().st_size < 10_000
+    result = real.run("archive.extract", [src])
+    assert_refused(result, tmp_path, "deep")
+
+
+def test_a_single_file_gzip_bomb_is_refused(real, tmp_path):
+    src = tmp_path / "disk.img.gz"
+    with gzip.open(src, "wb", compresslevel=9) as out:
+        for block in _zeros(32 * MIB):
+            out.write(block)
+    result = real.run("archive.extract", [src])
+    assert_refused(result, tmp_path, "disk.img")
+
+
+def test_a_bomb_conversion_is_refused_and_leaves_no_output(real, tmp_path):
+    src = make_zip_bomb(tmp_path / "bomb.zip")
+    result = real.run("archive.to_tar", [src])
+    assert result.ok is False
+    assert result.code == "archive_too_large"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["bomb.zip"]
+
+
+def test_free_disk_space_caps_the_total(real, tmp_path, monkeypatch):
+    monkeypatch.setattr(archive_mod, "_free_bytes", lambda path: archive_mod.GIB + MIB)
+    src = tmp_path / "fits.zip"
+    with zipfile.ZipFile(src, "w") as zf:
+        zf.writestr("a.bin", os.urandom(2 * MIB))
+    result = real.run("archive.extract", [src])
+    assert_refused(result, tmp_path, "fits")
+    assert "free disk space" in result.message
+
+
+def test_the_limits_can_be_raised_for_a_genuine_file(real, tmp_path):
+    src = make_zip_bomb(tmp_path / "zeros.zip", size=4 * MIB)
+    assert real.run("archive.extract", [src]).ok is False
+    result = real.run("archive.extract", [src], {"max_ratio": 0})
+    assert result.ok, result.message
+    assert (result.outputs[0] / "zeros.bin").stat().st_size == 4 * MIB
+
+
+def test_the_limits_are_params_with_desktop_defaults(real):
+    for action_id in ("archive.extract", "archive.to_zip", "archive.to_7z"):
+        params = {p.name: p.default for p in real.get(action_id).params}
+        assert params == {
+            "max_total_mb": 20480,
+            "max_member_mb": 20480,
+            "max_members": 1_000_000,
+            "max_ratio": 1000,
+        }
+
+
+def test_zip_extraction_does_not_run_testzip(real, tmp_path, monkeypatch):
+    """The old full decompress pass before extraction is gone."""
+
+    def boom(self):  # pragma: no cover - must not be called
+        raise AssertionError("testzip called")
+
+    monkeypatch.setattr(zipfile.ZipFile, "testzip", boom)
+    result = real.run("archive.extract", [make_zip(tmp_path / "pack.zip")])
+    assert result.ok, result.message
+
+
+def _make_7z_of_zeros(path: Path, size: int) -> Path:
+    import subprocess
+
+    exe = backends.require("7z")
+    src = path.parent / (path.stem + "_src")
+    src.mkdir()
+    with open(src / "zeros.bin", "wb") as out:
+        for block in _zeros(size):
+            out.write(block)
+    subprocess.run(
+        [str(exe), "a", "-y", "-t7z", "-mx=9", "--", str(path), "zeros.bin"],
+        cwd=str(src),
+        capture_output=True,
+        check=True,
+    )
+    (src / "zeros.bin").unlink()
+    src.rmdir()
+    return path
+
+
+@needs_7z
+def test_a_7z_bomb_is_refused_from_its_listing(real, tmp_path):
+    src = _make_7z_of_zeros(tmp_path / "bomb.7z", 64 * MIB)
+    assert src.stat().st_size < 100_000
+    result = real.run("archive.extract", [src])
+    assert_refused(result, tmp_path, "bomb")
+
+
+@needs_7z
+def test_a_7z_that_lies_in_its_listing_is_stopped_on_written_bytes(real, tmp_path, monkeypatch):
+    """Headers can lie: the folder is measured while 7-Zip runs."""
+    monkeypatch.setattr(archive_mod, "_parse_7z_listing", lambda text: [])
+    src = _make_7z_of_zeros(tmp_path / "liar.7z", 16 * MIB)
+    result = real.run("archive.extract", [src], {"max_total_mb": 1, "max_ratio": 0})
+    assert_refused(result, tmp_path, "liar")
+    assert "max_total_mb" in result.message
+
+
+def test_the_7z_listing_parser_reads_sizes():
+    text = (
+        "Path = x.7z\nType = 7z\n\n----------\n"
+        "Path = a.txt\nSize = 12\nFolder = -\n\n"
+        "Path = sub\nSize = 0\nFolder = +\n\n"
+        "Path = sub/b.bin\nSize = 4096\n"
+    )
+    assert archive_mod._parse_7z_listing(text) == [("a.txt", 12), ("sub", 0), ("sub/b.bin", 4096)]
+
+
+# --- tar links and odd members ----------------------------------------------
+
+
+def _tar(path: Path, members: list[tuple[str, str, str | bytes]]) -> Path:
+    """members: (kind, name, data or linkname); kind is file, sym, hard, fifo, chr."""
+    with tarfile.open(path, "w") as tf:
+        for kind, name, value in members:
+            info = tarfile.TarInfo(name)
+            if kind == "file":
+                data = value.encode() if isinstance(value, str) else value
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+                continue
+            info.type = {
+                "sym": tarfile.SYMTYPE,
+                "hard": tarfile.LNKTYPE,
+                "fifo": tarfile.FIFOTYPE,
+                "chr": tarfile.CHRTYPE,
+                "dir": tarfile.DIRTYPE,
+            }[kind]
+            if kind in ("sym", "hard"):
+                info.linkname = value
+            tf.addfile(info)
+    return path
+
+
+def test_internal_symlinks_become_copies(real, tmp_path):
+    src = _tar(
+        tmp_path / "links.tar",
+        [
+            ("file", "a.txt", "alpha\n"),
+            ("file", "sub/b.txt", "beta\n"),
+            ("sym", "sub/up.txt", "../a.txt"),
+            ("sym", "alias", "sub"),
+            ("sym", "chain.txt", "sub/up.txt"),
+        ],
+    )
+    result = real.run("archive.extract", [src])
+    assert result.ok, result.message
+    folder = result.outputs[0]
+    assert not (folder / "sub" / "up.txt").is_symlink()
+    assert (folder / "sub" / "up.txt").read_text() == "alpha\n"
+    assert (folder / "alias" / "b.txt").read_text() == "beta\n"
+    assert (folder / "chain.txt").read_text() == "alpha\n"
+    assert "Skipped" not in result.message
+
+
+def test_internal_symlinks_survive_a_conversion(real, tmp_path):
+    src = _tar(tmp_path / "links.tar", [("file", "a.txt", "alpha\n"), ("sym", "b.txt", "a.txt")])
+    result = real.run("archive.to_zip", [src])
+    assert result.ok, result.message
+    with zipfile.ZipFile(result.outputs[0]) as zf:
+        assert zf.read("b.txt") == b"alpha\n"
+
+
+def test_an_escaping_symlink_is_refused(real, tmp_path):
+    src = _tar(tmp_path / "evil.tar", [("file", "a.txt", "x"), ("sym", "sub/out", "../../etc/passwd")])
+    result = real.run("archive.extract", [src])
+    assert result.ok is False
+    assert "unsafe" in result.message
+    assert not (tmp_path / "evil").exists()
+
+
+def test_an_escaping_hard_link_is_refused(real, tmp_path):
+    src = _tar(tmp_path / "evil.tar", [("hard", "x", "../outside.txt")])
+    result = real.run("archive.extract", [src])
+    assert result.ok is False
+    assert "unsafe" in result.message
+
+
+def test_devices_fifos_and_dangling_links_are_listed_as_skipped(real, tmp_path):
+    src = _tar(
+        tmp_path / "odd.tar",
+        [
+            ("file", "a.txt", "alpha\n"),
+            ("fifo", "pipe", ""),
+            ("chr", "dev/null", ""),
+            ("sym", "gone.txt", "missing.txt"),
+        ],
+    )
+    result = real.run("archive.extract", [src])
+    assert result.ok, result.message
+    assert "Skipped 3" in result.message
+    assert "pipe (fifo)" in result.message
+    assert "dev/null (device)" in result.message
+    assert "gone.txt (link to a missing file)" in result.message
+
+
+def test_a_failed_tar_extract_removes_its_folder(real, tmp_path):
+    src = _tar(tmp_path / "half.tar", [("file", "good.txt", "fine\n"), ("file", "../evil.txt", "x")])
+    result = real.run("archive.extract", [src])
+    assert result.ok is False
+    assert not (tmp_path / "half").exists()
+    assert not (tmp_path / "evil.txt").exists()
+
+
+def test_a_failed_extract_keeps_a_folder_it_did_not_claim(real, tmp_path):
+    mine = tmp_path / "half"
+    mine.mkdir()
+    (mine / "keep.txt").write_text("mine\n")
+    src = _tar(tmp_path / "half.tar", [("file", "good.txt", "fine\n"), ("file", "../evil.txt", "x")])
+    result = real.run("archive.extract", [src])
+    assert result.ok is False
+    assert (mine / "keep.txt").read_text() == "mine\n"
+    assert not (tmp_path / "half 2").exists()
+
+
+# --- zip up name collisions -------------------------------------------------
+
+
+def test_zip_up_keeps_two_files_with_the_same_name(real, tmp_path):
+    (tmp_path / "one").mkdir()
+    (tmp_path / "two").mkdir()
+    a = tmp_path / "one" / "notes.txt"
+    b = tmp_path / "two" / "Notes.TXT"
+    a.write_text("first\n")
+    b.write_text("second\n")
+    result = real.run("archive.zip", [a, b])
+    assert result.ok, result.message
+    with zipfile.ZipFile(result.outputs[0]) as zf:
+        names = zf.namelist()
+        assert len({n.casefold() for n in names}) == len(names) == 2
+        assert zf.read("notes.txt") == b"first\n"
+        assert zf.read("Notes 2.TXT") == b"second\n"
+
+
+def test_zip_up_keeps_two_folders_with_the_same_name(real, tmp_path):
+    a = make_tree(tmp_path / "x" / "album", {"a.txt": "1\n"})
+    b = make_tree(tmp_path / "y" / "Album", {"a.txt": "2\n"})
+    result = real.run("archive.zip", [a, b])
+    assert result.ok, result.message
+    with zipfile.ZipFile(result.outputs[0]) as zf:
+        assert zf.read("album/a.txt") == b"1\n"
+        assert zf.read("Album 2/a.txt") == b"2\n"
+
+
+# --- double extensions ------------------------------------------------------
+
+
+def test_a_tar_gz_is_named_as_one_extension(real, tmp_path):
+    src = make_tar(tmp_path / "bundle.tar.gz", mode="w:gz")
+    extracted = real.run("archive.extract", [src])
+    assert extracted.ok, extracted.message
+    assert extracted.outputs[0].name == "bundle"
+    zipped = real.run("archive.to_zip", [src])
+    assert zipped.outputs[0].name == "bundle.zip"
+    assert read_archive(real, zipped.outputs[0], tmp_path) == PAYLOAD
+
+
+@pytest.mark.parametrize("name,mode", [("pack.tgz", "w:gz"), ("pack.tar.bz2", "w:bz2"), ("pack.tar.xz", "w:xz")])
+def test_other_compressed_tars_extract_and_name_cleanly(real, tmp_path, name, mode):
+    src = make_tar(tmp_path / name, mode=mode)
+    result = real.run("archive.to_zip", [src])
+    assert result.ok, result.message
+    assert result.outputs[0].name == "pack.zip"
+
+
+def test_to_gzip_is_not_offered_for_a_gzip(real, tmp_path):
+    src = make_tar(tmp_path / "bundle.tar.gz", mode="w:gz")
+    converts = entries(real.options([src], include_unavailable=True), "convert")
+    assert "archive.to_gzip" not in converts
+    assert "archive.to_zip" in converts
+
+
+def test_a_corrupt_gzip_reports_one_clean_line(real, tmp_path):
+    bad = tmp_path / "broken.gz"
+    bad.write_bytes(b"\x1f\x8b\x08\x00garbage that is not deflate data at all")
+    result = real.run("archive.extract", [bad])
+    assert result.ok is False
+    assert "\n" not in result.message
+    assert "Traceback" not in result.message

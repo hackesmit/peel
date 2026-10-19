@@ -223,3 +223,57 @@ def test_organize_rejects_a_bad_rotation(real, tmp_path):
     assert result.ok is False
     assert result.code == "invalid_params"
     assert "multiple of 90" in result.message
+
+
+# --- round 1 review fixes (hq-plct.5) ---------------------------------------
+
+
+def test_split_keeps_a_link_between_pages_of_one_range(real, tmp_path):
+    src = tmp_path / "linked.pdf"
+    doc = pymupdf.open()
+    doc.new_page()
+    doc.new_page()
+    doc[0].insert_link({"kind": pymupdf.LINK_GOTO, "from": pymupdf.Rect(72, 72, 200, 100), "page": 1})
+    doc.save(str(src))
+    doc.close()
+    result = real.run("pdf.split", [src], {"ranges": "1-2"})
+    assert result.ok, result.message
+    with pymupdf.open(result.outputs[0]) as out:
+        links = out[0].get_links()
+        assert [(link["kind"], link["page"]) for link in links] == [(pymupdf.LINK_GOTO, 1)]
+
+
+def test_organize_rotation_adds_to_the_current_rotation(real, tmp_path):
+    src = tmp_path / "turned.pdf"
+    doc = pymupdf.open()
+    doc.new_page().set_rotation(90)
+    doc.save(str(src))
+    doc.close()
+    result = real.run("pdf.organize", [src], {"pages": "1", "rotate": '{"1": 90}'})
+    assert result.ok, result.message
+    with pymupdf.open(result.outputs[0]) as out:
+        assert out[0].rotation == 180
+    help_text = {p.name: p.help for p in real.get("pdf.organize").params}["rotate"]
+    assert "current rotation" in help_text
+
+
+def test_compress_keeps_the_original_when_it_cannot_shrink(real, tmp_path):
+    first = real.run("pdf.compress", [make_pdf(tmp_path / "doc.pdf", pages=2, labels=True)])
+    assert first.ok
+    compact = first.outputs[0]
+    again = real.run("pdf.compress", [compact])
+    assert again.ok, again.message
+    assert "already compact" in again.message
+    assert again.outputs[0].read_bytes() == compact.read_bytes()
+    assert again.outputs[0].name == "doc (Compress) (Compress).pdf"
+
+
+def test_a_garbage_pdf_error_is_one_trimmed_line(real, tmp_path):
+    good = make_pdf(tmp_path / "good.pdf")
+    bad = tmp_path / "bad.pdf"
+    bad.write_bytes(b"this is not a pdf at all" * 10)
+    result = real.run("pdf.merge", [good, bad])
+    assert result.ok is False
+    assert "\n" not in result.message
+    assert result.message == result.message.strip()
+    assert "  " not in result.message
