@@ -19,7 +19,9 @@ dependencies = []
 dev = [
     "pytest>=8",
     "pillow",
-    "pymupdf",
+    # Held to the 1.26 line: pymupdf 2.x pulls in pymupdf_layout and
+    # onnxruntime, and changes find_tables output (phantom empty columns).
+    "pymupdf>=1.26,<1.27",
     "pdf2docx",
     "python-docx",
     "python-pptx",

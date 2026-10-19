@@ -137,6 +137,14 @@ SLIDE_DPI = Param(
     help="Dots per inch each page is rendered at.",
 )
 
+ALLOW_REMOTE = Param(
+    "allow_remote",
+    "bool",
+    "Download web images",
+    default=False,
+    help="Peel works offline: images on the web stay links unless this is on.",
+)
+
 
 # --- registration -----------------------------------------------------------
 
@@ -159,6 +167,7 @@ def _register_documents(registry: Registry) -> None:
             group="Documents",
             inputs=tuple(e for e in DOC_FORMATS if e != target),
             output_ext=target,
+            params=(ALLOW_REMOTE,),
             backends=("pandoc", "soffice") if target in LO_DOC_TARGETS else ("pandoc",),
             runner=f"{RUNNER}:doc_convert",
         )
@@ -320,33 +329,287 @@ def _last_line(text: str) -> str:
     return (lines[-1] if lines else "no output")[:200]
 
 
-def _run(args: Sequence[str], *, timeout: int,
-         cwd: str | None = None) -> subprocess.CompletedProcess[str]:
-    """Run a backend. A failure becomes a message, never a traceback."""
+def _run(args: Sequence[str], *, timeout: int, cwd: str | None = None,
+         env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Run a backend. A failure becomes a message, never a traceback.
+
+    The backend runs in its own process group (its own session on Linux), so a
+    timeout stops the whole tree. LibreOffice's ``soffice`` is only a launcher
+    for ``soffice.bin``; killing just the launcher used to leave the real
+    converter running, and it went on to write into a scratch folder beside the
+    source after Peel had already reported the failure.
+    """
     name = Path(args[0]).stem
+    popen: dict[str, Any] = {}
+    if os.name == "nt":
+        popen["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen["start_new_session"] = True
     try:
-        proc = subprocess.run(
-            list(args), capture_output=True, text=True, timeout=timeout, check=False, cwd=cwd
+        proc = subprocess.Popen(
+            list(args), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace", cwd=cwd, env=env, **popen,
         )
+    except OSError as exc:
+        raise RunnerFailed(f"{name} could not start: {exc.strerror or exc}") from None
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        _kill_tree(proc)
         raise RunnerFailed(
             f"{name} took longer than {timeout} seconds and was stopped.",
             code="backend_timeout",
         ) from None
-    except OSError as exc:
-        raise RunnerFailed(f"{name} could not start: {exc.strerror or exc}") from None
-    if proc.returncode != 0:
-        raise RunnerFailed(f"{name} failed: {_last_line(proc.stderr or proc.stdout)}")
-    return proc
+    done = subprocess.CompletedProcess(list(args), proc.returncode, stdout, stderr)
+    if done.returncode != 0:
+        raise RunnerFailed(f"{name} failed: {_last_line(stderr or stdout)}")
+    return done
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Stop a backend and every process it started, then reap it."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                           capture_output=True, check=False, timeout=30)
+        else:
+            import signal
+
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    with contextlib.suppress(Exception):
+        proc.kill()
+    with contextlib.suppress(Exception):
+        proc.communicate(timeout=30)
+
+
+#: A pandoc Lua filter that keeps a document to its own folder.
+#:
+#: A Markdown or HTML file can name any path as an image (``/etc/hostname``,
+#: ``C:/Users/danie/...``, ``../../secret.png``), and pandoc would copy that
+#: file's bytes into the DOCX, EPUB or self contained HTML it writes: a file
+#: the user then sends to someone. So every local reference must resolve inside
+#: the source file's folder or one of its subfolders; anything else is left out
+#: and reported. Peel is local only, so a web image is not fetched either
+#: unless the run asks for it (``allow_remote``); it stays in the document as a
+#: link. The check is lexical (``..`` segments, absolute paths, drive letters,
+#: percent escapes, ``file:`` URLs); pandoc itself is only given the source
+#: folder as its resource path.
+_RESOURCE_FILTER = r"""
+local root_ok = os.getenv("PEEL_RESOURCE_ROOT") ~= nil
+local allow_remote = os.getenv("PEEL_ALLOW_REMOTE") == "1"
+
+local function report(kind, target)
+  io.stderr:write("PEEL-RESOURCE\t" .. kind .. "\t" .. (target or "") .. "\n")
+end
+
+local function unescape(s)
+  return (s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end))
+end
+
+local function escapes(p)
+  p = p:gsub("\\", "/")
+  if p:match("^/") or p:match("^%a:") or p:match("^~") then return true end
+  local depth = 0
+  for part in p:gmatch("[^/]+") do
+    if part == ".." then
+      depth = depth - 1
+      if depth < 0 then return true end
+    elseif part ~= "." then
+      depth = depth + 1
+    end
+  end
+  return false
+end
+
+-- "ok", "remote" or "outside"
+local function classify(src)
+  if src == nil then return "ok" end
+  local s = src:gsub("^%s+", ""):gsub("%s+$", "")
+  if s == "" or s:match("^#") then return "ok" end
+  local lower = s:lower()
+  if lower:match("^data:") then return "ok" end
+  if lower:match("^https?:") or lower:match("^//") or lower:match("^ftps?:") then
+    return "remote"
+  end
+  if lower:match("^%a[%w+.-]+:") then return "outside" end
+  if not root_ok then return "outside" end
+  local bare = s:gsub("[?#].*$", "")
+  if escapes(s) or escapes(unescape(s)) or escapes(bare) or escapes(unescape(bare)) then
+    return "outside"
+  end
+  return "ok"
+end
+
+function Image(img)
+  local verdict = classify(img.src)
+  if verdict == "ok" or (verdict == "remote" and allow_remote) then return nil end
+  report(verdict, img.src)
+  local words = img.caption
+  if verdict == "remote" then
+    if #words == 0 then words = { pandoc.Str(img.src) } end
+    return pandoc.Link(words, img.src)
+  end
+  if #words > 0 then return pandoc.Span(words) end
+  return {}
+end
+
+local function clean_html(text)
+  local function check(value, keep_remote)
+    local verdict = classify(value)
+    if verdict == "ok" or (verdict == "remote" and (allow_remote or keep_remote)) then
+      return nil
+    end
+    report(verdict, value)
+    return ""
+  end
+  text = text:gsub("<([%w:-]+)(.-)>", function(tag, attrs)
+    local is_anchor = tag:lower() == "a"
+    local function attr(lead, name, q, value)
+      local n = name:lower()
+      if n == "src" or n == "href" or n == "poster" or n == "data" or n == "background"
+        or n == "xlink:href" or n == "srcset" or n == "action" then
+        if is_anchor and n == "href" then return nil end
+        local bad = false
+        if n == "srcset" then
+          for item in value:gmatch("[^,]+") do
+            if check(item:match("^%s*(%S*)")) ~= nil then bad = true end
+          end
+        else
+          bad = check(value) ~= nil
+        end
+        if bad then return lead .. name .. "=" .. q .. q end
+      end
+      return nil
+    end
+    attrs = attrs:gsub('(%s)([%w:-]+)%s*=%s*(")([^"]*)"', attr)
+    attrs = attrs:gsub("(%s)([%w:-]+)%s*=%s*(')([^']*)'", attr)
+    attrs = attrs:gsub("(%s)([%w:-]+)%s*=%s*()([^%s\"'>][^%s>]*)", function(lead, name, _, value)
+      return attr(lead, name, "", value)
+    end)
+    return "<" .. tag .. attrs .. ">"
+  end)
+  text = text:gsub("url%(%s*(['\"]?)(.-)%1%s*%)", function(q, value)
+    if check(value) ~= nil then return "url()" end
+    return nil
+  end)
+  text = text:gsub("@import%s+(['\"])(.-)%1", function(q, value)
+    if check(value) ~= nil then return "@import " .. q .. q end
+    return nil
+  end)
+  return text
+end
+
+local function is_html(format)
+  local f = format:lower()
+  return f == "html" or f == "html4" or f == "html5" or f == "epub"
+end
+
+function RawInline(el)
+  if is_html(el.format) then el.text = clean_html(el.text); return el end
+end
+
+function RawBlock(el)
+  if is_html(el.format) then el.text = clean_html(el.text); return el end
+end
+
+local RESOURCE_META = { "css", "stylesheet", "cover-image", "epub-cover-image",
+                        "header-includes", "include-before", "include-after" }
+
+function Meta(meta)
+  for _, key in ipairs(RESOURCE_META) do
+    if meta[key] ~= nil then
+      report("meta", key)
+      meta[key] = nil
+    end
+  end
+  return meta
+end
+"""
+
+#: Where the filter above is written, once per process.
+_FILTER_PATH: Path | None = None
+
+
+def _resource_filter() -> Path:
+    global _FILTER_PATH
+    if _FILTER_PATH is None or not _FILTER_PATH.is_file():
+        import atexit
+        import shutil
+        import tempfile
+
+        folder = Path(tempfile.mkdtemp(prefix=f"peel-filter-{os.getpid()}-"))
+        atexit.register(shutil.rmtree, folder, ignore_errors=True)
+        path = folder / "peel-resources.lua"
+        path.write_text(_RESOURCE_FILTER, encoding="utf-8")
+        _FILTER_PATH = path
+    return _FILTER_PATH
+
+
+@dataclass
+class Dropped:
+    """What the resource filter kept out of a document, for the result message."""
+
+    outside: list[str]
+    remote: list[str]
+    meta: list[str]
+
+    def __bool__(self) -> bool:
+        return bool(self.outside or self.remote or self.meta)
+
+    def extend(self, other: "Dropped") -> None:
+        self.outside += other.outside
+        self.remote += other.remote
+        self.meta += other.meta
+
+    def note(self) -> str:
+        parts = []
+        if self.outside:
+            names = ", ".join(sorted({_short(t) for t in self.outside})[:3])
+            parts.append(
+                f"Left out {len(self.outside)} linked file(s) outside the document's "
+                f"folder ({names})."
+            )
+        if self.remote:
+            parts.append(f"Kept {len(self.remote)} web image(s) as links; Peel does not "
+                         "download them.")
+        if self.meta:
+            parts.append(f"Ignored the document's {', '.join(sorted(set(self.meta)))} "
+                         "setting(s), which can pull in outside files.")
+        return " ".join(parts)
+
+
+def _short(target: str) -> str:
+    name = re.split(r"[\\/]", target.rstrip("\\/"))[-1]
+    return (name or target)[:60]
+
+
+def _with_note(message: str, dropped: Dropped | None) -> str:
+    return f"{message}. {dropped.note()}" if dropped else message
+
+
+def _parse_dropped(stderr: str) -> Dropped:
+    dropped = Dropped([], [], [])
+    for line in (stderr or "").splitlines():
+        if not line.startswith("PEEL-RESOURCE\t"):
+            continue
+        _, kind, target = (line.split("\t", 2) + [""])[:3]
+        {"remote": dropped.remote, "meta": dropped.meta}.get(kind, dropped.outside).append(target)
+    return dropped
 
 
 def _pandoc(source: Path, target: Path, *, src_ext: str = "", out_ext: str = "",
-            media: Path | None = None, reader: str = "") -> None:
+            media: Path | None = None, reader: str = "",
+            allow_remote: bool = False) -> Dropped:
     """Convert with pandoc straight onto ``target``.
 
     ``media`` is a folder images are extracted into. pandoc is run from the
     target's folder and given the folder's bare name, so the links it writes
     are relative to the document and the pair still works after a move.
+
+    Every run goes through the resource filter above; what it kept out comes
+    back so the result message can say so.
     """
     exe = backends.require("pandoc")
     reader = reader or PANDOC_READER.get(src_ext or _ext(source), "")
@@ -356,16 +619,18 @@ def _pandoc(source: Path, target: Path, *, src_ext: str = "", out_ext: str = "",
             f"Peel cannot convert {src_ext or _ext(source)} to {out_ext or _ext(target)}.",
             code="unsupported_pair",
         )
+    folder = os.path.dirname(_abs(source))
     args = [
         str(exe),
         "--from", reader,
         "--to", writer,
         "--output", _abs(target),
-        # Where to look for a file the document links to relatively. pandoc
-        # searches its working directory by default, which is wherever the
-        # shell happened to start peel, so an image beside the source would be
-        # silently dropped without this.
-        f"--resource-path={os.path.dirname(_abs(source))}{os.pathsep}.",
+        # Where to look for a file the document links to relatively: the
+        # source's own folder and nothing else. pandoc searches its working
+        # directory by default, which is wherever the shell happened to start
+        # peel, so an image beside the source would be silently dropped.
+        f"--resource-path={folder}",
+        f"--lua-filter={_abs(_resource_filter())}",
     ]
     if writer in ("html", "epub"):
         args += ["--standalone", "--metadata", f"title={source.stem}"]
@@ -376,8 +641,12 @@ def _pandoc(source: Path, target: Path, *, src_ext: str = "", out_ext: str = "",
     if media is not None:
         args += [f"--extract-media={Path(media).name}"]
     args += [_abs(source)]
-    _run(args, timeout=PANDOC_TIMEOUT,
-         cwd=os.path.dirname(_abs(target)) if media is not None else None)
+    env = dict(os.environ)
+    env["PEEL_RESOURCE_ROOT"] = folder
+    env["PEEL_ALLOW_REMOTE"] = "1" if allow_remote else "0"
+    proc = _run(args, timeout=PANDOC_TIMEOUT, env=env,
+                cwd=os.path.dirname(_abs(target)) if media is not None else None)
+    return _parse_dropped(proc.stderr)
 
 
 #: The LibreOffice user profile for this process, made on first use.
@@ -482,32 +751,93 @@ def doc_convert(job: Job) -> Result:
     src_ext = _ext(source)
     target = job.output_path()
     out_ext = _ext(target)
+    allow_remote = bool(job.params.get("allow_remote", False))
 
     if out_ext in LO_DOC_TARGETS:
-        _soffice(_as_soffice_input(job, source, src_ext, target),
-                 target, SOFFICE_CONVERT_TO[out_ext], job)
-        return ok([target], f"Wrote {target.name}")
+        given, dropped = _as_soffice_input(job, source, src_ext, target, allow_remote)
+        _soffice(given, target, SOFFICE_CONVERT_TO[out_ext], job)
+        return ok([target], _with_note(f"Wrote {target.name}", dropped))
 
     media = _claim_media(job, target) if out_ext == "md" else None
-    _pandoc(source, target, src_ext=src_ext, out_ext=out_ext, media=media)
+    dropped = _pandoc(source, target, src_ext=src_ext, out_ext=out_ext, media=media,
+                      allow_remote=allow_remote)
     outputs = [target] + _media_outputs(media)
-    return ok(outputs, f"Wrote {target.name}")
+    return ok(outputs, _with_note(f"Wrote {target.name}", dropped))
 
 
-def _as_soffice_input(job: Job, source: Path, src_ext: str, near: Path) -> Path:
-    """``source`` itself, or a scratch ODT when LibreOffice cannot read it."""
-    if src_ext in SOFFICE_DOC_IN:
-        return source
+def _as_soffice_input(job: Job, source: Path, src_ext: str, near: Path,
+                      allow_remote: bool = False) -> tuple[Path, Dropped | None]:
+    """``source`` itself, or a scratch ODT made by pandoc.
+
+    The pandoc detour is taken when LibreOffice cannot read the format, and
+    also when the source links to files LibreOffice would load by itself: an
+    HTML page always can, and a DOCX, ODT or RTF can carry a linked (not
+    embedded) picture or text. Going through pandoc puts those links through
+    the same folder check as every other pandoc run.
+    """
+    if src_ext in SOFFICE_DOC_IN and not _links_outside_files(source, src_ext):
+        return source, None
     bridge = job.scratch_dir(near) / f"{source.stem or 'document'}.odt"
-    _pandoc(source, bridge, src_ext=src_ext, out_ext="odt")
-    return bridge
+    dropped = _pandoc(source, bridge, src_ext=src_ext, out_ext="odt",
+                      allow_remote=allow_remote)
+    return bridge, dropped
+
+
+#: DOCX relationship types that only point somewhere (a hyperlink), as
+#: opposed to ones LibreOffice opens and pulls in (images, OLE, subdocuments).
+_HYPERLINK_REL = re.compile(r"/hyperlink$")
+_RELATIONSHIP = re.compile(r"<Relationship\b[^>]*>", re.I)
+_ODF_LINK = re.compile(
+    r"<(?:draw:image|draw:object|draw:object-ole|draw:plugin|draw:applet|"
+    r"text:section-source|draw:fill-image|style:background-image)\b[^>]*"
+    r"xlink:href=\"([^\"]*)\"",
+    re.I,
+)
+_RTF_LINK = re.compile(rb"INCLUDEPICTURE|INCLUDETEXT|\\objlink|\\objautlink|\\linkself", re.I)
+
+
+def _links_outside_files(source: Path, src_ext: str) -> bool:
+    """Whether LibreOffice would load files this document only links to."""
+    import zipfile
+
+    if src_ext in ("html", "htm"):
+        return True
+    if src_ext == "rtf":
+        try:
+            return bool(_RTF_LINK.search(source.read_bytes()))
+        except OSError:
+            return False
+    if src_ext not in ("docx", "odt"):
+        return False
+    try:
+        with zipfile.ZipFile(source) as package:
+            for name in package.namelist():
+                if src_ext == "docx" and name.endswith(".rels"):
+                    text = package.read(name).decode("utf-8", "replace")
+                    for rel in _RELATIONSHIP.findall(text):
+                        if re.search(r'TargetMode="External"', rel, re.I) and not \
+                                _HYPERLINK_REL.search(_attr(rel, "Type")):
+                            return True
+                if src_ext == "odt" and name in ("content.xml", "styles.xml"):
+                    text = package.read(name).decode("utf-8", "replace")
+                    for href in _ODF_LINK.findall(text):
+                        if href.startswith(("../", "/", "\\")) or re.match(r"^[a-z][\w+.-]*:", href, re.I):
+                            return True
+    except (OSError, zipfile.BadZipFile, KeyError):
+        return False
+    return False
+
+
+def _attr(tag: str, name: str) -> str:
+    match = re.search(rf'\b{name}="([^"]*)"', tag)
+    return match.group(1) if match else ""
 
 
 def extract_text(job: Job) -> Result:
     """The Extract Text and Extract Markdown tools: the words, no formatting."""
     target = job.output_path()
-    _pandoc(job.source, target, src_ext=_ext(job.source), out_ext=_ext(target))
-    return ok([target], f"Wrote {target.name}")
+    dropped = _pandoc(job.source, target, src_ext=_ext(job.source), out_ext=_ext(target))
+    return ok([target], _with_note(f"Wrote {target.name}", dropped))
 
 
 # --- PDF --------------------------------------------------------------------
@@ -596,6 +926,7 @@ def pdf_to_xlsx(job: Job) -> Result:
     target = job.output_path()
     doc = _open_pdf(job.source)
     tables_found = 0
+    texted = False
     try:
         book = Workbook()
         book.remove(book.active)
@@ -604,19 +935,41 @@ def pdf_to_xlsx(job: Job) -> Result:
             row = 1
             for table in page.find_tables().tables:
                 tables_found += 1
-                for cells in table.extract():
+                for cells in _drop_empty_columns(table.extract()):
                     _write_row(sheet, row, (_as_number(c) for c in cells))
                     row += 1
                 row += 1
+            text = page.get_text()
+            texted = texted or bool(text.strip())
             if row == 1:
-                for line in page.get_text().splitlines():
+                for line in text.splitlines():
                     _write_row(sheet, row, [line])
                     row += 1
         book.save(_abs(target))
     finally:
         doc.close()
     noun = "table" if tables_found == 1 else "tables"
-    return ok([target], f"Wrote {target.name} ({tables_found} {noun} found)")
+    message = f"Wrote {target.name} ({tables_found} {noun} found)"
+    return ok([target], message + _no_text_note(texted))
+
+
+def _drop_empty_columns(rows: Sequence[Sequence[Any]]) -> list[list[Any]]:
+    """A table without the columns that are empty in every row.
+
+    PyMuPDF 2.x reports a phantom column between real ones on some tables
+    (``['name', '', 'qty']``); written as is, every value after it lands one
+    column to the right of its header's neighbour. A column with nothing in
+    any row carries no data, so dropping it is safe with either version.
+    """
+    rows = [list(row) for row in rows]
+    width = max((len(row) for row in rows), default=0)
+
+    def blank(value: Any) -> bool:
+        return value is None or (isinstance(value, str) and not value.strip())
+
+    keep = [c for c in range(width)
+            if any(c < len(row) and not blank(row[c]) for row in rows)]
+    return [[row[c] if c < len(row) else None for c in keep] for row in rows]
 
 
 #: Significant digits a spreadsheet can hold without rounding, because every
@@ -684,7 +1037,15 @@ def pdf_to_text(job: Job) -> Result:
         doc.close()
     body = "\n\n".join(page.strip() for page in pages).strip() + "\n"
     target.write_text(body, encoding="utf-8", newline="\n")
-    return ok([target], f"Wrote {target.name}")
+    return ok([target], f"Wrote {target.name}" + _no_text_note(bool(body.strip())))
+
+
+def _no_text_note(found: bool) -> str:
+    """A warning for a PDF with no text layer: success, but say why it is empty."""
+    if found:
+        return ""
+    return (". No text was found in the PDF: it is probably scanned pages, "
+            "which need OCR before their words can be extracted")
 
 
 @quiet_stdout
@@ -699,6 +1060,7 @@ def pdf_to_markup(job: Job) -> Result:
     doc = _open_pdf(job.source)
     try:
         body = "".join(page.get_text("xhtml") for page in doc)
+        texted = any(page.get_text().strip() for page in doc)
     finally:
         doc.close()
     bridge = job.scratch_dir(target) / f"{job.source.stem or 'document'}.html"
@@ -710,7 +1072,7 @@ def pdf_to_markup(job: Job) -> Result:
     media = _claim_media(job, target) if out_ext == "md" else None
     _pandoc(bridge, target, src_ext="html", out_ext=out_ext, media=media,
             reader=PDF_MARKUP_READER)
-    return ok([target] + _media_outputs(media), f"Wrote {target.name}")
+    return ok([target] + _media_outputs(media), f"Wrote {target.name}" + _no_text_note(texted))
 
 
 def _escape(text: str) -> str:
@@ -797,7 +1159,7 @@ def _sheet_to_delimited(job: Job, source: Path, src_ext: str, out_ext: str) -> R
         _soffice(source, bridge, "xlsx", job)
         book_path = bridge
 
-    sheets = _read_workbook(book_path)
+    sheets = _read_workbook(book_path, job)
     if not sheets:
         return failure(f"{source.name} has no sheets to export.", code="empty_input")
 
@@ -880,12 +1242,26 @@ def _read_delimited(source: Path, delimiter: str) -> list[list[str]]:
     first would hand the reader two half rows and join them into ``firstsecond``.
     ``newline=""`` keeps the line endings for the reader to interpret, as the
     csv module's own documentation requires.
+
+    A ``.csv`` whose first record is one single column with commas is sniffed
+    for another separator: Excel in a locale with a decimal comma (es-ES, de,
+    fr) saves CSV with semicolons.
     """
     import csv
     import io
 
-    stream = io.StringIO(_read_text(source), newline="")
-    return list(csv.reader(stream, delimiter=delimiter))
+    text = _read_text(source)
+    rows = list(csv.reader(io.StringIO(text, newline=""), delimiter=delimiter))
+    if delimiter == "," and rows and len(rows[0]) <= 1:
+        sample = text[:65536]
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=";\t|")
+        except csv.Error:
+            return rows
+        other = list(csv.reader(io.StringIO(text, newline=""), dialect))
+        if other and len(other[0]) > 1:
+            return other
+    return rows
 
 
 def _write_delimited(target: Path, rows: Iterable[Sequence[Any]], delimiter: str) -> None:
@@ -898,27 +1274,77 @@ def _write_delimited(target: Path, rows: Iterable[Sequence[Any]], delimiter: str
         )
 
 
-def _read_workbook(path: Path) -> list[tuple[str, list[list[Any]]]]:
+def _read_workbook(path: Path, job: Job | None = None) -> list[tuple[str, list[list[Any]]]]:
     """Every sheet of an XLSX as (title, rows): the values, not the formulas.
 
     A workbook saved by a script and never opened in Excel has formulas with no
     cached result, and asking for values alone gives back an empty cell. Rather
-    than report success over silently dropped data, the formula text is read in
-    a second pass and used wherever the value is missing. The second pass only
-    happens when the first one found a gap.
+    than report success over silently dropped data, such a workbook is
+    recalculated by LibreOffice when it is installed, and any formula still
+    without a value is written as its formula text. Trailing blank rows are
+    trimmed only after that, so a total row made of nothing but an uncached
+    formula is never mistaken for blank and dropped.
     """
     values = _sheet_rows(path, data_only=True)
-    if not any(cell == "" for _, rows in values for row in rows for cell in row):
-        return values
     formulas = _sheet_rows(path, data_only=False)
+    if _formula_gaps(values, formulas) and job is not None and not backends.missing(("soffice",)):
+        recalculated = job.scratch_dir(path) / f"{path.stem or 'sheet'}.xlsx"
+        with contextlib.suppress(RunnerFailed):
+            _soffice(path, recalculated, "xlsx", job)
+            values = _sheet_rows(recalculated, data_only=True)
     for (_, rows), (_, backup) in zip(values, formulas):
         for index, row in enumerate(rows):
             if index >= len(backup):
                 break
             for column, cell in enumerate(row):
-                if cell == "" and column < len(backup[index]):
+                if cell == "" and column < len(backup[index]) and _is_formula(backup[index][column]):
                     row[column] = backup[index][column]
-    return values
+    return [(title, _trim(rows)) for title, rows in values]
+
+
+def _is_formula(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith("=")
+
+
+def _formula_gaps(values: list[tuple[str, list[list[Any]]]],
+                  formulas: list[tuple[str, list[list[Any]]]]) -> bool:
+    """Whether some formula cell has no cached value."""
+    for (_, rows), (_, backup) in zip(values, formulas):
+        for row, brow in zip(rows, backup):
+            for cell, formula in zip(row, brow):
+                if cell == "" and _is_formula(formula):
+                    return True
+    return False
+
+
+def _trim(rows: list[list[Any]]) -> list[list[Any]]:
+    while rows and not any(str(cell).strip() for cell in rows[-1]):
+        rows.pop()
+    return rows
+
+
+def _cell_text(value: Any) -> Any:
+    """A cell as Excel itself would export it to CSV.
+
+    Booleans are TRUE and FALSE, not Python's True and False, and a date with
+    no time of day is just the date, not ``2026-01-05 00:00:00``.
+    """
+    import datetime as dt
+
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, dt.datetime):
+        if value.time() == dt.time(0, 0):
+            return value.date().isoformat()
+        return value.isoformat(sep=" ")
+    if isinstance(value, (dt.date, dt.time)):
+        return value.isoformat()
+    if not isinstance(value, (str, int, float)):
+        text = getattr(value, "text", None)  # an openpyxl ArrayFormula
+        return text if isinstance(text, str) else str(value)
+    return value
 
 
 def _sheet_rows(path: Path, *, data_only: bool) -> list[tuple[str, list[list[Any]]]]:
@@ -926,16 +1352,11 @@ def _sheet_rows(path: Path, *, data_only: bool) -> list[tuple[str, list[list[Any
 
     book = load_workbook(_abs(path), read_only=True, data_only=data_only)
     try:
-        sheets = []
-        for sheet in book.worksheets:
-            rows = [
-                ["" if cell is None else cell for cell in row]
-                for row in sheet.iter_rows(values_only=True)
-            ]
-            while rows and not any(str(cell).strip() for cell in rows[-1]):
-                rows.pop()
-            sheets.append((sheet.title, rows))
-        return sheets
+        return [
+            (sheet.title, [[_cell_text(cell) for cell in row]
+                           for row in sheet.iter_rows(values_only=True)])
+            for sheet in book.worksheets
+        ]
     finally:
         book.close()
 
@@ -975,6 +1396,9 @@ class Cue:
 _TIMECODE = re.compile(r"(?:(\d+):)?(\d{1,3}):(\d{2})(?:[.,](\d{1,3}))?\s*$")
 #: Blocks a VTT may carry that are not cues.
 _VTT_BLOCKS = ("NOTE", "STYLE", "REGION")
+#: WebVTT markup SRT players do not know: voice spans, classes (colours),
+#: language spans, ruby and karaoke timestamps. SRT keeps b, i, u and font.
+_VTT_ONLY_TAGS = re.compile(r"</?(?:v|c|lang|ruby|rt)(?:[.\s][^>]*)?>|<\d+:[\d:.]+>")
 #: Inline markup to drop from plain text output.
 _TAGS = re.compile(r"</?[a-zA-Z][^>]*>|\{\\[^}]*\}")
 
@@ -1029,12 +1453,24 @@ def read_cues(source: Path) -> list[Cue]:
         end = parse_timecode(right.strip().split(" ")[0] if right.strip() else "")
         body: list[str] = []
         while index < len(lines) and lines[index].strip():
+            if _is_timing(lines[index]):
+                # The blank line before the next cue is missing. Stop here, and
+                # give back an SRT index number that belongs to the next cue.
+                if body and body[-1].strip().isdigit():
+                    body.pop()
+                break
             body.append(lines[index].rstrip())
             index += 1
         if start is None or end is None:
             continue
         cues.append(Cue(start, max(start, end), "\n".join(body).strip()))
     return cues
+
+
+def _is_timing(line: str) -> bool:
+    """Whether a line is a cue timing line (``start --> end``)."""
+    left, arrow, _ = line.partition("-->")
+    return bool(arrow) and parse_timecode(left) is not None
 
 
 def parse_timecode(text: str) -> float | None:
@@ -1062,7 +1498,7 @@ def format_timecode(seconds: float, decimal: str) -> str:
 def write_srt(cues: Sequence[Cue]) -> str:
     blocks = [
         f"{number}\n{format_timecode(cue.start, ',')} --> "
-        f"{format_timecode(cue.end, ',')}\n{cue.text}\n"
+        f"{format_timecode(cue.end, ',')}\n{_VTT_ONLY_TAGS.sub('', cue.text)}\n"
         for number, cue in enumerate(cues, start=1)
     ]
     return "\n".join(blocks)
