@@ -1,0 +1,57 @@
+<editors:EditorWindowBase x:Class="Peel.Editors.Image.AnnotateEditor"
+                          x:ClassModifier="internal"
+                          xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                          xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                          xmlns:editors="clr-namespace:Peel.Editors"
+                          Title="Annotate"
+                          Background="{DynamicResource EditorBack}"
+                          SizeToContent="WidthAndHeight"
+                          ResizeMode="NoResize"
+                          FontFamily="Segoe UI">
+    <Window.Resources>
+        <ResourceDictionary Source="/Peel;component/Editors/EditorStyles.xaml" />
+    </Window.Resources>
+    <StackPanel Margin="14">
+        <DockPanel Margin="0,0,0,10">
+            <TextBlock Style="{StaticResource EditorTitle}" Text="Annotate" DockPanel.Dock="Left" />
+            <TextBlock x:Name="Subject" Style="{StaticResource EditorText}" Margin="10,0,0,0"
+                       TextTrimming="CharacterEllipsis" />
+        </DockPanel>
+
+        <WrapPanel x:Name="ToolPanel" Margin="0,0,0,8" />
+
+        <Border Background="{StaticResource EditorCanvas}" BorderBrush="{StaticResource EditorEdge}"
+                BorderThickness="1" HorizontalAlignment="Center">
+            <Grid x:Name="Stage" ClipToBounds="True">
+                <Image x:Name="Picture" Stretch="Fill" />
+                <Canvas x:Name="Overlay" Background="Transparent"
+                        AutomationProperties.AutomationId="AnnotateCanvas"
+                        AutomationProperties.Name="Drawing area" />
+            </Grid>
+        </Border>
+
+        <WrapPanel Margin="0,8,0,0">
+            <TextBlock Style="{StaticResource EditorLabel}" Text="Words" />
+            <TextBox x:Name="Caption" Style="{StaticResource EditorField}" MinWidth="200" Margin="0,0,10,0"
+                     AutomationProperties.AutomationId="AnnotateText" AutomationProperties.Name="Words" />
+            <TextBlock Style="{StaticResource EditorLabel}" Text="Size" />
+            <TextBox x:Name="WordSize" Style="{StaticResource EditorField}" MinWidth="52" Margin="0,0,10,0"
+                     AutomationProperties.AutomationId="AnnotateSize" AutomationProperties.Name="Size" />
+            <Button Style="{StaticResource EditorButton}" Content="Undo"
+                    AutomationProperties.AutomationId="AnnotateUndo" Click="OnUndo" />
+            <Button Style="{StaticResource EditorButton}" Content="Clear"
+                    AutomationProperties.AutomationId="AnnotateClear" Click="OnClear" />
+        </WrapPanel>
+
+        <DockPanel Margin="0,12,0,0">
+            <TextBlock x:Name="Hint" Style="{StaticResource EditorText}" DockPanel.Dock="Left"
+                       AutomationProperties.AutomationId="AnnotateHint" />
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" DockPanel.Dock="Right">
+                <Button Style="{StaticResource EditorButton}" Content="Cancel"
+                        AutomationProperties.AutomationId="AnnotateCancel" Click="OnCancel" />
+                <Button Style="{StaticResource EditorPrimary}" Content="Draw"
+                        AutomationProperties.AutomationId="AnnotateApply" Click="OnApply" />
+            </StackPanel>
+        </DockPanel>
+    </StackPanel>
+</editors:EditorWindowBase>
