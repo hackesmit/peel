@@ -5,7 +5,9 @@
 // Nothing is ever overwritten: a name already taken in the destination grows a
 // " 2", " 3", ... suffix, the same rule the engine uses for its outputs, so a
 // move never silently replaces a file. A folder move to another volume, which
-// cannot be one rename, falls back to a copy then a delete. Which volume a
+// cannot be one rename, falls back to CrossVolumeMove: copy from a manifest,
+// verify, then delete only the source files that still match, never a
+// recursive delete; anything left behind is reported by name. Which volume a
 // folder is on, and whether a destination is inside the moved folder, are
 // decided from physical file identities (FileIdentity), never path strings.
 using System;
@@ -15,7 +17,17 @@ using Peel.Jobs;
 
 namespace Peel.Actions;
 
-internal readonly record struct MoveOutcome(int Moved, IReadOnlyList<string> Destinations, IReadOnlyList<string> Failures);
+/// <summary>What a Move did. <paramref name="Partials"/> names the items whose
+/// copy is complete but some source entries stayed behind (new, changed or not
+/// removable); they count as moved, since nothing is missing at the destination.</summary>
+internal readonly record struct MoveOutcome(
+    int Moved, IReadOnlyList<string> Destinations, IReadOnlyList<string> Failures, IReadOnlyList<string> Partials)
+{
+    internal MoveOutcome(int moved, IReadOnlyList<string> destinations, IReadOnlyList<string> failures)
+        : this(moved, destinations, failures, Array.Empty<string>())
+    {
+    }
+}
 
 internal static class MoveAction
 {
@@ -51,8 +63,16 @@ internal static class MoveAction
     private static bool TakenOnDisk(string path) => File.Exists(path) || Directory.Exists(path);
 
     /// <summary>Move one file or folder into the destination, never overwriting.</summary>
-    internal static string MoveInto(string source, string destDir)
+    internal static string MoveInto(string source, string destDir) => MoveInto(source, destDir, out _);
+
+    /// <summary>
+    /// Move one file or folder into the destination, never overwriting.
+    /// <paramref name="remaining"/> lists the source entries a cross-volume
+    /// folder move left in place (relative to the source), empty otherwise.
+    /// </summary>
+    internal static string MoveInto(string source, string destDir, out IReadOnlyList<string> remaining)
     {
+        remaining = Array.Empty<string>();
         var name = Path.GetFileName(source.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
         var target = UniqueDestination(destDir, name, TakenOnDisk);
         if (Directory.Exists(source))
@@ -76,10 +96,11 @@ internal static class MoveAction
             // destructive copy. A different serial (another drive, a volume
             // mounted in a folder, a network share) goes straight to the copy.
             var sameVolume = FileIdentity.Of(source).VolumeSerial == FileIdentity.Of(destDir).VolumeSerial;
+            // CrossVolumeMove refuses before touching anything when the copy
+            // could not be faithful (a link, a folder's alternate data stream).
             if (!sameVolume || !FileIdentity.TryRename(source, target))
             {
-                CopyTree(source, target);
-                Directory.Delete(source, recursive: true);
+                remaining = CrossVolumeMove.Move(source, target).Remaining;
             }
         }
         else
@@ -89,50 +110,24 @@ internal static class MoveAction
         return target;
     }
 
-    /// <summary>Copy a folder tree to a new place. Refuses a tree that holds a
-    /// junction or symbolic link before copying anything: copying would turn
-    /// the link into a plain empty folder, so the moved tree would silently
-    /// differ from the original.</summary>
-    internal static void CopyTree(string source, string target)
-    {
-        var entries = new DirectoryInfo(source).GetFileSystemInfos("*", SearchOption.AllDirectories);
-        foreach (var entry in entries)
-        {
-            if (entry.Attributes.HasFlag(FileAttributes.ReparsePoint))
-            {
-                throw new IOException($"\"{Path.GetFileName(source)}\" contains a link ({entry.Name}); move it in Explorer instead");
-            }
-        }
-        if (Directory.Exists(target) || File.Exists(target))
-        {
-            throw new IOException($"\"{target}\" already exists");
-        }
-        Directory.CreateDirectory(target);
-        foreach (var entry in entries)
-        {
-            var copy = Path.Combine(target, Path.GetRelativePath(source, entry.FullName));
-            if (entry is DirectoryInfo)
-            {
-                Directory.CreateDirectory(copy);
-            }
-            else
-            {
-                Directory.CreateDirectory(Path.GetDirectoryName(copy)!);
-                File.Copy(entry.FullName, copy, overwrite: false);
-            }
-        }
-    }
-
     /// <summary>Move every dropped item into one folder and record it as recent.</summary>
     internal static MoveOutcome MoveAll(IReadOnlyList<string> files, string destDir)
     {
         var destinations = new List<string>();
         var failures = new List<string>();
+        var partials = new List<string>();
         foreach (var source in files)
         {
             try
             {
-                destinations.Add(MoveInto(source, destDir));
+                destinations.Add(MoveInto(source, destDir, out var remaining));
+                if (remaining.Count > 0)
+                {
+                    var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(source));
+                    partials.Add(remaining.Count == 1 && remaining[0] == "."
+                        ? $"{name}: copied, but an empty folder stayed in the source"
+                        : $"{name}: copied, but {remaining.Count} item(s) stayed in the source because they are new, changed or in use: {CrossVolumeMove.Describe(remaining)}");
+                }
             }
             catch (Exception error)
             {
@@ -144,7 +139,7 @@ internal static class MoveAction
         {
             RecentFolders.Remember(destDir);
         }
-        return new MoveOutcome(destinations.Count, destinations, failures);
+        return new MoveOutcome(destinations.Count, destinations, failures, partials);
     }
 
     /// <summary>
@@ -170,10 +165,14 @@ internal static class MoveAction
                 {
                     var outcome = MoveAll(files, destination);
                     var where = Path.GetFileName(destination.TrimEnd(Path.DirectorySeparatorChar));
-                    if (outcome.Failures.Count == 0)
+                    if (outcome.Failures.Count == 0 && outcome.Partials.Count == 0)
                     {
                         var noun = outcome.Moved == 1 ? "item" : "items";
                         message = $"Moved {outcome.Moved} {noun} to {where}.";
+                    }
+                    else if (outcome.Failures.Count == 0)
+                    {
+                        message = $"Partly moved to {where}. {outcome.Partials[0]}";
                     }
                     else
                     {
@@ -189,10 +188,10 @@ internal static class MoveAction
             });
         }
 
-        foreach (var folder in RecentFolders.Load())
+        foreach (var folder in RecentFolders.LoadExisting())
         {
             var captured = folder;
-            var item = menu.Items.Add(folder);
+            var item = menu.Items.Add(RecentFolders.MenuText(folder));
             item.Click += (_, _) => MoveTo(captured);
         }
         if (menu.Items.Count > 0)

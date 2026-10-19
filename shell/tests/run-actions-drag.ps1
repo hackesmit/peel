@@ -17,12 +17,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-# The output folder carries the Windows SDK version (net8.0-windows10.0.x since
-# the Share action's WinRT need). Pick the most recently built Peel.exe so a
-# stale net8.0-windows folder from an earlier TFM never shadows the real build.
-$app = Get-ChildItem -Path (Join-Path $Root 'shell\Peel\bin\Release') -Filter 'net8.0-windows*' -Directory |
-    ForEach-Object { Join-Path $_.FullName 'Peel.exe' } | Where-Object { Test-Path $_ } |
-    Sort-Object { (Get-Item $_).LastWriteTime } -Descending | Select-Object -First 1
+# Pick the newest build by target framework version (e2e-hygiene.ps1), never
+# the first folder alphabetically: a dev copy that still holds an old
+# net8.0-windows build would otherwise launch that stale exe silently.
+. (Join-Path $PSScriptRoot 'e2e-hygiene.ps1')
+$app = Find-PeelApp $Root
 if (-not $app) { throw "build the shell first (dotnet build -c Release): no Peel.exe under shell\Peel\bin\Release\net8.0-windows*" }
 
 $script = Join-Path $Root 'shell\tests\e2e-actions-drag.ps1'

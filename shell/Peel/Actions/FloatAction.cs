@@ -32,10 +32,18 @@ internal static class FloatAction
     internal static bool IsImage(string path) =>
         !Directory.Exists(path) && ImageExtensions.Contains(Path.GetExtension(path));
 
+    /// <summary>The most windows one drop opens. A big selection would
+    /// otherwise cover the screen (and run far off it) with topmost windows.</summary>
+    internal const int MaxWindows = 20;
+
+    /// <summary>How many of <paramref name="count"/> dropped items get a window.</summary>
+    internal static int WindowsFor(int count) => Math.Min(count, MaxWindows);
+
     internal static void Run(IReadOnlyList<string> files, JobRunner jobs)
     {
         var opened = 0;
-        for (var i = 0; i < files.Count; i++)
+        var shown = WindowsFor(files.Count);
+        for (var i = 0; i < shown; i++)
         {
             try
             {
@@ -48,7 +56,11 @@ internal static class FloatAction
             }
         }
         Log.Write($"float: opened {opened} of {files.Count} window(s)");
-        if (opened < files.Count)
+        if (shown < files.Count)
+        {
+            jobs.Report($"Floated the first {opened} of {files.Count}; Float shows at most {MaxWindows} at a time.");
+        }
+        else if (opened < files.Count)
         {
             jobs.Report($"Floated {opened} of {files.Count}; the rest could not be shown.");
         }

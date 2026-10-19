@@ -10,6 +10,7 @@ six read as one set on the wheel.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -108,3 +109,43 @@ def test_a_shell_action_accepts_a_mixed_selection_of_many(make_file, tmp_path, r
     entries = alt_entries(real.options(paths))
     for action_id in SHELL_ACTIONS:
         assert action_id in entries
+
+
+def _copy_path_lines(real, paths) -> list[str]:
+    result = real.run(COPY_PATH, paths)
+    assert result.ok
+    assert result.outputs == []
+    text = result.data["clipboard_text"]
+    # CRLF, the Windows clipboard convention, and no bare LF anywhere.
+    assert "\n" not in text.replace("\r\n", "")
+    return text.split("\r\n")
+
+
+def test_copy_path_quotes_a_file_a_folder_and_a_mix(make_file, tmp_path, real):
+    spaced = make_file("my file.txt", "x")
+    folder = tmp_path / "an album"
+    folder.mkdir()
+    q = lambda p: '"' + os.path.abspath(p) + '"'  # noqa: E731
+    assert _copy_path_lines(real, [spaced]) == [q(spaced)]
+    assert _copy_path_lines(real, [folder]) == [q(folder)]
+    assert _copy_path_lines(real, [spaced, folder]) == [q(spaced), q(folder)]
+
+
+def test_copy_path_joins_many_paths_with_crlf_and_no_trailing_newline(make_file, real):
+    files = [make_file(f"f {n}.bin", "x") for n in range(4)]
+    text = real.run(COPY_PATH, files).data["clipboard_text"]
+    assert text.count("\r\n") == 3
+    assert not text.endswith("\r\n")
+    for line in text.split("\r\n"):
+        assert line.startswith('"') and line.endswith('"') and line.count('"') == 2
+
+
+def test_copy_path_keeps_the_path_as_given_not_its_symlink_target(tmp_path, real):
+    target = tmp_path / "real"
+    target.mkdir()
+    link = tmp_path / "alias"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks not permitted here")
+    assert _copy_path_lines(real, [link]) == ['"' + os.path.abspath(link) + '"']

@@ -34,11 +34,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-# The output folder carries the target framework, which gained a Windows SDK
-# version when the Share action landed (net8.0-windows -> net8.0-windows10.0.x),
-# so match the folder rather than naming one version.
-$app = Get-ChildItem -Path (Join-Path $Root 'shell\Peel\bin\Release') -Filter 'net8.0-windows*' -Directory |
-    ForEach-Object { Join-Path $_.FullName 'Peel.exe' } | Where-Object { Test-Path $_ } | Select-Object -First 1
+# Pick the newest build by target framework version (e2e-hygiene.ps1), never
+# the first folder alphabetically: a dev copy that still holds an old
+# net8.0-windows build would otherwise launch that stale exe silently.
+. (Join-Path $PSScriptRoot 'e2e-hygiene.ps1')
+$app = Find-PeelApp $Root
 if (-not $app) { throw "build the shell first (dotnet build -c Release): no Peel.exe under shell\Peel\bin\Release\net8.0-windows*" }
 
 if ($Test -eq 'drag') {

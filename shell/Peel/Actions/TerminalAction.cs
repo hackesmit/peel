@@ -3,10 +3,17 @@
 //
 // The folder is the dropped folder itself, or the parent of a dropped file. A
 // mixed selection opens one terminal, at the first item's folder, the same way
-// Tangerine opens one Finder window. Arguments go through ProcessStartInfo's
-// ArgumentList, never a command string, so a folder named with a quote or an
-// ampersand can never be parsed as part of a command (the same reason the
-// engine is never started through the .cmd shim).
+// Tangerine opens one Finder window.
+//
+// The folder never appears in any command line. Windows Terminal has its own
+// command grammar on top of argv: a ';' in any argument starts a new
+// subcommand, so passing "-d <folder>" would let a folder named
+// "x; new-tab powershell -Command calc" start a second command (lucy round 1).
+// Argv quoting does not switch that parser off. So wt.exe always gets the fixed
+// arguments "-d ." and the folder is handed over only as the new process's
+// working directory (ProcessStartInfo.WorkingDirectory, the lpCurrentDirectory
+// of CreateProcess), which no parser reads. The PowerShell fallback does the
+// same with a constant command text.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -29,12 +36,22 @@ internal static class TerminalAction
         return string.IsNullOrEmpty(parent) ? first : parent;
     }
 
-    /// <summary>Windows Terminal opened at the folder.</summary>
+    /// <summary>The only arguments wt.exe is ever given. "." is the working directory.</summary>
+    internal static readonly IReadOnlyList<string> PrimaryArguments = new[] { "-d", "." };
+
+    /// <summary>Windows Terminal opened at the folder, through its working directory only.</summary>
     internal static ProcessStartInfo Primary(string folder)
     {
-        var info = new ProcessStartInfo { FileName = "wt.exe", UseShellExecute = false };
-        info.ArgumentList.Add("-d");
-        info.ArgumentList.Add(folder);
+        var info = new ProcessStartInfo
+        {
+            FileName = "wt.exe",
+            UseShellExecute = false,
+            WorkingDirectory = folder,
+        };
+        foreach (var arg in PrimaryArguments)
+        {
+            info.ArgumentList.Add(arg);
+        }
         return info;
     }
 
@@ -50,6 +67,7 @@ internal static class TerminalAction
         info.ArgumentList.Add("-NoExit");
         info.ArgumentList.Add("-NoProfile");
         info.ArgumentList.Add("-Command");
+        // Constant text: the folder arrives only as the working directory.
         info.ArgumentList.Add("Set-Location -LiteralPath $PWD");
         return info;
     }
