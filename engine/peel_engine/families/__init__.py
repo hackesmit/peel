@@ -51,7 +51,7 @@ def discover(registry: "Registry", *, strict: bool = False) -> "Registry":
             if register is None:
                 raise RuntimeError(f"family module {dotted} has no register(registry)")
             register(registry)
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             if strict:
                 raise
             registry.restore(snapshot)

@@ -338,6 +338,8 @@ class Job:
     _reserved: list[Path] = field(default_factory=list, repr=False)
     #: Paths this job claimed on disk, for cleanup after a failed run.
     _claimed: list[Path] = field(default_factory=list, repr=False)
+    #: Scratch folders from scratch_dir(), removed after the run.
+    _scratch: list[Path] = field(default_factory=list, repr=False)
 
     @property
     def source(self) -> Path:
@@ -377,6 +379,19 @@ class Job:
         self._remember(path)
         return path
 
+    def scratch_dir(self, near: Path) -> Path:
+        """A fresh temporary folder beside ``near`` (normally a claimed output).
+
+        Tools that cannot write straight onto the claim (soffice, pandoc) work
+        here, then ``os.replace`` their result onto the claim. Being on the same
+        drive keeps that replace atomic. The folder is removed after the run.
+        """
+        import tempfile
+
+        folder = Path(tempfile.mkdtemp(prefix=".peel-", dir=Path(near).parent))
+        self._scratch.append(folder)
+        return folder
+
     def reserve(self, path: Path, *, directory: bool = False) -> Path:
         """Claim a path the runner built itself (or the next free variant)."""
         unique = naming.unique_path(Path(path), reserved=self._reserved, directory=directory)
@@ -395,6 +410,11 @@ class Job:
         exclusive create means nobody else can have written them. A claimed
         folder is only removed while empty.
         """
+        import shutil
+
+        for folder in self._scratch:
+            shutil.rmtree(folder, ignore_errors=True)
+        self._scratch.clear()
         kept = {naming.path_key(p) for p in keep}
         for path in self._claimed:
             if naming.path_key(path) in kept:
