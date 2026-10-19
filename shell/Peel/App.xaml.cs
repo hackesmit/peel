@@ -14,6 +14,7 @@ using Peel.Editors;
 using Peel.Engine;
 using Peel.Hooks;
 using Peel.Jobs;
+using Peel.Keyboard;
 using Peel.Wheel;
 
 namespace Peel;
@@ -25,6 +26,9 @@ public partial class App : Application
     private DragWatcher? _watcher;
     private WheelWindow? _wheel;
     private WheelController? _controller;
+    private KeyboardWheelWindow? _keyboardWheel;
+    private KeyboardController? _keyboard;
+    private HotkeyListener? _hotkey;
     private ToastHost? _toasts;
     private Tray? _tray;
     private EngineClient? _engine;
@@ -92,6 +96,22 @@ public partial class App : Application
         _hooks.Start();
         _watcher = new DragWatcher(_hooks, Dispatcher);
         _controller.Attach(_watcher);
+
+        // The keyboard path: a global hotkey opens the same wheel over the
+        // Explorer selection, with no drag (Peel/Keyboard). It shares the
+        // engine and the job runner, so its jobs read exactly like a drag's.
+        _keyboardWheel = new KeyboardWheelWindow();
+        _keyboard = new KeyboardController(_engine, _keyboardWheel, jobs, editors, Dispatcher);
+        _hotkey = new HotkeyListener();
+        if (_hotkey.Register())
+        {
+            _keyboard.Attach(_hotkey);
+        }
+        else if (!_hotkey.DisabledByEnvironment)
+        {
+            Log.Write("hotkey conflict toast shown");
+            jobs.Report(HotkeyListener.ConflictMessage);
+        }
 
         _tray = new Tray(jobs, Status, Quit);
 
@@ -172,6 +192,7 @@ public partial class App : Application
         try
         {
             _wheel?.HideNow("fault");
+            _keyboardWheel?.HideNow("fault");
         }
         catch (Exception error)
         {
@@ -215,6 +236,7 @@ public partial class App : Application
         _engine?.KillAll();
         ReportHooks();
         _hookReport?.Stop();
+        _hotkey?.Dispose();
         _watcher?.Dispose();
         _hooks?.Dispose();
         _tray?.Dispose();

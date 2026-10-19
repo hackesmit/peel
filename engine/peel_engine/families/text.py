@@ -1,32 +1,24 @@
-"""Plain text family: the smallest real family, and the proof of the plugin path.
+"""Files family: the Alt wheel action that needs no backend at all.
 
-It needs no backend, so it works on a bare machine and on CI. The two entries
-exercise both halves of the mechanism end to end: a conversion that writes a
-file next to the source, and an Alt wheel action that writes nothing and
-accepts anything, folders included.
+It is the smallest real family and the proof of the plugin path: an action that
+writes nothing, accepts anything including folders, and is resolved through the
+same dotted ``module:function`` runner path as everything else. Because it has
+no backend it still works on a bare machine and on CI.
 
-When the documents family lands (bead hq-plct.4) it owns TXT conversions and
-must drop ``text.to_md``. The registry refuses two segments with the same label
-in the same wheel group, so that clash fails loudly at discovery rather than
-showing twice on the wheel.
+It used to also hold ``text.to_md`` (TXT to Markdown) as the conversion half of
+that proof. The documents family (docs.py, bead hq-plct.4) owns every TXT
+conversion now, so that entry is gone: the registry's duplicate wheel segment
+guard refused convert/Documents/MD twice the moment docs.py landed, which is
+exactly the handover signal it was put there to give.
 """
 
 from __future__ import annotations
 
-from ..registry import ACTION, ANY, CONVERT, Job, Registry
+from ..registry import ACTION, ANY, Job, Registry
 from ..result import Result, ok
 
 
 def register(registry: Registry) -> None:
-    registry.add(
-        id="text.to_md",
-        family=CONVERT,
-        label="MD",
-        group="Documents",
-        inputs=("txt",),
-        output_ext="md",
-        runner="peel_engine.families.text:to_md",
-    )
     registry.add(
         id="files.copy_path",
         family=ACTION,
@@ -37,14 +29,6 @@ def register(registry: Registry) -> None:
         mode="combine",
         runner="peel_engine.families.text:copy_path",
     )
-
-
-def to_md(job: Job) -> Result:
-    """Copy a text file to Markdown. Plain text is already valid Markdown."""
-    source = job.source
-    target = job.output_path()
-    target.write_bytes(source.read_bytes())
-    return ok([target], f"Wrote {target.name}")
 
 
 def copy_path(job: Job) -> Result:
