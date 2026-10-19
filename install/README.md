@@ -37,7 +37,8 @@ without a prompt.
 | 7-Zip | `7zip.7zip` | archives |
 | .NET 8 SDK | `Microsoft.DotNet.SDK.8` | builds the WPF shell (shell bead) |
 
-Python module backends (`pillow`, `pillow-heif`, `pymupdf`, `pdf2docx`) and
+Python module backends (`pillow`, `pillow-heif`, `pymupdf` 1.26.x, `pdf2docx`,
+`openpyxl`, `python-pptx`, `python-docx`, all pinned in setup.ps1) and
 `pytest` are installed into the venv with pip, not winget.
 
 libvips ships as a winget portable package. winget normally exposes `vips` via
