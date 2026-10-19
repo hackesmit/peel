@@ -1,0 +1,643 @@
+{
+  "ok": true,
+  "files": [],
+  "wheels": [
+    {
+      "family": "convert",
+      "label": "Conversions",
+      "default_modifier": "Shift",
+      "groups": [
+        {
+          "group": "Documents",
+          "entries": [
+            {
+              "id": "fake.convert.pdf",
+              "family": "convert",
+              "label": "PDF",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "pdf",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.convert.docx",
+              "family": "convert",
+              "label": "DOCX",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "docx",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.convert.html",
+              "family": "convert",
+              "label": "HTML",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "html",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.convert.epub",
+              "family": "convert",
+              "label": "EPUB",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "epub",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.convert.md",
+              "family": "convert",
+              "label": "MD",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "md",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.convert.rtf",
+              "family": "convert",
+              "label": "RTF",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "rtf",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.convert.odt",
+              "family": "convert",
+              "label": "ODT",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "odt",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.convert.xlsx",
+              "family": "convert",
+              "label": "XLSX",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "xlsx",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.convert.csv",
+              "family": "convert",
+              "label": "CSV",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "csv",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "family": "tool",
+      "label": "File tools",
+      "default_modifier": "Ctrl",
+      "groups": [
+        {
+          "group": "Documents",
+          "entries": [
+            {
+              "id": "fake.tool.compress",
+              "family": "tool",
+              "label": "Compress",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "compress",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.tool.crop",
+              "family": "tool",
+              "label": "Crop",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "crop",
+              "mode": "each",
+              "needs_editor": true,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.tool.trim",
+              "family": "tool",
+              "label": "Trim",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "trim",
+              "mode": "each",
+              "needs_editor": true,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.tool.split",
+              "family": "tool",
+              "label": "Split",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "split",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.tool.join",
+              "family": "tool",
+              "label": "Join",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "join",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.tool.speed",
+              "family": "tool",
+              "label": "Speed",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "speed",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.tool.normalize",
+              "family": "tool",
+              "label": "Normalize",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "normalize",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.tool.bleep",
+              "family": "tool",
+              "label": "Bleep",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "bleep",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.tool.redact",
+              "family": "tool",
+              "label": "Redact",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "redact",
+              "mode": "each",
+              "needs_editor": true,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.tool.annotate",
+              "family": "tool",
+              "label": "Annotate",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "annotate",
+              "mode": "each",
+              "needs_editor": true,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.tool.metadata",
+              "family": "tool",
+              "label": "Metadata",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "metadata",
+              "mode": "each",
+              "needs_editor": true,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.tool.extract_text",
+              "family": "tool",
+              "label": "Extract text",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "extract text",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.tool.organize_pages",
+              "family": "tool",
+              "label": "Organize pages",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "organize pages",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.tool.rotate",
+              "family": "tool",
+              "label": "Rotate",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "rotate",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.tool.watermark",
+              "family": "tool",
+              "label": "Watermark",
+              "group": "Documents",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "watermark",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "family": "action",
+      "label": "File actions",
+      "default_modifier": "Alt",
+      "groups": [
+        {
+          "group": "Files",
+          "entries": [
+            {
+              "id": "fake.action.share",
+              "family": "action",
+              "label": "Share",
+              "group": "Files",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "share",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "shell",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.action.float",
+              "family": "action",
+              "label": "Float",
+              "group": "Files",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "float",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "shell",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.action.copy",
+              "family": "action",
+              "label": "Copy",
+              "group": "Files",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "copy",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.action.move",
+              "family": "action",
+              "label": "Move",
+              "group": "Files",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "move",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.action.copy_path",
+              "family": "action",
+              "label": "Copy Path",
+              "group": "Files",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "copy path",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "engine",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            },
+            {
+              "id": "fake.action.terminal",
+              "family": "action",
+              "label": "Terminal",
+              "group": "Files",
+              "inputs": [
+                "txt"
+              ],
+              "output_ext": "terminal",
+              "mode": "each",
+              "needs_editor": false,
+              "min_files": 1,
+              "max_files": null,
+              "accepts_dirs": false,
+              "handled_by": "shell",
+              "params": [],
+              "backends": [],
+              "missing_backends": [],
+              "available": true
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "warnings": []
+}
