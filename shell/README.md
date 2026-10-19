@@ -96,9 +96,61 @@ ssh george "powershell -NoProfile -ExecutionPolicy Bypass -File C:\peel-dev\<bra
   wheel, a wheel with more entries than fit, and the page it turns to. A
   developer machine may hold a single conversion, which proves nothing about a
   full ring.
+- `-Test editors` opens each image editor from the tools wheel with a real
+  drag, drives it with UI Automation, applies, and checks the output pixel by
+  pixel or tag by tag, with one screenshot per editor. Pass `-Engine
+  <peel.exe>` when the installed engine is older than the branch (its registry
+  decides what the tools wheel offers, so a stale install leaves it empty).
 
-Both leave their evidence in `C:\peel-dev\e2e` and `C:\peel-dev\e2e-render`:
-`result.json`, `drive.log`, Peel's own `peel.log` and the screenshots.
+They leave their evidence in `C:\peel-dev\e2e`, `C:\peel-dev\e2e-render` and
+`C:\peel-dev\e2e-editors`: `result.json`, `drive.log`, Peel's own `peel.log`
+and the screenshots.
+
+## The editor windows
+
+`Editors/` holds the windows that collect parameters for an entry the registry
+marks `needs_editor`. Five are built, all for images: Crop, Edit, Annotate,
+Redact and Metadata (`Editors/Image/`).
+
+Four things in there are load bearing.
+
+- **The editor is opened after the drop, never during it.**
+  `IEditorHost.TryCollectParams` runs inside OLE's drop callback, with the
+  dragging application's drag loop waiting on the return, so a window shown
+  there freezes Explorer until the user is done with it. `EditorHost` queues
+  the window on the dispatcher, returns false so the wheel starts no job, and
+  starts the job itself when the user applies. False is "not now", not
+  "failed".
+- **The schema comes from the engine.** Slider ranges, enum choices, defaults
+  and field labels are read from the entry's own `params` (`ParamSchema`), so
+  the registry stays the one statement of what an action takes. Only what the
+  user actually changed is sent, so the engine's defaults stay the definition
+  of neutral.
+- **A click becomes an image pixel in one place.** `PreviewMap` does that
+  arithmetic and the windows never do it themselves, because a preview is
+  fitted, letterboxed and then scaled again by the monitor's DPI, and a crop
+  box that is wrong by a factor does not look wrong enough to notice.
+- **A rotated or exotic photo is rasterised by the engine.** `image.load`
+  opens every image upright (it applies and drops the EXIF Orientation tag)
+  and its docstring promises that a crop box refers to what the editor showed.
+  WPF does not apply the tag and has no codec for HEIC or AVIF, so
+  `PreviewSource` sends any file whose Orientation is not 1, or that WPF
+  refuses, through `peel run image.to_png --out-dir <temp>`: the preview is
+  then what the engine sees, by construction.
+
+The Edit window's live preview is pillow's `ImageEnhance` pixel for pixel
+(`Editors/Image/Adjust.cs`), in the engine's order, because a preview that is
+only roughly the result is worse than none: the user sets a slider by eye and
+the file gets something else.
+
+**Peel.csproj does not set `InvariantGlobalization`, and must not.** WPF asks
+for culture 1033 behind the user's back and gets `CultureNotFoundException` in
+invariant mode: giving a `TextBox` the keyboard focus does it, and so does any
+`{Binding}`. A `FontFamily` looked up by name throws a
+`TypeInitializationException` from `MS.Internal.FontCache.MajorLanguages`
+instead. The app's own handler catches all three, so the symptom is a window
+that is subtly wrong and a line in the log rather than a crash, which is why
+the csproj carries a comment and not a setting.
 
 ## Logging
 
@@ -116,9 +168,9 @@ cannot leave a tray app behind.
   hq-plct.8.
 - The six Alt wheel actions. Entries marked `handled_by: shell` say so in a
   toast instead of running: bead hq-plct.9.
-- The editor windows for entries with `needs_editor`. `Jobs/IEditorHost.cs` is
-  the seam they plug into; the stand in says the editor is not built: bead
-  hq-plct.10.
+- The editor windows for video, audio and PDF entries with `needs_editor`
+  (trim, split, bleep, organize pages): bead hq-plct.11. `Editors/EditorHost.cs`
+  knows which entries it has a window for and says so in a toast for the rest.
 - Settings, including remapping the modifiers. The wheel to modifier mapping is
   already data (the engine's `default_modifier`), so this is a settings file and
   a window, not a change to the wheel.

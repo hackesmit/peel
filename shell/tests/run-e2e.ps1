@@ -30,7 +30,10 @@ param(
     [string]$Source = 'sample.txt',
     [string]$Segment = 'MD',
     [string]$Expect = 'sample.md',
-    [int]$TimeoutSeconds = 900
+    [int]$TimeoutSeconds = 900,
+    # editors only: the peel.exe to test against, when the installed engine is
+    # older than the branch. The python beside it runs the pixel checks.
+    [string]$Engine = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,6 +50,7 @@ elseif ($Test -eq 'editors') {
     $dir = 'C:\peel-dev\e2e-editors'
     $check = Join-Path $Root 'shell\tests\e2e-editors-check.py'
     $arguments = '-Dir "{0}" -App "{1}" -Check "{2}"' -f $dir, $app, $check
+    if ($Engine) { $arguments += ' -Peel "{0}"' -f $Engine }
 }
 else {
     $script = Join-Path $Root 'shell\tests\e2e-wheel-render.ps1'

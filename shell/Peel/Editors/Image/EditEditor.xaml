@@ -47,7 +47,7 @@
             <StackPanel Orientation="Horizontal" DockPanel.Dock="Left">
                 <Button x:Name="ResetButton" Style="{StaticResource EditorButton}" Content="Reset"
                         AutomationProperties.AutomationId="EditReset" Click="OnReset" />
-                <TextBlock x:Name="Hint" Style="{StaticResource EditorText}"
+                <TextBlock x:Name="Hint" Style="{StaticResource EditorText}" Margin="6,0,0,0"
                            AutomationProperties.AutomationId="EditHint"
                            Text="Enter saves, Escape cancels." />
             </StackPanel>

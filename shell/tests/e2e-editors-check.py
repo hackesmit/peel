@@ -57,6 +57,18 @@ def make(folder: Path) -> dict:
     Image.new("RGB", (400, 300), FLAT).save(folder / "light.png")
     written["light.png"] = "400x300 flat %d,%d,%d" % FLAT
 
+    # A photo the way a phone leaves it: stored turned, with an Orientation
+    # tag that says which way up it really is. image.load applies the tag, so
+    # the editor has to show 300 by 400 and crop in those coordinates. WPF does
+    # not apply the tag, which is why the preview for this one comes from the
+    # engine instead.
+    upright = quadrants(300, 400)
+    stored = upright.transpose(Image.Transpose.ROTATE_90)
+    turned = stored.getexif()
+    turned[274] = 6
+    stored.save(folder / "turned.jpg", quality=95, exif=turned.tobytes())
+    written["turned.jpg"] = "stored 400x300, upright 300x400"
+
     tagged = quadrants(400, 300)
     exif = tagged.getexif()
     exif[270] = "the old title"

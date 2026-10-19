@@ -18,6 +18,10 @@ collide:
                        the ink on its edge and the red untouched inside it.
   hide.png   Redact    drag a region over the red quarter with mode box, and
                        expect black there and the grey quarter untouched.
+  turned.jpg Crop      a photo stored turned, with an EXIF Orientation tag.
+                       Its preview has to come from the engine and the box has
+                       to be in the upright 300 by 400, not the stored 400 by
+                       300.
   tags.jpg   Metadata  expect the form to arrive filled from the file's own
                        tags (the engine's action=view), type new ones with a
                        location, and expect them in the output's EXIF.
@@ -37,10 +41,17 @@ dropped on Explorer's navigation pane.
 param(
     [string]$Dir = 'C:\peel-dev\e2e-editors',
     [string]$App = 'C:\peel-dev\peel-6f29\shell\Peel\bin\Release\net8.0-windows\Peel.exe',
+    # The engine to test against, and the python next to it for the checks.
+    # The installed engine is the default, but a developer machine's install
+    # can be older than the branch (it was: C:\peel-dev\main had no image
+    # family and the tools wheel was empty for a PNG), so pass -Peel the
+    # peel.exe of a venv holding this branch's engine. Peel itself is pointed
+    # at the same one through PEEL_CLI, so the shell and the checks never
+    # disagree about which engine they are talking about.
     [string]$Peel = "$env:LOCALAPPDATA\Peel\venv\Scripts\peel.exe",
-    [string]$Python = "$env:LOCALAPPDATA\Peel\venv\Scripts\python.exe",
     [string]$Check = 'C:\peel-dev\peel-6f29\shell\tests\e2e-editors-check.py'
 )
+$Python = Join-Path (Split-Path -Parent $Peel) 'python.exe'
 
 $ErrorActionPreference = 'Stop'
 $test = Join-Path $Dir 'testdir'
@@ -214,10 +225,20 @@ function GetText($element) {
 }
 
 function Press($element) {
+    # A Button answers Invoke and a RadioButton answers SelectionItem. Toggle
+    # is last and deliberately so: WPF implements it with OnToggle, which
+    # changes IsChecked without raising Click, so a window that listened for
+    # Click would look like it ignored the press.
     try {
         $element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-    } catch {
-        $element.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle()
+    }
+    catch {
+        try {
+            $element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+        }
+        catch {
+            $element.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Toggle()
+        }
     }
     Start-Sleep -Milliseconds 200
 }
@@ -306,14 +327,18 @@ function OpenEditorFrom($source, $label) {
     StartDragFrom $item
     if (-not (WaitLog 'drag start at' 5000 ($drags + 1))) { throw "the hook did not see the drag of $source" }
 
+    # Count every line to be waited for BEFORE the action that writes it. The
+    # wheel draws its segments within milliseconds of opening, so a count taken
+    # after the pointer has reached the ring is already too late and the wait
+    # is for a line that will never come.
     $shown = CountLog 'wheel shown at'
+    $drawn = CountLog 'wheel tool page 0: '
     [InEd]::Tap($VkCtrl)
     $line = WaitLog 'wheel shown at (\d+),(\d+)' 5000 ($shown + 1)
     if (-not $line) { throw 'the tools wheel never opened' }
     $centre = @([int]$line.Groups[1].Value, [int]$line.Groups[2].Value)
     ApproachRing $centre
 
-    $drawn = CountLog 'wheel tool page 0: '
     $tools = WaitLog 'wheel tool page 0: (.+)' 6000 ($drawn + 1)
     if (-not $tools) { throw 'the tools wheel never drew its segments' }
     $labels = @($tools.Groups[1].Value.Trim() -split ',')
@@ -338,7 +363,8 @@ $peelProcess = $null
 $originalCursor = [System.Windows.Forms.Cursor]::Position
 try {
     if (-not (Test-Path $App)) { throw "build the shell first: $App" }
-    if (-not (Test-Path $Python)) { throw "the engine venv python is not there: $Python" }
+    if (-not (Test-Path $Peel)) { throw "the engine is not there: $Peel" }
+    if (-not (Test-Path $Python)) { throw "the python next to the engine is not there: $Python" }
     $made = Ask @('make', $test)
     Check 'fixtures made' ($made.files -ne $null) "$($made.folder): $(($made.files | Get-Member -MemberType NoteProperty).Name -join ',')"
     $red = $made.red; $green = $made.green; $grey = $made.grey; $flat = $made.flat
@@ -348,10 +374,13 @@ try {
     $offered = @((& $Peel options (Join-Path $test 'crop.png') | ConvertFrom-Json).wheels |
         Where-Object { $_.family -eq 'tool' } | ForEach-Object { $_.groups } |
         ForEach-Object { $_.entries } | Where-Object { $_.needs_editor } | ForEach-Object { $_.label })
-    Check 'the engine offers the five image editors' ($offered.Count -eq 5) "needs_editor tools for a PNG: $($offered -join ',')"
+    Check 'the engine offers the five image editors' ($offered.Count -eq 5) `
+        "needs_editor tools for a PNG from $Peel : $($offered -join ',')"
+    if ($offered.Count -ne 5) { throw "this engine has no image editors to test: $Peel" }
 
     $env:PEEL_LOG = $peelLog
     $env:PEEL_EXIT_AFTER = '900'
+    $env:PEEL_CLI = $Peel
     $peelProcess = Start-Process $App -PassThru
     L "started $App as pid $($peelProcess.Id)"
     Check 'app starts' ((WaitLog 'peel shell start' 15000) -ne $null) 'peel shell start in the log'
@@ -417,7 +446,10 @@ try {
     Check 'the output is turned a quarter turn' (($size.width -eq 300) -and ($size.height -eq 400)) `
         "$($size.width)x$($size.height) from 400x300"
     $lit = Ask @('pixel', $out, '150', '200')
-    $doubled = @([int]$flat[0] * 2, [int]$flat[1] * 2, [int]$flat[2] * 2)
+    # One at a time: a comma binds tighter than a multiplication in
+    # PowerShell, so the obvious one liner builds nested arrays instead.
+    $doubled = @()
+    foreach ($channel in $flat) { $doubled += ([int]$channel * 2) }
     Check 'every channel doubled, which is what brightness 2 means' (Near $lit.rgb $doubled 2) `
         "$($lit.rgb -join ',') against $($doubled -join ',')"
 
@@ -434,12 +466,26 @@ try {
     DragOnCanvas $rect 40 40 160 120
     $drawn = (El $draw 'AnnotateHint').Current.Name
     Check 'the box is drawn' ($drawn -match '^1 shape') $drawn
+    # Then a caption, which is the other half of the tool: type the words and
+    # click where they go. It is also the one path that makes WPF measure text
+    # in a font of its own, which is where the font cache bites.
+    SetText (El $draw 'AnnotateText') 'Vineyard'
+    Press (El $draw 'AnnotateToolText')
+    $where = CanvasPoint $rect 220 200
+    MoveTo $where[0] $where[1]
+    Start-Sleep -Milliseconds 150
+    [InEd]::Down(); Start-Sleep -Milliseconds 120; [InEd]::Up()
+    Start-Sleep -Milliseconds 300
+    $both = (El $draw 'AnnotateHint').Current.Name
+    Check 'the caption is placed where it was clicked' ($both -match '^2 shapes') $both
     ReadShot (ShootWindow $draw 'shot-annotate.png') 'Annotate'
     Press (El $draw 'AnnotateApply')
     Check 'Annotate sends a shape list the engine parses' `
         ((WaitLog 'image\.annotate: editor applied shapes=\[\{"type":"rect"' 5000) -ne $null) 'from the log'
     $out = Join-Path $test 'draw (Annotate).png'
     Check 'Annotate wrote its output' (WaitForOutput $out) $out
+    Check 'the engine drew both shapes' `
+        ((WaitLog 'job end image\.annotate ok=True outputs=1 Drew 2 shapes' 10000) -ne $null) 'from the log'
     $edge = Ask @('pixel', $out, '100', '42')
     Check 'the ink landed on the edge of the box' (Near $edge.rgb @(52, 199, 89) 24) `
         "$($edge.rgb -join ',') against the green ink 52,199,89"
@@ -479,6 +525,8 @@ try {
     $was = GetText (El $meta 'MetaTitle')
     Check 'the form arrives filled from the file' ($was -eq 'the old title') `
         "the Title field holds '$was', which the engine's action=view read"
+    $tag = (El $meta 'MetaTagArtist').Current.Name
+    Check 'the tags in the file are listed' ($tag -eq 'Artist') "the list holds a row named '$tag'"
     SetText (El $meta 'MetaTitle') 'Vineyard at dusk'
     SetText (El $meta 'MetaAuthor') 'Daniel'
     SetText (El $meta 'MetaLatitude') '32.4567'
@@ -501,6 +549,40 @@ try {
          ([Math]::Abs([double]$tags.longitude + 116.6123) -lt 0.001)) `
         "$($tags.latitude), $($tags.longitude)"
 
+    # --- a photo stored turned ------------------------------------------------
+    # The engine opens every image upright (image.load applies and drops the
+    # EXIF Orientation tag) and a crop box means what the editor showed. WPF
+    # does not apply the tag, so this file's preview has to come from the
+    # engine, and the editor has to work in the upright 300 by 400, not the
+    # stored 400 by 300.
+    Start-Sleep -Milliseconds 800
+    $turnedCanvas = CountLog 'editor canvas image\.crop at'
+    $null = OpenEditorFrom 'turned.jpg' 'Crop'
+    $turned = Win 'Crop turned.jpg'
+    Check 'the Crop window opens for a photo stored turned' ($turned -ne $null) 'found by its title'
+    if (-not $turned) { throw 'no Crop window for turned.jpg' }
+    Check 'a rotated photo is rasterised by the engine, not by WPF' `
+        ((WaitLog 'image\.crop: preview 300x400 via engine raster' 8000) -ne $null) 'from the log'
+    $rect = CanvasRect 'image.crop' 12000 ($turnedCanvas + 1)
+    Check 'the editor works in the upright size' (($rect.iw -eq 300) -and ($rect.ih -eq 400)) `
+        "the canvas stands for $($rect.iw)x$($rect.ih), and the file on disk is 400x300"
+    SetText (El $turned 'CropW') '150'
+    SetText (El $turned 'CropH') '200'
+    SetText (El $turned 'CropX') '150'
+    SetText (El $turned 'CropY') '0'
+    $said = (El $turned 'CropHint').Current.Name
+    Check 'the upright box is the one it will send' ($said -match 'Cropping to 150 by 200 at 150,0') $said
+    ReadShot (ShootWindow $turned 'shot-crop-turned.png') 'Crop of a turned photo'
+    Press (El $turned 'CropApply')
+    $out = Join-Path $test 'turned (Crop).jpg'
+    Check 'the turned photo was cropped' (WaitForOutput $out) $out
+    $size = Ask @('info', $out)
+    Check 'the output is the upright box, not the stored one' `
+        (($size.width -eq 150) -and ($size.height -eq 200)) "$($size.width)x$($size.height)"
+    $quarter = Ask @('pixel', $out, '75', '100')
+    Check 'the crop came from the upright top right quarter' (Near $quarter.rgb $green 24) `
+        "centre is $($quarter.rgb -join ',') and the green quarter is $($green -join ',')"
+
     # --- Escape writes nothing ------------------------------------------------
     Start-Sleep -Milliseconds 800
     $before = @(Get-ChildItem $test -File | ForEach-Object { $_.Name })
@@ -508,7 +590,7 @@ try {
     $again = Win 'Crop crop.png'
     Check 'the Crop window opens a second time' ($again -ne $null) 'found by its title'
     if ($again) {
-        $null = CanvasRect 'image.crop' 12000 ($canvasLines + 2)
+        $null = CanvasRect 'image.crop' 12000 ($turnedCanvas + 2)
         [InEd]::Tap($VkEsc)
         Check 'Escape closes the editor' ((WaitLog 'image\.crop: editor cancelled' 5000) -ne $null) 'from the log'
     }
@@ -522,7 +604,7 @@ try {
     $ms = if ($worst.Count -gt 0) { [double]$worst[$worst.Count - 1].Groups[1].Value } else { 0 }
     Check 'the hooks stayed far under their budget' ($ms -lt 10) "worst hook call ${ms}ms against 10ms"
     Check 'no unhandled exceptions' (-not ((PeelLog) -match 'unhandled')) 'the log has no unhandled exception'
-    Check 'every editor opened from the wheel' ((CountLog ': editor open') -ge 6) `
+    Check 'every editor opened from the wheel' ((CountLog ': editor open') -ge 7) `
         "$(CountLog ': editor open') editor windows opened"
 }
 catch {

@@ -89,6 +89,15 @@
         <Setter Property="Margin" Value="0" />
     </Style>
 
+    <!--
+      Used by the RadioButtons that make up every choice group in the editors.
+      A RadioButton is a ToggleButton, so this style fits both, and the custom
+      template drops the radio circle: these read as a row of pressed buttons.
+      They are RadioButtons rather than ToggleButtons because a ToggleButton
+      driven through UI Automation gets OnToggle, which changes IsChecked
+      without raising Click, so a window that listened for Click would not
+      answer a screen reader or a scripted test at all.
+    -->
     <Style x:Key="EditorToggle" TargetType="ToggleButton" BasedOn="{StaticResource EditorButton}">
         <Setter Property="MinWidth" Value="52" />
         <Setter Property="Padding" Value="9,4" />

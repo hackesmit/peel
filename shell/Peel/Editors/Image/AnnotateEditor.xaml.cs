@@ -45,9 +45,9 @@ internal partial class AnnotateEditor : EditorWindowBase
 
     private readonly AnnotatePlan _plan = new();
     private readonly PreviewMap _map;
-    private readonly List<ToggleButton> _tools = new();
-    private readonly List<ToggleButton> _inks = new();
-    private readonly List<ToggleButton> _nibs = new();
+    private readonly List<RadioButton> _tools = new();
+    private readonly List<RadioButton> _inks = new();
+    private readonly List<RadioButton> _nibs = new();
     private readonly List<Point> _stroke = new();
     private ShapeKind _tool = ShapeKind.Pen;
     private string _ink = Inks[0].Colour;
@@ -79,7 +79,7 @@ internal partial class AnnotateEditor : EditorWindowBase
             .ToString(CultureInfo.InvariantCulture);
 
         BuildTools();
-        PickInk(_inks[0]);
+        RingInk(_inks[0]);
         LogCanvas("image.annotate", Overlay, preview.FileWidth, preview.FileHeight);
         Overlay.MouseLeftButtonDown += OnDown;
         Overlay.MouseMove += OnMove;
@@ -121,11 +121,10 @@ internal partial class AnnotateEditor : EditorWindowBase
                      (ShapeKind.Text, "Text"),
                  })
         {
-            var button = Toggle($"AnnotateTool{label}", label, kind == _tool);
-            button.Click += (sender, _) =>
+            var button = Choice("AnnotateTool", $"AnnotateTool{label}", label, kind == _tool);
+            button.Checked += (_, _) =>
             {
                 _tool = kind;
-                Pick(_tools, (ToggleButton)sender);
                 Redraw();
             };
             _tools.Add(button);
@@ -134,14 +133,14 @@ internal partial class AnnotateEditor : EditorWindowBase
         ToolPanel.Children.Add(Spacer());
         foreach (var (label, colour) in Inks)
         {
-            var button = Toggle($"AnnotateInk{label}", label, colour == _ink);
+            var button = Choice("AnnotateInk", $"AnnotateInk{label}", label, colour == _ink);
             button.Background = (Brush)new BrushConverter().ConvertFromString(colour)!;
             button.Foreground = label is "White" or "Yellow" ? Brushes.Black : Brushes.White;
             button.MinWidth = 58;
-            button.Click += (sender, _) =>
+            button.Checked += (sender, _) =>
             {
                 _ink = colour;
-                PickInk((ToggleButton)sender);
+                RingInk((RadioButton)sender);
             };
             _inks.Add(button);
             ToolPanel.Children.Add(button);
@@ -149,23 +148,20 @@ internal partial class AnnotateEditor : EditorWindowBase
         ToolPanel.Children.Add(Spacer());
         foreach (var (label, width) in Nibs)
         {
-            var button = Toggle($"AnnotateWidth{label}", label, width == _nib);
-            button.Click += (sender, _) =>
-            {
-                _nib = width;
-                Pick(_nibs, (ToggleButton)sender);
-            };
+            var button = Choice("AnnotateWidth", $"AnnotateWidth{label}", label, width == _nib);
+            button.Checked += (_, _) => _nib = width;
             _nibs.Add(button);
             ToolPanel.Children.Add(button);
         }
     }
 
-    private ToggleButton Toggle(string automationId, string label, bool on)
+    private RadioButton Choice(string group, string automationId, string label, bool on)
     {
-        var button = new ToggleButton
+        var button = new RadioButton
         {
             Content = label,
             Style = (Style)FindResource("EditorToggle"),
+            GroupName = group,
             IsChecked = on,
         };
         System.Windows.Automation.AutomationProperties.SetAutomationId(button, automationId);
@@ -173,25 +169,16 @@ internal partial class AnnotateEditor : EditorWindowBase
         return button;
     }
 
-    private static void Pick(IEnumerable<ToggleButton> group, ToggleButton chosen)
-    {
-        foreach (var button in group)
-        {
-            button.IsChecked = ReferenceEquals(button, chosen);
-        }
-    }
-
     /// <summary>
     /// A swatch keeps its own colour when it is chosen (a local Background
-    /// outranks the style's checked trigger), so the ring is what shows which
-    /// one is active.
+    /// outranks the style's checked trigger), so a white ring is what shows
+    /// which one is active.
     /// </summary>
-    private void PickInk(ToggleButton chosen)
+    private void RingInk(RadioButton chosen)
     {
         foreach (var button in _inks)
         {
             var on = ReferenceEquals(button, chosen);
-            button.IsChecked = on;
             button.BorderBrush = on ? Brushes.White : (Brush)FindResource("EditorEdge");
             button.BorderThickness = new Thickness(on ? 2.5 : 1);
         }
@@ -405,7 +392,6 @@ internal partial class AnnotateEditor : EditorWindowBase
                 {
                     Text = shape.Text,
                     Foreground = ink,
-                    FontFamily = new FontFamily("Segoe UI"),
                     FontSize = Math.Max(4, shape.FontSize * _map.Scale),
                     Opacity = opacity,
                     IsHitTestVisible = false,
