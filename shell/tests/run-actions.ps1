@@ -22,6 +22,10 @@ param(
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 
+# The user's own Windows Terminal windows must survive this test. Record the
+# ones already open so the cleanup kills only terminals the probe started.
+$terminalsBefore = @(Get-Process -Name 'WindowsTerminal' -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+
 $probeProject = Join-Path $Root 'shell\tests\ActionProbe'
 $probe = Join-Path $probeProject 'bin\Release\net8.0-windows10.0.19041.0\Peel.ActionProbe.exe'
 if (-not (Test-Path $probe)) {
@@ -96,9 +100,13 @@ try {
     Invoke-Probe 'move' ('move --out "{0}\move.txt" --files "{1}" --dest "{2}"' -f $dir, (@($mImg, $mDir) -join ';'), $moveDst)
 }
 finally {
-    foreach ($leftover in @('WindowsTerminal', 'Peel.ActionProbe')) {
-        Get-Process -Name $leftover -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    }
+    # Kill only a Windows Terminal the probe started (one not open at the start),
+    # never the user's own sessions.
+    Get-Process -Name 'WindowsTerminal' -ErrorAction SilentlyContinue |
+        Where-Object { $terminalsBefore -notcontains $_.Id } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process -Name 'Peel.ActionProbe' -ErrorAction SilentlyContinue |
+        Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
 Write-Output '=== action checks ==='

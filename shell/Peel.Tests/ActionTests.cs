@@ -184,6 +184,48 @@ public class ActionTests
         }
     }
 
+    [Fact]
+    public void MovingAFolderIntoItsOwnDescendantIsRefusedAndNothingIsLost()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "peel-move-" + Guid.NewGuid().ToString("N"));
+        var album = Path.Combine(root, "album");
+        var into = Path.Combine(album, "out");
+        Directory.CreateDirectory(into);
+        var keep = Path.Combine(album, "photo.txt");
+        File.WriteAllText(keep, "precious");
+        try
+        {
+            // Without the guard this used to copy album into album\out\album
+            // and then delete album, losing everything. It must refuse instead.
+            Assert.Throws<IOException>(() => MoveAction.MoveInto(album, into));
+            Assert.True(Directory.Exists(album));
+            Assert.True(File.Exists(keep));
+            Assert.Equal("precious", File.ReadAllText(keep));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void MovingAFolderIntoItselfIsRefused()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "peel-move-" + Guid.NewGuid().ToString("N"));
+        var album = Path.Combine(root, "album");
+        Directory.CreateDirectory(album);
+        File.WriteAllText(Path.Combine(album, "a.txt"), "x");
+        try
+        {
+            Assert.Throws<IOException>(() => MoveAction.MoveInto(album, album));
+            Assert.True(File.Exists(Path.Combine(album, "a.txt")));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
     // --- RecentFolders ------------------------------------------------------
 
     [Fact]
@@ -220,5 +262,23 @@ public class ActionTests
     public void TheFloatThumbnailIsOnlyDecodedForImages(string name, bool expected)
     {
         Assert.Equal(expected, FloatAction.IsImage(name));
+    }
+
+    [Fact]
+    public void AFolderNamedLikeAnImageIsNotTreatedAsOne()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "peel-float-" + Guid.NewGuid().ToString("N"));
+        var folder = Path.Combine(root, "holiday.jpg");
+        Directory.CreateDirectory(folder);
+        try
+        {
+            // A real folder called "holiday.jpg" must float as an icon tile, not
+            // be handed to the image decoder, which would fail and show nothing.
+            Assert.False(FloatAction.IsImage(folder));
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
     }
 }

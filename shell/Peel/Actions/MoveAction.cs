@@ -48,6 +48,27 @@ internal static class MoveAction
 
     private static bool TakenOnDisk(string path) => File.Exists(path) || Directory.Exists(path);
 
+    /// <summary>True when <paramref name="inner"/> is <paramref name="outer"/>
+    /// itself or sits beneath it, both compared as full paths.</summary>
+    internal static bool IsSameOrBeneath(string inner, string outer)
+    {
+        var a = Path.GetFullPath(inner).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var b = Path.GetFullPath(outer).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (string.Equals(a, b, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        return a.StartsWith(b + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>True when both paths live on the same volume (drive or UNC share),
+    /// which is when <see cref="Directory.Move"/> can move a folder in one step.</summary>
+    private static bool SameVolume(string a, string b) =>
+        string.Equals(
+            Path.GetPathRoot(Path.GetFullPath(a)),
+            Path.GetPathRoot(Path.GetFullPath(b)),
+            StringComparison.OrdinalIgnoreCase);
+
     /// <summary>Move one file or folder into the destination, never overwriting.</summary>
     internal static string MoveInto(string source, string destDir)
     {
@@ -55,14 +76,24 @@ internal static class MoveAction
         var target = UniqueDestination(destDir, name, TakenOnDisk);
         if (Directory.Exists(source))
         {
-            try
+            // Moving a folder into itself or one of its own descendants is
+            // never valid: the cross-volume fallback below would copy the tree
+            // into a subfolder of the source and then delete the source, taking
+            // the copy with it. Refuse before touching anything.
+            if (IsSameOrBeneath(destDir, source))
             {
+                throw new IOException($"cannot move \"{name}\" into itself");
+            }
+            if (SameVolume(source, target))
+            {
+                // Same volume: an atomic rename. If it fails it is a real error,
+                // reported as a failure; never fall back to a destructive copy.
                 Directory.Move(source, target);
             }
-            catch (IOException)
+            else
             {
                 // A different drive: Directory.Move cannot cross volumes, so
-                // copy the tree and remove the original.
+                // copy the tree and only then remove the original.
                 CopyTree(source, target);
                 Directory.Delete(source, recursive: true);
             }
@@ -122,17 +153,35 @@ internal static class MoveAction
         var menu = new System.Windows.Forms.ContextMenuStrip();
         void MoveTo(string destination)
         {
-            var outcome = MoveAll(files, destination);
-            var where = Path.GetFileName(destination.TrimEnd(Path.DirectorySeparatorChar));
-            if (outcome.Failures.Count == 0)
+            // The move can copy gigabytes across drives, so it runs off the UI
+            // thread: doing it in the menu click handler would freeze the wheel
+            // and the toasts. The menu is not modal, so ActionHost.Run has
+            // already returned; failures are caught here, never thrown into the
+            // click handler, and the one report is marshalled back to the UI.
+            System.Threading.Tasks.Task.Run(() =>
             {
-                var noun = outcome.Moved == 1 ? "item" : "items";
-                jobs.Report($"Moved {outcome.Moved} {noun} to {where}.");
-            }
-            else
-            {
-                jobs.Report($"Moved {outcome.Moved} of {files.Count} to {where}. {outcome.Failures[0]}");
-            }
+                string message;
+                try
+                {
+                    var outcome = MoveAll(files, destination);
+                    var where = Path.GetFileName(destination.TrimEnd(Path.DirectorySeparatorChar));
+                    if (outcome.Failures.Count == 0)
+                    {
+                        var noun = outcome.Moved == 1 ? "item" : "items";
+                        message = $"Moved {outcome.Moved} {noun} to {where}.";
+                    }
+                    else
+                    {
+                        message = $"Moved {outcome.Moved} of {files.Count} to {where}. {outcome.Failures[0]}";
+                    }
+                }
+                catch (Exception error)
+                {
+                    Log.Write("move: the move failed", error);
+                    message = $"The move failed: {error.Message}";
+                }
+                ui.InvokeAsync(() => jobs.Report(message));
+            });
         }
 
         foreach (var folder in RecentFolders.Load())

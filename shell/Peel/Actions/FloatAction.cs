@@ -26,8 +26,11 @@ internal static class FloatAction
         ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".ico",
     };
 
-    /// <summary>True when the extension is one WPF can decode as a thumbnail.</summary>
-    internal static bool IsImage(string path) => ImageExtensions.Contains(Path.GetExtension(path));
+    /// <summary>True when the path is a file WPF can decode as a thumbnail. A
+    /// folder whose name ends in an image extension (for example a folder called
+    /// "holiday.jpg") is not an image, so it is excluded here.</summary>
+    internal static bool IsImage(string path) =>
+        !Directory.Exists(path) && ImageExtensions.Contains(Path.GetExtension(path));
 
     internal static void Run(IReadOnlyList<string> files, JobRunner jobs)
     {
@@ -96,17 +99,28 @@ internal sealed class FloatWindow : Window
     private Border BuildContent(string path)
     {
         var panel = new StackPanel { Margin = new Thickness(6) };
+        var shown = false;
         if (FloatAction.IsImage(path))
         {
-            panel.Children.Add(new Image
+            try
             {
-                Source = Thumbnail(path),
-                Stretch = Stretch.Uniform,
-                MaxWidth = Thumb,
-                MaxHeight = Thumb,
-            });
+                panel.Children.Add(new Image
+                {
+                    Source = Thumbnail(path),
+                    Stretch = Stretch.Uniform,
+                    MaxWidth = Thumb,
+                    MaxHeight = Thumb,
+                });
+                shown = true;
+            }
+            catch (Exception error)
+            {
+                // A corrupt or unreadable image must not stop the file floating:
+                // fall back to the icon and name tile below.
+                Log.Write($"float: could not decode {path} as an image", error);
+            }
         }
-        else
+        if (!shown)
         {
             var icon = AssociatedIcon(path);
             if (icon is not null)
