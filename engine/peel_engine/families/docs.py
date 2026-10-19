@@ -880,9 +880,12 @@ def _soffice(source: Path, target: Path, convert_to: str, job: Job,
 
     LibreOffice names its own output, so it writes into a scratch folder beside
     the claim and the result is moved on with ``os.replace``, which is atomic
-    because both are on the same drive.
+    because both are on the same drive. Every source passes ``_soffice_gate``
+    first, so no route reaches LibreOffice with a link out of its package.
     """
     exe = backends.require("soffice")
+    source, default_filter = _soffice_gate(job, source, target)
+    infilter = infilter or default_filter
     work = job.scratch_dir(target)
     profile = _soffice_profile() / "profile"
     args = [
@@ -920,10 +923,17 @@ def _produced_file(work: Path, ext: str) -> Path:
     )
 
 
-def _csv_filter(ext: str) -> str:
-    """The StarCalc text filter with the separator for this extension."""
-    separator = 9 if naming.normalise_ext(ext) == "tsv" else 44
-    return f"{_CSV_FILTER}:{separator},34,76,1"
+def _csv_filter(delimiter: str, quotechar: str = '"') -> str:
+    """The StarCalc text filter for a detected dialect.
+
+    Tokens: separator, text delimiter, charset 76 (UTF-8), first line, cell
+    formats, language, quoted field as text, detect special numbers (dates, as
+    LibreOffice does by default), three export-only tokens, and last
+    "evaluate formulas" off: a CSV cell such as ``=WEBSERVICE(...)`` would
+    otherwise run while the file is converted.
+    """
+    return (f"{_CSV_FILTER}:{ord(delimiter)},{ord(quotechar)},76,1,,,"
+            "false,true,false,false,false,-1,false")
 
 
 def _claim_media(job: Job, target: Path) -> Path:
@@ -971,9 +981,11 @@ def _as_soffice_input(job: Job, source: Path, src_ext: str, near: Path,
 
     The pandoc detour is taken when LibreOffice cannot read the format, and
     also when the source links to files LibreOffice would load by itself: an
-    HTML page always can, and a DOCX, ODT or RTF can carry a linked (not
-    embedded) picture or text. Going through pandoc puts those links through
-    the same folder check as every other pandoc run.
+    HTML page always can, an RTF can hide a linked picture or text in ways no
+    scan reads reliably, and a DOCX or ODT can carry a linked (not embedded)
+    picture, object or field. Going through pandoc puts those links through
+    the same folder check as every other pandoc run. Whatever reaches
+    LibreOffice afterwards still passes the package gate in ``_soffice``.
     """
     if src_ext in SOFFICE_DOC_IN and not _links_outside_files(source, src_ext):
         return source, None
@@ -983,54 +995,437 @@ def _as_soffice_input(job: Job, source: Path, src_ext: str, near: Path,
     return bridge, dropped
 
 
-#: DOCX relationship types that only point somewhere (a hyperlink), as
-#: opposed to ones LibreOffice opens and pulls in (images, OLE, subdocuments).
-_HYPERLINK_REL = re.compile(r"/hyperlink$")
-_RELATIONSHIP = re.compile(r"<Relationship\b[^>]*>", re.I)
-_ODF_LINK = re.compile(
-    r"<(?:draw:image|draw:object|draw:object-ole|draw:plugin|draw:applet|"
-    r"text:section-source|draw:fill-image|style:background-image)\b[^>]*"
-    r"xlink:href=\"([^\"]*)\"",
+def _links_outside_files(source: Path, src_ext: str) -> bool:
+    """Whether LibreOffice would load anything this document only links to.
+
+    True for HTML and RTF always (neither can be checked structurally), and
+    for a DOCX or ODT with any link out of the package, removable or not. A
+    package that cannot be read at all raises ``RunnerFailed``.
+    """
+    if src_ext in ("html", "htm", "rtf"):
+        return True
+    if src_ext not in _OOXML + _ODF:
+        return False
+    found = _inspect_package(source)
+    return bool(found.blockers or found.rewrites)
+
+
+# --- LibreOffice confinement --------------------------------------------------
+#
+# LibreOffice loads whatever a document links to: a picture or OLE object
+# linked by a DOCX/PPTX/XLSX relationship, an ODF xlink:href, a DOCX
+# INCLUDEPICTURE field, an external workbook reference in a formula, a DDE
+# link. Nothing in its command line turns that off, so every file handed to it
+# passes ``_soffice_gate`` first. The gate parses each XML part of the package
+# with a real parser (no DTD, so no entity tricks; character references are
+# decoded by the parser, so ``&#46;./`` is ``../``), removes the links it can
+# remove into a scratch copy, and refuses everything it cannot read or clean.
+
+_OOXML = ("docx", "pptx", "xlsx")
+_ODF = ("odt", "ods", "odp")
+
+#: Explicit import filters, so LibreOffice never sniffs a file into a format
+#: the gate did not check (a ``.txt`` that is really an RTF, say).
+_SOFFICE_INFILTER = {
+    "docx": "MS Word 2007 XML",
+    "pptx": "Impress MS PowerPoint 2007 XML",
+    "xlsx": "Calc MS Excel 2007 XML",
+    "odt": "writer8",
+    "ods": "calc8",
+    "odp": "impress8",
+}
+_TEXT_INFILTER = "Text (encoded):UTF8,LF,,"
+
+#: Binary or RTF formats no parser here reads, and what to save them as.
+_RESAVE_AS = {"rtf": "DOCX", "doc": "DOCX", "ppt": "PPTX", "pps": "PPTX", "xls": "XLSX"}
+
+_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+#: Elements whose link is a hyperlink: shown as a link, never loaded.
+_OOXML_HYPERLINKS = {"hyperlink", "hlinkClick", "hlinkHover", "hlinkMouseOver"}
+_ODF_HYPERLINKS = {"a"}  # text:a and draw:a
+#: Attributes that carry a URL LibreOffice may load.
+_URL_ATTRS = {"href", "src"}
+#: Live data links: nothing to remove safely, so the file is refused.
+_LIVE_LINK_ELEMENTS = {
+    "ddeLink", "dde-source", "dde-link", "dde-connection-decl", "dde-connection",
+    "webPr", "textPr", "dbPr", "olapPr", "altChunk",
+}
+#: Word field codes that pull another file in.
+_LINK_FIELDS = re.compile(r"\b(?:INCLUDEPICTURE|INCLUDETEXT|INCLUDE|LINK|DDE|DDEAUTO|IMPORT)\b", re.I)
+#: Formula text that reaches another file or the network.
+_RISKY_FORMULA = re.compile(
+    r"file:|://|\\\\|(?<![A-Za-z])[A-Za-z]:[\\/]|'[^']*'#|"
+    r"\b(?:WEBSERVICE|INDIRECT|DDE|FILTERXML)\s*\(",
     re.I,
 )
-_RTF_LINK = re.compile(rb"INCLUDEPICTURE|INCLUDETEXT|\\objlink|\\objautlink|\\linkself", re.I)
+_FORMULA_ELEMENTS = {"f", "definedName", "formula", "formula1", "formula2"}
+_FORMULA_ATTRS = ("formula", "expression", "condition", "range-address", "cell-address")
+_CSS_URL = re.compile(r"url\(\s*['\"]?([^'\")]*)", re.I)
+
+_PACKAGE_MAX_PARTS = 10000
+_PACKAGE_MAX_BYTES = 512 * 2**20
+_SCHEME = re.compile(r"^[a-z][a-z0-9+.\-]*:", re.I)
+_UNSEEN = re.compile(r"[\x00-\x20\x7f]+")
 
 
-def _links_outside_files(source: Path, src_ext: str) -> bool:
-    """Whether LibreOffice would load files this document only links to."""
+class _Unsafe(Exception):
+    """A package part the gate cannot read, so it refuses the file."""
+
+
+@dataclass
+class _Findings:
+    rewrites: dict[str, bytes]
+    blockers: list[str]
+    odf: bool
+
+
+def _local(name: str) -> str:
+    return name.rsplit("}", 1)[-1]
+
+
+def _ns(name: str) -> str:
+    return name[1:].split("}", 1)[0] if name.startswith("{") else ""
+
+
+def _outside_ref(value: str, base: str = "", *, rooted: bool = False) -> bool:
+    """Whether a link resolves outside the package.
+
+    Outside is an absolute path, a drive letter, a UNC path, any URL scheme
+    (file:, http:, smb:, vnd.sun.star.*), or ``..`` climbing above the package
+    root. Percent escapes are decoded too, and control characters and spaces
+    removed, as URL parsers do. ``rooted`` allows ``/part/name``, which in an
+    OOXML relationship is a part of the package itself.
+    """
+    from urllib.parse import unquote
+    import posixpath
+
+    seen = value
+    for _ in range(4):
+        text = _UNSEEN.sub("", seen).replace("\\", "/")
+        if text and not text.startswith("#"):
+            if text.startswith("//") or _SCHEME.match(text):
+                return True
+            if text.startswith("/"):
+                if not rooted:
+                    return True
+                text = text.lstrip("/")
+                start = ""
+            else:
+                start = base
+            joined = posixpath.normpath(posixpath.join(start, text))
+            if joined == ".." or joined.startswith("../") or joined.startswith("/"):
+                return True
+        decoded = unquote(seen)
+        if decoded == seen:
+            return False
+        seen = decoded
+    return True
+
+
+def _xml_kind(data: bytes) -> str:
+    """"xml", "gzip", "zip", "rtf", or "" (a binary part such as a PNG)."""
+    head = data[:8]
+    if head.startswith((b"\x00\x00\xfe\xff", b"\xff\xfe\x00\x00", b"\x00\x00\x00<", b"<\x00\x00\x00")):
+        raise _Unsafe("is stored in UTF-32")
+    if head.startswith((b"\xff\xfe", b"\xfe\xff", b"\xef\xbb\xbf", b"\x00<", b"<\x00")):
+        return "xml"
+    stripped = data[:256].lstrip(b" \t\r\n")
+    if stripped.startswith(b"<"):
+        return "xml"
+    if head.startswith(b"\x1f\x8b"):
+        return "gzip"
+    if head.startswith(b"PK\x03\x04"):
+        return "zip"
+    if stripped.startswith(b"{\\rt"):
+        return "rtf"
+    return ""
+
+
+def _parse_xml(data: bytes):
+    """Parse one part. No DTD, no entity declarations, no stylesheet PI."""
+    import xml.etree.ElementTree as ET
+    from xml.parsers import expat
+
+    def refuse(*_args: Any) -> None:
+        raise _Unsafe("declares a DTD or entities")
+
+    def instruction(target: str, _data: str) -> None:
+        if target.lower() == "xml-stylesheet":
+            raise _Unsafe("links a stylesheet")
+
+    probe = expat.ParserCreate()
+    probe.StartDoctypeDeclHandler = refuse
+    probe.EntityDeclHandler = refuse
+    probe.UnparsedEntityDeclHandler = refuse
+    probe.ProcessingInstructionHandler = instruction
+    try:
+        probe.Parse(data, True)
+        return ET.fromstring(data)
+    except (expat.ExpatError, ET.ParseError, ValueError) as exc:
+        raise _Unsafe(f"is not well-formed XML ({exc})") from None
+
+
+def _namespaces(data: bytes) -> list[tuple[str, str]]:
+    import io
+    import xml.etree.ElementTree as ET
+
+    return [ns for _, ns in ET.iterparse(io.BytesIO(data), events=("start-ns",))]
+
+
+def _serialise(root: Any, data: bytes) -> bytes:
+    """Write a cleaned part back, keeping the prefixes it declared."""
+    import xml.etree.ElementTree as ET
+
+    for prefix, uri in _namespaces(data):
+        if prefix and prefix != "xml":
+            with contextlib.suppress(ValueError):
+                ET.register_namespace(prefix, uri)
+    return ET.tostring(root, encoding="UTF-8", xml_declaration=True)
+
+
+def _inspect_package(source: Path, *, depth: int = 0) -> _Findings:
+    """Every link out of an OOXML or ODF package, found structurally.
+
+    Raises ``RunnerFailed`` when the package cannot be read (damaged, password
+    protected, a part that is not well-formed or declares a DTD).
+    """
     import zipfile
 
-    if src_ext in ("html", "htm"):
-        return True
-    if src_ext == "rtf":
-        try:
-            return bool(_RTF_LINK.search(source.read_bytes()))
-        except OSError:
-            return False
-    if src_ext not in ("docx", "odt"):
-        return False
     try:
         with zipfile.ZipFile(source) as package:
-            for name in package.namelist():
-                if src_ext == "docx" and name.endswith(".rels"):
-                    text = package.read(name).decode("utf-8", "replace")
-                    for rel in _RELATIONSHIP.findall(text):
-                        if re.search(r'TargetMode="External"', rel, re.I) and not \
-                                _HYPERLINK_REL.search(_attr(rel, "Type")):
-                            return True
-                if src_ext == "odt" and name in ("content.xml", "styles.xml"):
-                    text = package.read(name).decode("utf-8", "replace")
-                    for href in _ODF_LINK.findall(text):
-                        if href.startswith(("../", "/", "\\")) or re.match(r"^[a-z][\w+.-]*:", href, re.I):
-                            return True
-    except (OSError, zipfile.BadZipFile, KeyError):
-        return False
-    return False
+            return _inspect_zip(package, depth)
+    except _Unsafe as exc:
+        raise RunnerFailed(
+            f"{source.name} was not converted: a part of it {exc}, so Peel cannot "
+            "check what LibreOffice would load from it.",
+            code="unsafe_input",
+        ) from None
+    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile, RuntimeError,
+            NotImplementedError, EOFError) as exc:
+        raise RunnerFailed(
+            f"{source.name} could not be read as a document package. It may be "
+            "password protected or damaged.",
+            code="unsafe_input",
+        ) from exc
 
 
-def _attr(tag: str, name: str) -> str:
-    match = re.search(rf'\b{name}="([^"]*)"', tag)
-    return match.group(1) if match else ""
+def _inspect_zip(package: Any, depth: int) -> _Findings:
+    import gzip
+    import io
+    import zipfile
+
+    infos = package.infolist()
+    if len(infos) > _PACKAGE_MAX_PARTS or sum(i.file_size for i in infos) > _PACKAGE_MAX_BYTES:
+        raise _Unsafe("is too large to check")
+    names = [i.filename.replace("\\", "/").casefold() for i in infos]
+    if len(set(names)) != len(names):
+        raise _Unsafe("is stored twice under one name")
+    if any(i.flag_bits & 0x1 for i in infos):
+        raise _Unsafe("is encrypted")
+
+    odf = any(i.filename == "mimetype" for i in infos)
+    blockers: list[str] = []
+    parsed: dict[str, tuple[Any, bytes]] = {}
+    rels: dict[str, tuple[Any, bytes]] = {}
+    for info in infos:
+        if info.is_dir():
+            continue
+        data = package.read(info)
+        kind = _xml_kind(data)
+        if kind == "gzip":
+            try:
+                data = gzip.GzipFile(fileobj=io.BytesIO(data)).read(_PACKAGE_MAX_BYTES + 1)
+            except (OSError, EOFError):
+                raise _Unsafe("is a damaged compressed part") from None
+            if len(data) > _PACKAGE_MAX_BYTES:
+                raise _Unsafe("is too large to check")
+            if _xml_kind(data) == "xml":
+                inner: list[str] = []
+                if _part_links(info.filename, _parse_xml(data), odf, inner)[0] or inner:
+                    blockers.append(f"a compressed picture ({info.filename}) links to another file")
+            continue
+        if kind == "zip":
+            if depth >= 2:
+                raise _Unsafe("nests packages too deeply")
+            try:
+                inner = _inspect_zip(zipfile.ZipFile(io.BytesIO(data)), depth + 1)
+            except zipfile.BadZipFile:
+                continue  # an embedded binary that only looks like a zip header
+            if inner.blockers or inner.rewrites:
+                blockers.append(f"an embedded document ({info.filename}) links to other files")
+            continue
+        if kind == "rtf":
+            blockers.append(f"an embedded RTF part ({info.filename}) cannot be checked")
+            continue
+        if kind != "xml":
+            continue
+        root = _parse_xml(data)
+        if _local(root.tag) == "encryption-data" or any(
+                _local(e.tag) == "encryption-data" for e in root.iter()):
+            raise _Unsafe("is encrypted")
+        if _local(root.tag) == "Relationships":
+            rels[info.filename] = (root, data)
+        else:
+            parsed[info.filename] = (root, data)
+
+    rewrites: dict[str, bytes] = {}
+    used_ids: dict[str, set[str]] = {}
+    for name, (root, data) in parsed.items():
+        changed, found, ids = _part_links(name, root, odf, blockers)
+        used_ids[name] = ids
+        if changed:
+            if odf or _local(root.tag) == "svg":
+                rewrites[name] = _serialise(root, data)
+            else:
+                blockers.append(f"{name} links to {found[0]!r}")
+    for name, (root, _data) in rels.items():
+        cleaned = _clean_rels(name, root, used_ids)
+        if cleaned is not None:
+            rewrites[name] = cleaned
+    return _Findings(rewrites=rewrites, blockers=blockers, odf=odf)
+
+
+def _part_links(name: str, root: Any, odf: bool, blockers: Any) -> tuple[bool, list[str], set[str]]:
+    """Remove outside links from one parsed part, in place.
+
+    Returns whether anything was removed, what was found, and every attribute
+    value used by a non-hyperlink element (to tell a relationship used as a
+    hyperlink from one used to load a picture). Live links and risky formulas
+    go to ``blockers``.
+    """
+    hyperlinks = _ODF_HYPERLINKS if odf else _OOXML_HYPERLINKS
+    found: list[str] = []
+    ids: set[str] = set()
+    instructions: list[str] = []
+    for element in root.iter():
+        if not isinstance(element.tag, str):
+            continue
+        local = _local(element.tag)
+        if local in _LIVE_LINK_ELEMENTS:
+            blockers.append(f"{name} has a live link ({local})")
+        if local == "instrText" and element.text:
+            instructions.append(element.text)
+        if local in _FORMULA_ELEMENTS and element.text and _RISKY_FORMULA.search(element.text):
+            blockers.append(f"{name} has a formula that reads another file")
+        if local == "style" and element.text and _css_outside(element.text):
+            found.append("a stylesheet link")
+            element.text = ""
+        for attr, value in list(element.attrib.items()):
+            attr_local = _local(attr)
+            if local not in hyperlinks:
+                ids.add(value)
+            if attr_local == "instr":
+                instructions.append(value)
+            if attr_local.endswith(_FORMULA_ATTRS) and _RISKY_FORMULA.search(value):
+                blockers.append(f"{name} has a formula that reads another file")
+            if attr_local == "style" and _css_outside(value):
+                found.append("a style link")
+                del element.attrib[attr]
+                continue
+            if attr_local in _URL_ATTRS and local not in hyperlinks and _outside_ref(value):
+                found.append(value)
+                del element.attrib[attr]
+    if _LINK_FIELDS.search("".join(instructions)):
+        blockers.append(f"{name} has a field that includes another file")
+    return bool(found), found, ids
+
+
+def _css_outside(text: str) -> bool:
+    if "@import" in text.lower():
+        return True
+    return any(not url.strip().startswith("#") and _outside_ref(url)
+               for url in _CSS_URL.findall(text))
+
+
+def _clean_rels(name: str, root: Any, used_ids: dict[str, set[str]]) -> bytes | None:
+    """A relationships part without the links that leave the package.
+
+    None when nothing needs removing. A hyperlink relationship stays, unless
+    something other than a hyperlink uses its id (a picture's ``r:link``).
+    """
+    import posixpath
+    from xml.sax.saxutils import quoteattr
+
+    folder = posixpath.dirname(posixpath.dirname(name))
+    owner = posixpath.join(folder, posixpath.basename(name)[: -len(".rels")]) if name.endswith(".rels") else ""
+    users = used_ids.get(owner, set())
+    keep: list[dict[str, str]] = []
+    removed = False
+    for rel in root:
+        if not isinstance(rel.tag, str):
+            continue
+        attrs = {_local(k): v for k, v in rel.attrib.items() if not _ns(k)}
+        if _local(rel.tag) != "Relationship" or any(_ns(k) for k in rel.attrib):
+            removed = True
+            continue
+        target = attrs.get("Target", "")
+        external = attrs.get("TargetMode", "").strip().casefold() == "external"
+        hyperlink = attrs.get("Type", "").rstrip("/").endswith("/hyperlink")
+        if external:
+            outside = not (hyperlink and attrs.get("Id", "") not in users)
+        else:
+            outside = _outside_ref(target, folder, rooted=True)
+        if outside:
+            removed = True
+        else:
+            keep.append(attrs)
+    if not removed:
+        return None
+    body = "".join(
+        "<Relationship " + " ".join(f"{k}={quoteattr(v)}" for k, v in attrs.items()) + "/>"
+        for attrs in keep
+    )
+    return ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+            f'<Relationships xmlns="{_REL_NS}">{body}</Relationships>').encode("utf-8")
+
+
+def _write_package(source: Path, target: Path, rewrites: dict[str, bytes]) -> None:
+    """Copy a package part for part, replacing the cleaned ones, order kept
+    (an ODF ``mimetype`` must stay first and stored)."""
+    import zipfile
+
+    with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w") as out:
+        for info in src.infolist():
+            data = rewrites.get(info.filename)
+            out.writestr(info, src.read(info) if data is None else data)
+
+
+def _soffice_gate(job: Job, source: Path, near: Path) -> tuple[Path, str | None]:
+    """What LibreOffice may open in place of ``source``, and its import filter.
+
+    A package with no outside links is passed as it is; one whose links can be
+    removed is copied without them into a scratch folder; anything else is
+    refused with ``RunnerFailed``.
+    """
+    ext = _ext(source)
+    if ext in _RESAVE_AS:
+        raise RunnerFailed(
+            f"{source.name} is a {ext.upper()} file. Peel cannot check it for links "
+            "to other files before LibreOffice opens it, so it is not converted. "
+            f"Open it, save it as {_RESAVE_AS[ext]}, and convert that.",
+            code="unsafe_input",
+        )
+    if ext in DELIMITED:
+        return source, None  # read with the CSV filter, formulas kept as text
+    if ext == "txt":
+        copy = job.scratch_dir(near) / f"{source.stem or 'text'}.txt"
+        copy.write_text(_read_text(source), encoding="utf-8")
+        return copy, _TEXT_INFILTER
+    if ext not in _SOFFICE_INFILTER:
+        raise RunnerFailed(f"Peel does not hand .{ext} files to LibreOffice.", code="unsafe_input")
+    found = _inspect_package(source)
+    if found.blockers:
+        raise RunnerFailed(
+            f"{source.name} was not converted: {found.blockers[0]}, and Peel cannot "
+            "remove that link safely. Embed the linked file or remove the link, "
+            "save, and try again.",
+            code="unsafe_input",
+        )
+    if not found.rewrites:
+        return source, _SOFFICE_INFILTER[ext]
+    copy = job.scratch_dir(near) / source.name
+    _write_package(source, copy, found.rewrites)
+    return copy, _SOFFICE_INFILTER[ext]
 
 
 def extract_text(job: Job) -> Result:
@@ -1341,7 +1736,15 @@ def sheet_convert(job: Job) -> Result:
         return _delimited_to_xlsx(job, source, src_ext)
 
     target = job.output_path()
-    infilter = _csv_filter(src_ext) if src_ext in DELIMITED else None
+    infilter = None
+    if src_ext in DELIMITED:
+        # The same dialect the Python routes use, on a UTF-8 copy, so a
+        # semicolon CSV splits into the same columns whatever the target.
+        text = _read_text(source)
+        infilter = _csv_filter(*_csv_dialect(text, DELIMITED[src_ext]))
+        copy = job.scratch_dir(target) / f"{source.stem or 'table'}.{src_ext}"
+        copy.write_text(text, encoding="utf-8", newline="")
+        source = copy
     _soffice(source, target, SOFFICE_CONVERT_TO[out_ext], job, infilter=infilter)
     return ok([target], f"Wrote {target.name}")
 
@@ -1392,12 +1795,20 @@ def _delimited_to_xlsx(job: Job, source: Path, src_ext: str) -> Result:
     from openpyxl import Workbook
 
     rows = _read_delimited(source, DELIMITED[src_ext])
+    _check_xlsx_limits(source, rows)
     target = job.output_path()
     book = Workbook()
     sheet = book.active
     sheet.title = _sheet_title(source.stem)
     for number, cells in enumerate(rows, start=1):
-        _write_row(sheet, number, (_as_number(c) for c in cells))
+        for column, text in enumerate(cells, start=1):
+            if text == "":
+                continue
+            value = _as_number(text)
+            cell = sheet.cell(row=number, column=column)
+            cell.value = value
+            if isinstance(value, str) and value.startswith("="):
+                cell.data_type = "s"
     book.save(_abs(target))
     return ok([target], f"Wrote {target.name} ({len(rows)} rows)")
 
@@ -1435,6 +1846,74 @@ def _as_number(text: Any) -> Any:
     return value if value == value and abs(value) != float("inf") else text
 
 
+#: What one XLSX cell and sheet can hold.
+XLSX_MAX_CELL = 32767
+XLSX_MAX_ROWS = 1048576
+XLSX_MAX_COLUMNS = 16384
+#: Characters XML 1.0, and so XLSX, cannot store at all.
+_NOT_IN_XLSX = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff\ud800-\udfff]")
+
+
+def _column_name(index: int) -> str:
+    name = ""
+    while index:
+        index, rest = divmod(index - 1, 26)
+        name = chr(65 + rest) + name
+    return name
+
+
+def _check_xlsx_limits(source: Path, rows: Sequence[Sequence[str]]) -> None:
+    """Refuse, naming the cell, rather than let a value be cut or changed.
+
+    Text is written as it is, newlines and surrounding spaces included, so the
+    only ways to lose data are a cell longer than Excel allows, a character
+    XLSX cannot store, or more rows or columns than a sheet has.
+    """
+    if len(rows) > XLSX_MAX_ROWS:
+        raise RunnerFailed(f"{source.name} has {len(rows)} rows; an XLSX sheet holds "
+                           f"{XLSX_MAX_ROWS}. Nothing was written.", code="too_large")
+    for number, cells in enumerate(rows, start=1):
+        if len(cells) > XLSX_MAX_COLUMNS:
+            raise RunnerFailed(f"Row {number} of {source.name} has {len(cells)} columns; "
+                               f"an XLSX sheet holds {XLSX_MAX_COLUMNS}. Nothing was written.",
+                               code="too_large")
+        for column, text in enumerate(cells, start=1):
+            where = f"Cell {_column_name(column)}{number} of {source.name}"
+            if len(text) > XLSX_MAX_CELL:
+                raise RunnerFailed(f"{where} has {len(text)} characters; an XLSX cell holds "
+                                   f"{XLSX_MAX_CELL}. Nothing was written.", code="cell_too_long")
+            bad = _NOT_IN_XLSX.search(text)
+            if bad:
+                raise RunnerFailed(f"{where} contains character U+{ord(bad.group()):04X}, which "
+                                   "an XLSX file cannot store. Nothing was written.",
+                                   code="bad_character")
+
+
+def _csv_dialect(text: str, delimiter: str) -> tuple[str, str]:
+    """The separator and quote character, detected once for every route.
+
+    A ``.csv`` whose first record is one single column with commas is sniffed
+    for another separator: Excel in a locale with a decimal comma (es-ES, de,
+    fr) saves CSV with semicolons.
+    """
+    import csv
+    import io
+
+    if delimiter != ",":
+        return delimiter, '"'
+    first = next(csv.reader(io.StringIO(text, newline=""), delimiter=","), [])
+    if len(first) > 1:
+        return ",", '"'
+    try:
+        dialect = csv.Sniffer().sniff(text[:65536], delimiters=";\t|")
+    except csv.Error:
+        return ",", '"'
+    other = next(csv.reader(io.StringIO(text, newline=""), dialect), [])
+    if len(other) > 1:
+        return dialect.delimiter, dialect.quotechar or '"'
+    return ",", '"'
+
+
 def _read_delimited(source: Path, delimiter: str) -> list[list[str]]:
     """Rows of a CSV or TSV, quoted fields that span lines included.
 
@@ -1444,25 +1923,15 @@ def _read_delimited(source: Path, delimiter: str) -> list[list[str]]:
     ``newline=""`` keeps the line endings for the reader to interpret, as the
     csv module's own documentation requires.
 
-    A ``.csv`` whose first record is one single column with commas is sniffed
-    for another separator: Excel in a locale with a decimal comma (es-ES, de,
-    fr) saves CSV with semicolons.
+    The separator comes from ``_csv_dialect``, the same detection the
+    LibreOffice routes are given.
     """
     import csv
     import io
 
     text = _read_text(source)
-    rows = list(csv.reader(io.StringIO(text, newline=""), delimiter=delimiter))
-    if delimiter == "," and rows and len(rows[0]) <= 1:
-        sample = text[:65536]
-        try:
-            dialect = csv.Sniffer().sniff(sample, delimiters=";\t|")
-        except csv.Error:
-            return rows
-        other = list(csv.reader(io.StringIO(text, newline=""), dialect))
-        if other and len(other[0]) > 1:
-            return other
-    return rows
+    found, quotechar = _csv_dialect(text, delimiter)
+    return list(csv.reader(io.StringIO(text, newline=""), delimiter=found, quotechar=quotechar))
 
 
 def _write_delimited(target: Path, rows: Iterable[Sequence[Any]], delimiter: str) -> None:
