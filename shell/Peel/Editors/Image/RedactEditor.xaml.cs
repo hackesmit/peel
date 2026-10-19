@@ -29,7 +29,7 @@ internal partial class RedactEditor : EditorWindowBase
 
     private readonly RedactPlan _plan;
     private readonly PreviewMap _map;
-    private readonly List<ToggleButton> _modes = new();
+    private readonly List<RadioButton> _modes = new();
     private Point _from;
     private bool _drawing;
 
@@ -79,22 +79,19 @@ internal partial class RedactEditor : EditorWindowBase
         foreach (var mode in _plan.Modes)
         {
             var label = mode.Length == 0 ? mode : char.ToUpperInvariant(mode[0]) + mode[1..];
-            var button = new ToggleButton
+            var button = new RadioButton
             {
                 Content = label,
                 Style = (Style)FindResource("EditorToggle"),
+                GroupName = "RedactMode",
                 IsChecked = mode == _plan.Mode,
                 Tag = mode,
             };
             System.Windows.Automation.AutomationProperties.SetAutomationId(button, $"RedactMode{label}");
             System.Windows.Automation.AutomationProperties.SetName(button, label);
-            button.Click += (sender, _) =>
+            button.Checked += (sender, _) =>
             {
-                _plan.Mode = (string)((ToggleButton)sender).Tag;
-                foreach (var other in _modes)
-                {
-                    other.IsChecked = ReferenceEquals(other, sender);
-                }
+                _plan.Mode = (string)((RadioButton)sender).Tag;
                 Redraw();
             };
             _modes.Add(button);

@@ -45,8 +45,9 @@ internal partial class CropEditor : EditorWindowBase
     private readonly Path _mask = new();
     private readonly Rectangle _box = new();
     private readonly List<Rectangle> _handles = new();
-    private readonly List<ToggleButton> _aspects = new();
+    private readonly List<RadioButton> _aspects = new();
     private bool _writing;
+    private bool _syncing;
 
     internal CropEditor(string path, PreviewSource preview, ParamSchema schema)
     {
@@ -121,23 +122,23 @@ internal partial class CropEditor : EditorWindowBase
         });
         foreach (var aspect in _plan.Aspects)
         {
-            var button = new ToggleButton
+            var button = new RadioButton
             {
                 Content = aspect.Label,
                 Style = (Style)FindResource("EditorToggle"),
+                GroupName = "CropAspect",
                 IsChecked = aspect.Ratio is null,
                 Tag = aspect,
             };
             System.Windows.Automation.AutomationProperties.SetAutomationId(button, $"CropAspect{aspect.Label}");
             System.Windows.Automation.AutomationProperties.SetName(button, aspect.Label);
-            button.Click += (sender, _) =>
+            button.Checked += (sender, _) =>
             {
-                var chosen = (CropAspect)((ToggleButton)sender).Tag;
-                _plan.SetAspect(chosen.Ratio);
-                foreach (var other in _aspects)
+                if (_syncing)
                 {
-                    other.IsChecked = ReferenceEquals(other, sender);
+                    return;
                 }
+                _plan.SetAspect(((CropAspect)((RadioButton)sender).Tag).Ratio);
                 Render();
             };
             _aspects.Add(button);
@@ -223,11 +224,10 @@ internal partial class CropEditor : EditorWindowBase
         }
         // A typed number is a free form box: holding the ratio would move the
         // side the user did not touch, which reads as the field being ignored.
+        // Checked here is a side effect of typing, so it must not run the
+        // handler: that would redraw the fields under the caret.
         _plan.SetAspect(null);
-        foreach (var button in _aspects)
-        {
-            button.IsChecked = ((CropAspect)button.Tag).Ratio is null;
-        }
+        ShowFree();
         _plan.Set(
             Whole(FieldX, _plan.X),
             Whole(FieldY, _plan.Y),
@@ -275,13 +275,24 @@ internal partial class CropEditor : EditorWindowBase
             : $"Cropping to {_plan.Describe()}. Enter crops, Escape cancels.";
     }
 
-    private void OnReset(object sender, RoutedEventArgs e)
+    /// <summary>
+    /// Put the ratio group back on Free without running its handler, for when
+    /// something else has already changed the box.
+    /// </summary>
+    private void ShowFree()
     {
-        _plan.Reset();
+        _syncing = true;
         foreach (var button in _aspects)
         {
             button.IsChecked = ((CropAspect)button.Tag).Ratio is null;
         }
+        _syncing = false;
+    }
+
+    private void OnReset(object sender, RoutedEventArgs e)
+    {
+        _plan.Reset();
+        ShowFree();
         Render();
     }
 

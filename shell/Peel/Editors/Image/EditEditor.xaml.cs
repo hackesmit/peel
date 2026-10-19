@@ -38,8 +38,8 @@ internal partial class EditEditor : EditorWindowBase
     private readonly WriteableBitmap _canvas;
     private readonly int _pixels;
     private readonly DispatcherTimer _settle;
-    private readonly List<ToggleButton> _rotations = new();
-    private readonly List<ToggleButton> _flips = new();
+    private readonly List<RadioButton> _rotations = new();
+    private readonly List<RadioButton> _flips = new();
     private readonly Dictionary<string, Slider> _factors = new(StringComparer.Ordinal);
     private readonly Dictionary<string, TextBlock> _readouts = new(StringComparer.Ordinal);
 
@@ -116,14 +116,10 @@ internal partial class EditEditor : EditorWindowBase
         });
         foreach (var choice in _plan.Rotations)
         {
-            var button = Choice($"EditRotate{choice}", choice, choice == _plan.Rotate);
-            button.Click += (sender, _) =>
+            var button = Choice("EditRotate", $"EditRotate{choice}", choice, choice, choice == _plan.Rotate);
+            button.Checked += (sender, _) =>
             {
-                _plan.Rotate = (string)((ToggleButton)sender).Tag;
-                foreach (var other in _rotations)
-                {
-                    other.IsChecked = ReferenceEquals(other, sender);
-                }
+                _plan.Rotate = (string)((RadioButton)sender).Tag;
                 Turn();
             };
             _rotations.Add(button);
@@ -140,15 +136,10 @@ internal partial class EditEditor : EditorWindowBase
         });
         foreach (var choice in _plan.Flips)
         {
-            var button = Choice($"EditFlip{choice}", Sentence(choice), choice == _plan.Flip);
-            button.Tag = choice;
-            button.Click += (sender, _) =>
+            var button = Choice("EditFlip", $"EditFlip{choice}", Sentence(choice), choice, choice == _plan.Flip);
+            button.Checked += (sender, _) =>
             {
-                _plan.Flip = (string)((ToggleButton)sender).Tag;
-                foreach (var other in _flips)
-                {
-                    other.IsChecked = ReferenceEquals(other, sender);
-                }
+                _plan.Flip = (string)((RadioButton)sender).Tag;
                 Turn();
             };
             _flips.Add(button);
@@ -156,14 +147,20 @@ internal partial class EditEditor : EditorWindowBase
         }
     }
 
-    private ToggleButton Choice(string automationId, string label, bool on)
+    /// <summary>
+    /// One choice in a group. The value the engine wants goes in the Tag and
+    /// the label is only what the user reads, so a choice the engine renames
+    /// needs nothing here.
+    /// </summary>
+    private RadioButton Choice(string group, string automationId, string label, string value, bool on)
     {
-        var button = new ToggleButton
+        var button = new RadioButton
         {
             Content = label,
             Style = (Style)FindResource("EditorToggle"),
+            GroupName = group,
             IsChecked = on,
-            Tag = label,
+            Tag = value,
         };
         System.Windows.Automation.AutomationProperties.SetAutomationId(button, automationId);
         System.Windows.Automation.AutomationProperties.SetName(button, label);
@@ -290,16 +287,23 @@ internal partial class EditEditor : EditorWindowBase
         {
             slider.Value = _plan.Default(name);
         }
-        foreach (var button in _rotations)
-        {
-            button.IsChecked = (string)button.Tag == _plan.DefaultRotate;
-        }
-        foreach (var button in _flips)
-        {
-            button.IsChecked = (string)button.Tag == _plan.DefaultFlip;
-        }
+        // Checking the default unchecks the rest of its group by itself, and
+        // the handler it runs sets the plan to the value it already has.
+        Show(_rotations, _plan.DefaultRotate);
+        Show(_flips, _plan.DefaultFlip);
         Paint();
         Turn();
+    }
+
+    private static void Show(IEnumerable<RadioButton> group, string value)
+    {
+        foreach (var button in group)
+        {
+            if ((string)button.Tag == value)
+            {
+                button.IsChecked = true;
+            }
+        }
     }
 
     private void OnApply(object sender, RoutedEventArgs e) => ApplyAndClose();

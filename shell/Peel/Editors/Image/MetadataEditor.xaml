@@ -62,22 +62,9 @@
         <Border Background="{StaticResource EditorCanvas}" BorderBrush="{StaticResource EditorEdge}"
                 BorderThickness="1" Height="150">
             <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="8,6">
-                <ItemsControl x:Name="TagList" AutomationProperties.AutomationId="MetaTags">
-                    <ItemsControl.ItemTemplate>
-                        <DataTemplate>
-                            <Grid Margin="0,1">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="170" />
-                                    <ColumnDefinition Width="*" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Grid.Column="0" Text="{Binding Key}" FontFamily="Consolas"
-                                           FontSize="11.5" Foreground="#FF3FA7FF" TextTrimming="CharacterEllipsis" />
-                                <TextBlock Grid.Column="1" Text="{Binding Value}" FontFamily="Consolas"
-                                           FontSize="11.5" Foreground="#D8FFFFFF" TextTrimming="CharacterEllipsis" />
-                            </Grid>
-                        </DataTemplate>
-                    </ItemsControl.ItemTemplate>
-                </ItemsControl>
+                <!-- Two columns of plain text, filled in code: there is
+                     nothing here for a template or a binding to do. -->
+                <StackPanel x:Name="TagList" />
             </ScrollViewer>
         </Border>
 
