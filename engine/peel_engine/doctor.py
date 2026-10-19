@@ -2,7 +2,8 @@
 
 The install script and the tray app both read this, so it reports rather than
 fails. A missing backend is not an error here; it only disables the entries
-that need it.
+that need it. A family module that failed to load is listed under
+``warnings`` and named in ``message``.
 """
 
 from __future__ import annotations
@@ -55,13 +56,23 @@ def check() -> dict[str, Any]:
         "missing": missing,
         "actions_total": len(registry),
         "actions_blocked": sorted(blocked),
-        "message": _summary(reports, blocked),
+        "warnings": list(registry.warnings),
+        "message": _summary(reports, blocked, registry.warnings),
     }
 
 
-def _summary(reports: list[dict[str, Any]], blocked: list[str]) -> str:
+def _summary(
+    reports: list[dict[str, Any]], blocked: list[str], warnings: list[dict[str, str]]
+) -> str:
     found = sum(1 for r in reports if r["found"])
     total = len(reports)
     if found == total:
-        return f"All {total} backends found."
-    return f"{found} of {total} backends found, {len(blocked)} actions unavailable."
+        text = f"All {total} backends found."
+    else:
+        text = f"{found} of {total} backends found, {len(blocked)} actions unavailable."
+    if warnings:
+        noun = "family" if len(warnings) == 1 else "families"
+        text += f" {len(warnings)} {noun} failed to load: " + "; ".join(
+            w["message"] for w in warnings
+        )
+    return text

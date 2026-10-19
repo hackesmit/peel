@@ -4,7 +4,9 @@ Lookup order for an executable backend:
 
 1. ``PEEL_BACKEND_<NAME>`` in the environment, pointing at the executable.
 2. ``PATH`` (``shutil.which``).
-3. The standard Windows install directories, as glob patterns.
+3. The standard Windows install directories, as glob patterns. Folder
+   variables (%ProgramFiles%, %ProgramFiles(x86)%, %LOCALAPPDATA%) come from
+   the environment, with the stock locations searched as a fallback.
 
 Module backends (pillow, PyMuPDF, ...) are probed with ``find_spec``, which
 locates without importing, so ``peel options`` stays cheap.
@@ -16,6 +18,7 @@ inside the runner function, never at module scope.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -52,7 +55,7 @@ BACKENDS: tuple[Backend, ...] = (
         used_for="audio and video conversion and tools",
         commands=("ffmpeg",),
         windows_globs=(
-            r"C:\Program Files\ffmpeg\bin",
+            r"%ProgramFiles%\ffmpeg\bin",
             r"C:\ffmpeg\bin",
             r"%LOCALAPPDATA%\Microsoft\WinGet\Links",
             r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg*\*\bin",
@@ -67,7 +70,7 @@ BACKENDS: tuple[Backend, ...] = (
         used_for="reading media duration and streams",
         commands=("ffprobe",),
         windows_globs=(
-            r"C:\Program Files\ffmpeg\bin",
+            r"%ProgramFiles%\ffmpeg\bin",
             r"C:\ffmpeg\bin",
             r"%LOCALAPPDATA%\Microsoft\WinGet\Links",
             r"%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg*\*\bin",
@@ -81,7 +84,7 @@ BACKENDS: tuple[Backend, ...] = (
         label="ImageMagick",
         used_for="image conversion fallback",
         commands=("magick",),
-        windows_globs=(r"C:\Program Files\ImageMagick*",),
+        windows_globs=(r"%ProgramFiles%\ImageMagick*",),
         install="winget install ImageMagick.ImageMagick",
     ),
     Backend(
@@ -90,7 +93,7 @@ BACKENDS: tuple[Backend, ...] = (
         label="libvips",
         used_for="fast image conversion",
         commands=("vips",),
-        windows_globs=(r"C:\Program Files\vips*\bin", r"C:\vips\bin"),
+        windows_globs=(r"%ProgramFiles%\vips*\bin", r"C:\vips\bin"),
         install="winget install libvips.libvips",
     ),
     Backend(
@@ -100,8 +103,8 @@ BACKENDS: tuple[Backend, ...] = (
         used_for="documents, slides and spreadsheets",
         commands=("soffice", "libreoffice"),
         windows_globs=(
-            r"C:\Program Files\LibreOffice\program",
-            r"C:\Program Files (x86)\LibreOffice\program",
+            r"%ProgramFiles%\LibreOffice\program",
+            r"%ProgramFiles(x86)%\LibreOffice\program",
         ),
         install="winget install TheDocumentFoundation.LibreOffice",
     ),
@@ -111,7 +114,7 @@ BACKENDS: tuple[Backend, ...] = (
         label="Pandoc",
         used_for="document conversion",
         commands=("pandoc",),
-        windows_globs=(r"C:\Program Files\Pandoc", r"%LOCALAPPDATA%\Pandoc"),
+        windows_globs=(r"%ProgramFiles%\Pandoc", r"%LOCALAPPDATA%\Pandoc"),
         install="winget install JohnMacFarlane.Pandoc",
     ),
     Backend(
@@ -120,7 +123,7 @@ BACKENDS: tuple[Backend, ...] = (
         label="7-Zip",
         used_for="archives",
         commands=("7z", "7zz", "7za"),
-        windows_globs=(r"C:\Program Files\7-Zip", r"C:\Program Files (x86)\7-Zip"),
+        windows_globs=(r"%ProgramFiles%\7-Zip", r"%ProgramFiles(x86)%\7-Zip"),
         version_arg="",
         install="winget install 7zip.7zip",
     ),
@@ -176,21 +179,81 @@ def _env_override(name: str) -> Path | None:
     return path if path.exists() else None
 
 
+#: Where a Windows folder variable points when the environment does not say
+#: (a service account, a stripped environment). The real variable wins and the
+#: default is searched as well, so a non-default install and a default one are
+#: both found.
+_WINDOWS_DEFAULTS: dict[str, tuple[str, ...]] = {
+    "PROGRAMFILES": (r"C:\Program Files",),
+    "PROGRAMFILES(X86)": (r"C:\Program Files (x86)",),
+    "PROGRAMW6432": (r"C:\Program Files",),
+    "LOCALAPPDATA": (),  # derived from USERPROFILE below
+}
+
+_VAR = re.compile(r"%([^%]+)%")
+
+
+def _env(name: str) -> str | None:
+    """Case-insensitive environment lookup, as Windows does it."""
+    wanted = name.upper()
+    for key, value in os.environ.items():
+        if key.upper() == wanted and value:
+            return value
+    return None
+
+
+def _var_values(name: str) -> list[str]:
+    values: list[str] = []
+    real = _env(name)
+    if real:
+        values.append(real)
+    defaults = list(_WINDOWS_DEFAULTS.get(name.upper(), ()))
+    if name.upper() == "LOCALAPPDATA":
+        profile = _env("USERPROFILE")
+        if profile:
+            defaults.append(profile.rstrip("\\/") + r"\AppData\Local")
+    for value in defaults:
+        if value.lower() not in (v.lower() for v in values):
+            values.append(value)
+    return values
+
+
+def expand_windows(pattern: str) -> list[str]:
+    """Every concrete form of a pattern with %VAR% folders, real value first.
+
+    A variable that is unset and has no default drops the pattern.
+    """
+    results = [pattern]
+    for name in _VAR.findall(pattern):
+        values = _var_values(name)
+        results = [r.replace(f"%{name}%", v) for r in results for v in values]
+    seen: list[str] = []
+    for r in results:
+        if r.lower() not in (x.lower() for x in seen):
+            seen.append(r)
+    return seen
+
+
 def _search_windows(backend: Backend) -> Path | None:
     for pattern in backend.windows_globs:
-        expanded = os.path.expandvars(pattern)
-        if "%" in expanded:  # an unset variable, nothing to search
-            continue
-        root = Path(expanded[:3]) if len(expanded) > 2 and expanded[1] == ":" else Path("/")
-        try:
-            relative = str(Path(expanded).relative_to(root))
-        except ValueError:
-            continue
-        for directory in sorted(root.glob(relative), reverse=True):
-            for command in backend.commands:
-                candidate = directory / f"{command}.exe"
-                if candidate.exists():
-                    return candidate
+        for expanded in expand_windows(pattern):
+            found = _search_windows_dir(backend, expanded)
+            if found is not None:
+                return found
+    return None
+
+
+def _search_windows_dir(backend: Backend, expanded: str) -> Path | None:
+    root = Path(expanded[:3]) if len(expanded) > 2 and expanded[1] == ":" else Path("/")
+    try:
+        relative = str(Path(expanded).relative_to(root))
+    except ValueError:
+        return None
+    for directory in sorted(root.glob(relative), reverse=True):
+        for command in backend.commands:
+            candidate = directory / f"{command}.exe"
+            if candidate.exists():
+                return candidate
     return None
 
 
