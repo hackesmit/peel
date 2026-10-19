@@ -88,9 +88,16 @@ internal sealed class EditorHost : IEditorHost
                 _jobs.Report($"Opening {entry.Label} for {System.IO.Path.GetFileName(files[0])}");
             };
             waiting.Start();
-            var window = entry.Id == "image.metadata"
-                ? await MetadataWindowAsync(entry, files, schema).ConfigureAwait(true)
-                : await PictureWindowAsync(entry, files, schema).ConfigureAwait(true);
+            PreviewSource? preview = null;
+            EditorWindowBase? window;
+            if (entry.Id == "image.metadata")
+            {
+                window = await MetadataWindowAsync(entry, files, schema).ConfigureAwait(true);
+            }
+            else
+            {
+                (window, preview) = await PictureWindowAsync(entry, files, schema).ConfigureAwait(true);
+            }
             if (window is null)
             {
                 return;
@@ -104,6 +111,15 @@ internal sealed class EditorHost : IEditorHost
                     .OrderBy(pair => pair.Key, StringComparer.Ordinal)
                     .Select(pair => $"{pair.Key}={Short(pair.Value)}"));
                 Log.Write($"{entry.Id}: editor applied {said}");
+                // The regions, the crop box and the strokes were drawn on the
+                // bytes the preview was decoded from. Check they are still the
+                // bytes on disk right before the engine opens the file.
+                if (preview is not null && !preview.StillMatches(files[0], out var problem))
+                {
+                    Log.Write($"{entry.Id}: refused, {files[0]} changed since its preview was decoded");
+                    _jobs.Report(problem);
+                    return;
+                }
                 _jobs.Start(entry, files, collected);
             };
             window.Cancelled += () => Log.Write($"{entry.Id}: editor cancelled");
@@ -127,7 +143,7 @@ internal sealed class EditorHost : IEditorHost
     private static string Short(string value) =>
         value.Length <= 160 ? value : value[..160] + "...";
 
-    private async Task<EditorWindowBase?> PictureWindowAsync(
+    private async Task<(EditorWindowBase? Window, PreviewSource? Preview)> PictureWindowAsync(
         ActionEntry entry, IReadOnlyList<string> files, ParamSchema schema)
     {
         var (preview, problem) = await PreviewSource.LoadAsync(files[0], _engine, CancellationToken.None)
@@ -136,16 +152,17 @@ internal sealed class EditorHost : IEditorHost
         {
             Log.Write($"{entry.Id}: no preview for {files[0]}: {problem}");
             _jobs.Report(problem.Length > 0 ? problem : $"Peel cannot show {System.IO.Path.GetFileName(files[0])}.");
-            return null;
+            return (null, null);
         }
         Log.Write($"{entry.Id}: preview {preview.FileWidth}x{preview.FileHeight} via {preview.How}");
-        return entry.Id switch
+        EditorWindowBase window = entry.Id switch
         {
             "image.crop" => new CropEditor(files[0], preview, schema),
             "image.annotate" => new AnnotateEditor(files[0], preview),
             "image.redact" => new RedactEditor(files[0], preview, schema),
             _ => new EditEditor(files[0], files.Count, preview, schema),
         };
+        return (window, preview);
     }
 
     private async Task<EditorWindowBase?> MetadataWindowAsync(

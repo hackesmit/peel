@@ -40,17 +40,55 @@ internal sealed class EditPlan
 
     internal string Flip { get; set; } = "none";
 
-    internal double Brightness { get; set; } = Adjust.Neutral;
+    // The three factors are quantized once, here, when they are set. The
+    // preview, the readout and the parameters all read these same values, so a
+    // slider left at 0.996 by a drag or by UI Automation is 1.00 everywhere,
+    // never 0.996 on screen and 1.00 in the file.
+    private double _brightness = Adjust.Neutral;
+    private double _contrast = Adjust.Neutral;
+    private double _saturation = Adjust.Neutral;
 
-    internal double Contrast { get; set; } = Adjust.Neutral;
+    internal double Brightness
+    {
+        get => _brightness;
+        set => _brightness = Quantize("brightness", value);
+    }
 
-    internal double Saturation { get; set; } = Adjust.Neutral;
+    internal double Contrast
+    {
+        get => _contrast;
+        set => _contrast = Quantize("contrast", value);
+    }
+
+    internal double Saturation
+    {
+        get => _saturation;
+        set => _saturation = Quantize("saturation", value);
+    }
+
+    /// <summary>
+    /// A factor as the plan keeps it: clamped to the schema's range and rounded
+    /// to the step. NaN (which a slider never holds, but a bound value might)
+    /// becomes the default rather than reaching the preview or the engine.
+    /// </summary>
+    internal double Quantize(string name, double value)
+    {
+        if (!double.IsFinite(value))
+        {
+            value = _schema.Number(name, Adjust.Neutral);
+        }
+        var clamped = Math.Clamp(value, Minimum(name), Maximum(name));
+        return Math.Round(clamped, 2, MidpointRounding.AwayFromZero);
+    }
+
+    /// <summary>The value a readout shows for a factor: the one that is sent.</summary>
+    internal static string Readout(double factor) => factor.ToString("0.00", CultureInfo.InvariantCulture);
 
     internal double Minimum(string name) => _schema.Minimum(name, 0.0);
 
     internal double Maximum(string name) => _schema.Maximum(name, 4.0);
 
-    internal double Default(string name) => _schema.Number(name, Adjust.Neutral);
+    internal double Default(string name) => Quantize(name, _schema.Number(name, Adjust.Neutral));
 
     /// <summary>Degrees clockwise, for turning the preview.</summary>
     internal int RotateDegrees =>
@@ -95,13 +133,13 @@ internal sealed class EditPlan
 
     private void AddFactor(IDictionary<string, string> parameters, string name, double value)
     {
-        // The slider moves in hundredths, so compare at that resolution rather
-        // than asking two doubles to be equal.
-        var rounded = Math.Round(Math.Clamp(value, Minimum(name), Maximum(name)), 2);
-        if (Math.Abs(rounded - Default(name)) < 0.005)
+        // value is already quantized (the setters), and so is the default, so
+        // the comparison is exact and the string is the same number the
+        // preview was painted with.
+        if (value == Default(name))
         {
             return;
         }
-        parameters[name] = rounded.ToString("0.##", CultureInfo.InvariantCulture);
+        parameters[name] = value.ToString("0.##", CultureInfo.InvariantCulture);
     }
 }

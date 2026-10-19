@@ -34,6 +34,13 @@ internal sealed class MetadataFields
 
     internal string Longitude { get; set; } = string.Empty;
 
+    /// <summary>
+    /// Whether the file carried a location when the form was filled. Emptying
+    /// both boxes then means "remove it", which set alone cannot do: it keeps
+    /// every tag it is not given.
+    /// </summary>
+    internal bool HadLocation { get; private set; }
+
     /// <summary>Every tag the engine could name, for the read only list.</summary>
     internal IReadOnlyList<KeyValuePair<string, string>> Tags { get; private set; } =
         Array.Empty<KeyValuePair<string, string>>();
@@ -59,6 +66,7 @@ internal sealed class MetadataFields
         fields.Author = Text(metadata, "author");
         fields.Latitude = Decimal(metadata, "latitude");
         fields.Longitude = Decimal(metadata, "longitude");
+        fields.HadLocation = fields.Latitude.Length > 0 || fields.Longitude.Length > 0;
         if (metadata.TryGetProperty("exif", out var exif) && exif.ValueKind == JsonValueKind.Object)
         {
             fields.Tags = exif.EnumerateObject()
@@ -73,7 +81,12 @@ internal sealed class MetadataFields
     /// The parameters for Save, or the reason the form is not ready. Both
     /// halves of the location or neither, and something to write.
     /// </summary>
-    internal bool TrySet(out Dictionary<string, string> parameters, out string problem)
+    /// <param name="canClearLocation">
+    /// Whether the engine's schema declares clear_location. Without it there
+    /// is no way to drop only the location, so an emptied location is refused
+    /// with a pointer to Remove every tag rather than silently kept.
+    /// </param>
+    internal bool TrySet(out Dictionary<string, string> parameters, out string problem, bool canClearLocation = true)
     {
         parameters = new Dictionary<string, string>(StringComparer.Ordinal) { ["action"] = "set" };
         problem = string.Empty;
@@ -91,6 +104,11 @@ internal sealed class MetadataFields
             problem = $"\"{Longitude.Trim()}\" is not a longitude. Use a number such as -116.6123.";
             return false;
         }
+        if ((hasLatitude && !double.IsFinite(latitude)) || (hasLongitude && !double.IsFinite(longitude)))
+        {
+            problem = "A location needs real numbers, not NaN or infinity.";
+            return false;
+        }
         if (hasLatitude != hasLongitude)
         {
             problem = "A location needs both a latitude and a longitude.";
@@ -106,7 +124,14 @@ internal sealed class MetadataFields
             problem = "A longitude runs from -180 to 180.";
             return false;
         }
-        if (title.Length == 0 && author.Length == 0 && !hasLatitude)
+        var clearLocation = HadLocation && !hasLatitude;
+        if (clearLocation && !canClearLocation)
+        {
+            problem = "This version of the engine cannot remove only the location. "
+                + "Use Remove every tag, or put the location back.";
+            return false;
+        }
+        if (title.Length == 0 && author.Length == 0 && !hasLatitude && !clearLocation)
         {
             problem = "Give a title, an author or a location to save.";
             return false;
@@ -123,6 +148,10 @@ internal sealed class MetadataFields
         {
             parameters["latitude"] = latitude.ToString("0.########", CultureInfo.InvariantCulture);
             parameters["longitude"] = longitude.ToString("0.########", CultureInfo.InvariantCulture);
+        }
+        if (clearLocation)
+        {
+            parameters["clear_location"] = "true";
         }
         return true;
     }

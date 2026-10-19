@@ -504,6 +504,11 @@ try {
     DragOnCanvas $rect 20 20 170 120
     $hidden = (El $hide 'RedactHint').Current.Name
     Check 'the region is drawn' ($hidden -match '^1 region, box') $hidden
+    # Round 1: a drag that runs past the bottom right corner must reach the
+    # last column and row, not stop one pixel short of them.
+    DragOnCanvas $rect 340 240 ($rect.iw + 30) ($rect.ih + 30)
+    $hidden = (El $hide 'RedactHint').Current.Name
+    Check 'a drag past the corner is a second region' ($hidden -match '^2 regions, box') $hidden
     ReadShot (ShootWindow $hide 'shot-redact.png') 'Redact'
     Press (El $hide 'RedactApply')
     Check 'Redact sends the region and the way of hiding it' `
@@ -515,6 +520,11 @@ try {
     $kept = Ask @('pixel', $out, '300', '250')
     Check 'the rest of the picture is untouched' (Near $kept.rgb $grey) `
         "$($kept.rgb -join ',') against the grey quarter $($grey -join ',')"
+    foreach ($corner in @(@(399, 299), @(399, 245), @(345, 299))) {
+        $edge = Ask @('pixel', $out, "$($corner[0])", "$($corner[1])")
+        Check "the edge pixel $($corner[0]),$($corner[1]) is hidden" (Near $edge.rgb @(0, 0, 0) 6) `
+            "$($edge.rgb -join ',')"
+    }
 
     # --- Metadata -------------------------------------------------------------
     Start-Sleep -Milliseconds 800
@@ -548,6 +558,36 @@ try {
         (([Math]::Abs([double]$tags.latitude - 32.4567) -lt 0.001) -and
          ([Math]::Abs([double]$tags.longitude + 116.6123) -lt 0.001)) `
         "$($tags.latitude), $($tags.longitude)"
+
+    # Round 1: emptying both location boxes removes the location and keeps
+    # the rest. set alone keeps every tag it is not given, so the window
+    # sends clear_location.
+    Start-Sleep -Milliseconds 800
+    $null = OpenEditorFrom 'tags (Metadata).jpg' 'Metadata'
+    $again = Win 'Metadata of tags (Metadata).jpg'
+    Check 'the Metadata window opens on the tagged output' ($again -ne $null) 'found by its title'
+    if (-not $again) { throw 'no second Metadata window' }
+    $lat = GetText (El $again 'MetaLatitude')
+    Check 'the form shows the location it is about to remove' ($lat -match '^32\.45') "latitude '$lat'"
+    SetText (El $again 'MetaLatitude') ''
+    SetText (El $again 'MetaLongitude') ''
+    SetText (El $again 'MetaLatitude') 'NaN'
+    SetText (El $again 'MetaLongitude') '0'
+    Press (El $again 'MetaApply')
+    $problem = (El $again 'MetaProblem').Current.Name
+    Check 'NaN is refused in the window' ($problem -match 'NaN') $problem
+    SetText (El $again 'MetaLatitude') ''
+    SetText (El $again 'MetaLongitude') ''
+    Press (El $again 'MetaApply')
+    Check 'emptied location boxes send clear_location' `
+        ((WaitLog 'image\.metadata: editor applied action=set .*clear_location=true' 5000) -ne $null) 'from the log'
+    $out = Join-Path $test 'tags (Metadata) (Metadata).jpg'
+    Check 'the cleared copy was written' (WaitForOutput $out) $out
+    $tags = Ask @('tags', $out)
+    Check 'the location is gone and the title and author stay' `
+        (($null -eq $tags.latitude) -and ($null -eq $tags.longitude) -and
+         ($tags.title -eq 'Vineyard at dusk') -and ($tags.author -eq 'Daniel')) `
+        "latitude '$($tags.latitude)', longitude '$($tags.longitude)', title '$($tags.title)', author '$($tags.author)'"
 
     # --- a photo stored turned ------------------------------------------------
     # The engine opens every image upright (image.load applies and drops the
