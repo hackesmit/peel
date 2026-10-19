@@ -355,12 +355,15 @@ def test_listing_options_for_a_document_does_not_import_a_backend():
 
 def test_options_on_a_pdf_offers_exactly_the_spec_targets(registry):
     payload = registry.options([Path("whatever.pdf")], include_unavailable=True)
+    # Keyed by wheel AND group: the tool wheel has a PDF group of its own
+    # (Split, Organize, Compress from the PDF tools bead), and keying by group
+    # alone let it overwrite the conversions.
     groups = {
-        group["group"]: {e["label"] for e in group["entries"]}
+        (wheel["family"], group["group"]): {e["label"] for e in group["entries"]}
         for wheel in payload["wheels"]
         for group in wheel["groups"]
     }
-    assert groups["PDF"] == {"DOCX", "PPTX", "XLSX", "JPG", "PNG", "EPUB", "TXT", "MD"}
+    assert groups[(CONVERT, "PDF")] == {"DOCX", "PPTX", "XLSX", "JPG", "PNG", "EPUB", "TXT", "MD"}
 
 
 # --- documents --------------------------------------------------------------
@@ -811,12 +814,14 @@ def test_a_sheet_name_is_always_one_excel_accepts(stem, title):
     assert docs._sheet_title(stem) == title
 
 
-def test_a_formula_with_no_cached_result_is_exported_not_dropped(registry, tmp_path):
+def test_a_formula_with_no_cached_result_is_exported_not_dropped(registry, tmp_path, monkeypatch):
     """A workbook written by a script and never opened in Excel has formulas
     with no cached value. Exporting a blank cell and reporting success would be
-    silent data loss."""
+    silent data loss. Without LibreOffice to recalculate, the formula text is
+    what is written."""
     from openpyxl import Workbook
 
+    _without_soffice(monkeypatch)
     source = tmp_path / "formula.xlsx"
     book = Workbook()
     book.active["A1"] = "=1+1"
@@ -1075,3 +1080,307 @@ def test_a_utf16_subtitle_file_is_decoded(registry, tmp_path):
     )
     out = run(registry, "docs.sub_to_txt", source).outputs[0]
     assert out.read_text(encoding="utf-8") == "Jos\u00e9 habla.\n"
+
+
+# --- round 1 adversarial review fixes ----------------------------------------
+
+
+def _without_soffice(monkeypatch) -> None:
+    """Make the engine believe LibreOffice is not installed."""
+    real = docs.backends.missing
+    monkeypatch.setattr(
+        docs.backends, "missing",
+        lambda names: [n for n in names if n == "soffice"]
+        + list(real(tuple(n for n in names if n != "soffice"))),
+    )
+
+
+@needs_soffice
+def test_a_formula_with_no_cached_result_is_recalculated_by_libreoffice(registry, tmp_path):
+    from openpyxl import Workbook
+
+    source = tmp_path / "formula.xlsx"
+    book = Workbook()
+    book.active["A1"] = "=1+1"
+    book.active["B1"] = "label"
+    book.save(source)
+    out = run(registry, "docs.sheet_to_csv", source).outputs[0]
+    assert out.read_text(encoding="utf-8-sig").strip() == "2,label"
+
+
+@pytest.mark.parametrize("office", [True, False])
+def test_a_trailing_total_row_with_no_cached_value_is_kept(registry, tmp_path, monkeypatch, office):
+    """The trailing all-formula row used to look blank to the value pass and
+    was trimmed before the formula pass could see it."""
+    from openpyxl import Workbook
+
+    if office and backends.missing(("soffice",)):
+        pytest.skip("needs soffice")
+    if not office:
+        _without_soffice(monkeypatch)
+    book = Workbook()
+    for row in (1, 2, 3):
+        book.active.cell(row, 1, row)
+    book.active.cell(4, 1, "=SUM(A1:A3)")
+    source = tmp_path / "totals.xlsx"
+    book.save(source)
+    lines = run(registry, "docs.sheet_to_csv", source).outputs[0].read_text("utf-8-sig").splitlines()
+    assert lines == ["1", "2", "3", "6" if office else "=SUM(A1:A3)"]
+
+
+def test_excel_booleans_and_midnight_dates_are_written_the_way_excel_writes_them(registry, tmp_path):
+    import datetime as dt
+
+    from openpyxl import Workbook
+
+    book = Workbook()
+    sheet = book.active
+    sheet.append([True, False, dt.datetime(2026, 1, 5), dt.datetime(2026, 1, 5, 13, 30)])
+    source = tmp_path / "kinds.xlsx"
+    book.save(source)
+    out = run(registry, "docs.sheet_to_csv", source).outputs[0]
+    assert out.read_text("utf-8-sig").strip() == "TRUE,FALSE,2026-01-05,2026-01-05 13:30:00"
+
+
+def test_a_semicolon_csv_is_split_into_columns(registry, tmp_path):
+    from openpyxl import load_workbook
+
+    source = tmp_path / "semi.csv"
+    source.write_text("name;qty;price\napple;3;1,50\npear;5;2,25\n", encoding="utf-8")
+    rows = list(load_workbook(run(registry, "docs.sheet_to_xlsx", source).outputs[0]).active.values)
+    assert rows[0] == ("name", "qty", "price")
+    assert rows[1] == ("apple", 3, "1,50")
+
+
+def test_a_one_column_csv_stays_one_column(registry, tmp_path):
+    source = tmp_path / "list.csv"
+    source.write_text("name\napple\npear\n", encoding="utf-8")
+    assert docs._read_delimited(source, ",") == [["name"], ["apple"], ["pear"]]
+
+
+def test_srt_cues_without_a_blank_line_between_them_are_still_two_cues(tmp_path):
+    source = tmp_path / "tight.srt"
+    source.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nHello\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nWorld\n",
+        encoding="utf-8",
+    )
+    cues = docs.read_cues(source)
+    assert [(c.start, c.text) for c in cues] == [(1.0, "Hello"), (3.0, "World")]
+
+
+def test_vtt_cues_without_a_blank_line_between_them_are_still_two_cues(registry, tmp_path):
+    source = tmp_path / "tight.vtt"
+    source.write_text(
+        "WEBVTT\n\n00:00.000 --> 00:01.000\nfirst\n00:01.000 --> 00:02.000\nsecond\n",
+        encoding="utf-8",
+    )
+    assert [c.text for c in docs.read_cues(source)] == ["first", "second"]
+    srt = run(registry, "docs.sub_to_srt", source).outputs[0].read_text(encoding="utf-8")
+    assert srt.count("-->") == 2 and "00:00:01.000" not in srt
+
+
+def test_a_number_inside_a_cue_is_kept_when_no_timing_follows(tmp_path):
+    source = tmp_path / "count.srt"
+    source.write_text("1\n00:00:01,000 --> 00:00:02,000\nCountdown\n3\n\n", encoding="utf-8")
+    assert [c.text for c in docs.read_cues(source)] == ["Countdown\n3"]
+
+
+def test_vtt_voice_and_colour_tags_do_not_reach_an_srt(registry, tmp_path):
+    source = tmp_path / "styled.vtt"
+    source.write_text(
+        "WEBVTT\n\n00:00.000 --> 00:01.000\n<v Roger>Hi <c.yellow>there</c> <i>you</i></v>\n",
+        encoding="utf-8",
+    )
+    srt = run(registry, "docs.sub_to_srt", source).outputs[0].read_text(encoding="utf-8")
+    assert "Hi there <i>you</i>" in srt
+    assert "<v" not in srt and "<c" not in srt
+
+
+def _secret(tmp_path: Path) -> tuple[Path, Path]:
+    """A private file outside the folder of a downloaded document."""
+    private = tmp_path / "private"
+    private.mkdir()
+    secret = private / "secret.png"
+    secret.write_bytes(b"\x89PNG\r\n\x1a\nPRIVATE-KEY-MATERIAL-0123456789")
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    return secret, downloads
+
+
+def _leaks(path: Path) -> bool:
+    import base64
+
+    raw = path.read_bytes()
+    needle = b"PRIVATE-KEY-MATERIAL"
+    if needle in raw or base64.b64encode(b"\x89PNG\r\n\x1a\nPRIVATE-KEY-MATERIAL")[:24] in raw:
+        return True
+    if zipfile.is_zipfile(path):
+        with zipfile.ZipFile(path) as archive:
+            return any(needle in archive.read(n) for n in archive.namelist())
+    return False
+
+
+@needs_pandoc
+@pytest.mark.parametrize("action", ["docs.doc_to_html", "docs.doc_to_docx", "docs.doc_to_epub",
+                                    "docs.doc_to_odt"])
+@pytest.mark.parametrize("link", ["absolute", "parent", "escaped", "raw_html", "css_meta", "file_url"])
+def test_a_markdown_file_cannot_pull_in_a_file_outside_its_folder(registry, tmp_path, action, link):
+    secret, downloads = _secret(tmp_path)
+    reference = {
+        "absolute": f"![x]({secret.as_posix()})",
+        "parent": "![x](../private/secret.png)",
+        "escaped": "![x](..%2Fprivate%2Fsecret.png)",
+        "raw_html": f'<img src="{secret.as_posix()}"> <img src=../private/secret.png>',
+        "css_meta": "",
+        "file_url": f"![x]({secret.as_uri()})",
+    }[link]
+    front = f"---\ncss: {secret.as_posix()}\n---\n\n" if link == "css_meta" else ""
+    source = downloads / "readme.md"
+    source.write_text(f"{front}# hi\n\n{reference}\n", encoding="utf-8")
+    result = run(registry, action, source)
+    assert not _leaks(result.outputs[0]), "a file outside the source folder was embedded"
+    assert "outside" in result.message or "Ignored" in result.message, result.message
+
+
+@needs_office
+def test_a_markdown_file_cannot_pull_a_file_into_a_pdf(registry, tmp_path):
+    from PIL import Image
+
+    secret, downloads = _secret(tmp_path)
+    Image.new("RGB", (40, 40), (200, 0, 0)).save(secret, format="PNG")
+    source = downloads / "readme.md"
+    source.write_text(f"# hi\n\n![x]({secret.as_posix()})\n", encoding="utf-8")
+    result = run(registry, "docs.doc_to_pdf", source)
+    import pymupdf
+
+    with pymupdf.open(result.outputs[0]) as pdf:
+        assert not pdf[0].get_images(), "an outside image was drawn into the PDF"
+    assert "outside" in result.message
+
+
+@needs_office
+def test_a_docx_linking_a_picture_outside_its_folder_does_not_embed_it(registry, tmp_path):
+    """A DOCX can link a picture instead of embedding it; LibreOffice would load
+    the link when it writes the PDF. Such a document goes through pandoc."""
+    import pymupdf
+    from PIL import Image
+
+    secret, downloads = _secret(tmp_path)
+    Image.new("RGB", (40, 40), (200, 0, 0)).save(secret, format="PNG")
+    clean = _make_docx_with_picture(downloads / "base.docx")
+    source = downloads / "linked.docx"
+    with zipfile.ZipFile(clean) as src, zipfile.ZipFile(source, "w") as out:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename == "word/_rels/document.xml.rels":
+                text = data.decode("utf-8")
+                text = re.sub(r'Target="media/[^"]+"',
+                              f'Target="{secret.as_uri()}" TargetMode="External"', text)
+                data = text.encode("utf-8")
+            if item.filename == "word/document.xml":
+                data = data.replace(b"r:embed=", b"r:link=")
+            out.writestr(item, data)
+    assert docs._links_outside_files(source, "docx")
+    assert not docs._links_outside_files(clean, "docx")
+    result = run(registry, "docs.doc_to_pdf", source)
+    with pymupdf.open(result.outputs[0]) as pdf:
+        assert not any(page.get_images() for page in pdf)
+
+
+@needs_pandoc
+def test_a_picture_in_a_subfolder_of_the_source_is_kept(registry, tmp_path):
+    from PIL import Image
+
+    folder = tmp_path / "doc"
+    (folder / "img").mkdir(parents=True)
+    Image.new("RGB", (60, 40), (10, 180, 10)).save(folder / "img" / "picture.png")
+    (folder / "notes.md").write_text("# Hi\n\n![](img/./picture.png)\n", encoding="utf-8")
+    result = run(registry, "docs.doc_to_html", folder / "notes.md")
+    assert "data:image/png;base64" in result.outputs[0].read_text(encoding="utf-8")
+    assert result.message == f"Wrote {result.outputs[0].name}"
+
+
+@needs_pandoc
+def test_a_web_image_is_not_downloaded_and_stays_a_link(registry, tmp_path):
+    import http.server
+    import socketserver
+    import threading
+
+    hits: list[str] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            hits.append(self.path)
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/beacon.png"
+    try:
+        source = tmp_path / "beacon.md"
+        source.write_text(f"![logo]({url})\n\n<img src=\"{url}\">\n", encoding="utf-8")
+        html = run(registry, "docs.doc_to_html", source)
+        docx = run(registry, "docs.doc_to_docx", source)
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert hits == []
+    assert url in html.outputs[0].read_text(encoding="utf-8")
+    assert "web image" in docx.message
+
+
+def test_document_conversions_offer_the_allow_remote_switch(registry):
+    params = {p.name: p for p in registry.get("docs.doc_to_docx").params}
+    assert params["allow_remote"].type == "bool" and params["allow_remote"].default is False
+
+
+def test_a_table_column_empty_in_every_row_is_dropped():
+    rows = [["name", "", "qty"], ["apple", None, "3"], ["pear", " ", "5"]]
+    assert docs._drop_empty_columns(rows) == [["name", "qty"], ["apple", "3"], ["pear", "5"]]
+    assert docs._drop_empty_columns([["a", "", "b"], ["", "x", ""]]) == [["a", "", "b"], ["", "x", ""]]
+    assert docs._drop_empty_columns([]) == []
+
+
+@needs_pymupdf
+@pytest.mark.parametrize("action", ["docs.pdf_to_txt", "docs.pdf_to_xlsx"])
+def test_a_pdf_with_no_text_says_it_needs_ocr(registry, tmp_path, action):
+    pytest.importorskip("openpyxl")
+    import pymupdf
+    from PIL import Image
+
+    picture = tmp_path / "scan.png"
+    Image.new("RGB", (200, 260), (240, 240, 240)).save(picture)
+    source = tmp_path / "scan.pdf"
+    with pymupdf.open() as pdf:
+        page = pdf.new_page()
+        page.insert_image(page.rect, filename=str(picture))
+        pdf.save(source)
+    result = registry.run(action, [source], None)
+    assert result.ok and "OCR" in result.message
+
+
+@needs_pymupdf
+def test_a_pdf_with_text_does_not_warn(registry, work):
+    assert "OCR" not in run(registry, "docs.pdf_to_txt", work("pdf")).message
+
+
+@needs_soffice
+def test_a_libreoffice_timeout_stops_the_whole_process_tree(registry, tmp_path, monkeypatch):
+    """soffice is a launcher for soffice.bin. Killing only the launcher left
+    the converter running, and it later wrote a scratch folder beside the
+    source after Peel had reported the failure."""
+    import time
+
+    monkeypatch.setattr(docs, "SOFFICE_TIMEOUT", 1)
+    monkeypatch.setattr(docs, "_SOFFICE_PROFILE", None)  # a slow first run
+    source = tmp_path / "a.txt"
+    source.write_text("hello\n", encoding="utf-8")
+    result = registry.run("docs.doc_to_pdf", [source], None)
+    assert not result.ok and result.code == "backend_timeout"
+    time.sleep(8)
+    assert [p.name for p in tmp_path.iterdir()] == ["a.txt"]
