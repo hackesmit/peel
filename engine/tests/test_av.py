@@ -509,12 +509,42 @@ def test_compress_makes_the_file_smaller_and_keeps_it_playable(real, media):
 
 
 @needs_ffmpeg
-def test_compress_to_a_target_size_lands_near_that_size(real, media):
-    source = media("noisy")
-    target_mb = 0.05
+@pytest.mark.parametrize("ext", ["mp4", "webm"])
+def test_compress_to_a_target_size_lands_near_that_size(real, tmp_path, ext):
+    """Five seconds of noise: long enough for rate control to settle, which a
+    one second clip is not. 1 MB is 1,000,000 bytes (the param help says so)."""
+    codecs = {
+        "mp4": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-c:a", "aac"],
+        "webm": ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-crf", "10", "-b:v", "0",
+                 "-c:a", "libopus"],
+    }[ext]
+    source = generate(
+        tmp_path / f"noise5.{ext}",
+        ["-f", "lavfi", "-i", "testsrc=size=320x240:rate=20:duration=5,noise=alls=50:allf=t",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=5", "-pix_fmt", "yuv420p",
+         *codecs, "-shortest"],
+    )
+    target_mb = 0.15
     target = run(real, "av.video_compress", source, target_mb=target_mb).outputs[0]
     assert target.stat().st_size < source.stat().st_size
-    assert target.stat().st_size < target_mb * 1024 * 1024 * 2.5
+    wanted = target_mb * 1_000_000
+    assert abs(target.stat().st_size - wanted) <= wanted * 0.10, target.stat().st_size
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("ext", ["avi", "wmv"])
+def test_compress_to_a_target_size_never_overshoots_on_the_legacy_encoders(real, media, ext):
+    """mpeg4 and wmv2 ran 1.5x to 2x over a one pass bitrate; two pass fixes it."""
+    source = run(real, f"av.video_to_{ext}", media("noisy")).outputs[0]
+    target_mb = 0.05
+    target = run(real, "av.video_compress", source, target_mb=target_mb).outputs[0]
+    assert target.stat().st_size <= target_mb * 1_000_000 * 1.10, target.stat().st_size
+
+
+def test_the_target_size_param_states_its_unit():
+    entry = load_registry(force=True).get("av.video_compress")
+    param = next(p for p in entry.params if p.name == "target_mb")
+    assert "1,000,000 bytes" in (param.help or "")
 
 
 @needs_ffmpeg
@@ -614,12 +644,28 @@ def test_join_re_encodes_to_the_first_clip_when_the_clips_differ(real, media):
 
 
 @needs_ffmpeg
-def test_join_with_a_silent_clip_says_the_result_is_silent(real, media):
+def test_join_with_a_silent_clip_keeps_the_audio_of_the_others(real, media):
+    """The silent clip gets a silent track of its own length, so the tone of
+    the first clip survives and the second half is quiet."""
     first = media("video", "a.mp4")
     second = media("silent", "b.mp4")
     result = run(real, "av.video_join", [first, second])
+    target = result.outputs[0]
+    assert streams(target, "audio"), "one silent clip must not strip the whole join"
+    assert "silence" in result.message
+    assert duration(target) == pytest.approx(duration(first) + duration(second), abs=0.35)
+    loud = samples(target, 0.2, 0.9)
+    quiet = samples(target, duration(first) + 0.2, duration(first) + 0.8)
+    assert max(abs(v) for v in loud) > 1000
+    assert max(abs(v) for v in quiet) < 50
+
+
+@needs_ffmpeg
+def test_join_of_clips_that_all_lack_audio_is_silent(real, media):
+    result = run(real, "av.video_join", [media("silent", "a.mp4"), media("small", "b.mp4")])
+    assert streams(result.outputs[0], "audio"), "the second clip has audio"
+    result = run(real, "av.video_join", [media("silent", "c.mp4"), media("silent", "d.mp4")])
     assert not streams(result.outputs[0], "audio")
-    assert "silent" in result.message
 
 
 @needs_ffmpeg
@@ -669,6 +715,83 @@ def test_a_redact_with_a_time_range_only_blurs_inside_it(real, media):
         real, "av.video_redact", source, x=0, y=0, w=120, h=120, strength=15, start=0.6, end=1.2
     ).outputs[0]
     assert detail(target, 0.8, rect) < detail(target, 0.1, rect) / 2
+
+
+def _rotated(media, name: str = "phone.mp4") -> Path:
+    """The 320x240 master with a display matrix that says rotate 90: a phone
+    clip, shown as 240x320."""
+    source = media("video", "landscape.mp4")
+    target = source.parent / name
+    _ffmpeg_bytes(["-display_rotation", "90", "-i", str(source), "-c", "copy", str(target)])
+    return target
+
+
+def _rotation_of(path: Path):
+    for stream in streams(path, "video"):
+        for side in stream.get("side_data_list") or []:
+            if "rotation" in side:
+                return side["rotation"]
+    return None
+
+
+@needs_ffmpeg
+def test_crop_on_a_phone_clip_uses_the_displayed_frame(real, media):
+    source = _rotated(media)
+    target = run(real, "av.video_crop", source, x=20, y=200, w=200, h=100).outputs[0]
+    assert frame_size(target) == (200, 100)
+    assert not _rotation_of(target), "the crop is already upright"
+    # A rect that fits the coded 320x240 frame but not the displayed 240x320.
+    assert fails(real, "av.video_crop", source, x=0, y=0, w=300, h=200).code == "invalid_params"
+
+
+@needs_ffmpeg
+def test_join_of_a_phone_clip_and_a_landscape_clip_is_upright(real, media):
+    phone = _rotated(media)
+    flat = media("video", "flat.mp4")
+    target = run(real, "av.video_join", [phone, flat]).outputs[0]
+    assert frame_size(target) == (240, 320), "re-encoded to the first clip's displayed shape"
+    assert not _rotation_of(target)
+    assert duration(target) == pytest.approx(duration(phone) + duration(flat), abs=0.35)
+
+
+@needs_ffmpeg
+def test_join_of_two_phone_clips_keeps_their_shared_rotation(real, media):
+    first, second = _rotated(media, "p1.mp4"), _rotated(media, "p2.mp4")
+    target = run(real, "av.video_join", [first, second]).outputs[0]
+    assert abs(_rotation_of(target) or 0) == 90
+
+
+@needs_ffmpeg
+def test_snapshot_reports_only_whole_png_frames(real, media, tmp_path):
+    """Audio runs 1.5s past a 0.25s video: frames come from the video only."""
+    source = generate(
+        tmp_path / "talk.mp4",
+        ["-f", "lavfi", "-i", "sine=duration=1.75", "-f", "lavfi",
+         "-i", "testsrc=size=160x120:rate=20:duration=0.25",
+         "-map", "0:a", "-map", "1:v", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"],
+    )
+    result = run(real, "av.video_snapshot", source, every=0.1)
+    assert len(result.outputs) == 3
+    for output in result.outputs:
+        assert av._is_png(output) and frame_size(output) == (160, 120)
+    assert not [p for p in tmp_path.glob("*.png") if p.stat().st_size == 0]
+    single = run(real, "av.video_snapshot", source, time=0.24).outputs[0]
+    assert av._is_png(single)
+
+
+@needs_ffmpeg
+def test_split_cuts_on_the_video_track_and_keeps_the_audio_tail(real, media, tmp_path):
+    source = generate(
+        tmp_path / "talk.mp4",
+        ["-f", "lavfi", "-i", "sine=duration=2", "-f", "lavfi",
+         "-i", "testsrc=size=160x120:rate=20:duration=1",
+         "-map", "0:a", "-map", "1:v", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"],
+    )
+    result = run(real, "av.video_split", source, every=0.4)
+    assert len(result.outputs) == 3, [p.name for p in result.outputs]
+    for output in result.outputs:
+        assert streams(output, "video"), f"{output.name} has no video"
+    assert duration(result.outputs[-1]) == pytest.approx(2.0 - 0.8, abs=0.2)
 
 
 @needs_ffmpeg

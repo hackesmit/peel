@@ -40,6 +40,7 @@ Gotchas that cost a debugging round, kept as code:
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -169,7 +170,8 @@ def register(registry: Registry) -> None:
         params=(
             _QUALITY,
             Param("target_mb", "float", "Target size (MB)", minimum=0.05,
-                  help="Optional. Overrides quality: the bitrate is fitted to this size."),
+                  help="Optional. 1 MB is 1,000,000 bytes. Overrides quality: the "
+                       "bitrate is fitted to this size."),
         ),
         runner=f"{MOD}:video_compress",
     )
@@ -382,11 +384,22 @@ def _exe(name: str) -> str:
     return str(backends.require(name))
 
 
+def _arg(value: Any) -> str:
+    """One argv entry for ffmpeg or ffprobe.
+
+    A path is always made absolute, so a relative name that starts with a dash
+    (``-x.mp4`` dropped from its own folder) is never read as an option.
+    """
+    if isinstance(value, Path):
+        return os.path.abspath(value)
+    return str(value)
+
+
 def probe(path: Path) -> dict[str, Any]:
     """ffprobe's format and streams for one file, as a dict."""
     args = [
         _exe("ffprobe"), "-v", "error", "-show_format", "-show_streams",
-        "-of", "json", str(path),
+        "-of", "json", _arg(path),
     ]
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=120)
@@ -422,12 +435,103 @@ def _duration(info: dict[str, Any]) -> float:
     return best
 
 
+def _seconds(value: Any) -> float:
+    """A duration from ffprobe: plain seconds, or Matroska's HH:MM:SS.fff tag."""
+    if value is None:
+        return 0.0
+    text = str(value).strip()
+    try:
+        if ":" in text:
+            total = 0.0
+            for part in text.split(":"):
+                total = total * 60 + float(part)
+            return total
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
+def _rate(text: Any) -> float:
+    """Frames per second from ffprobe's ``25/1`` form. 0.0 when unknown."""
+    try:
+        num, _, den = str(text).partition("/")
+        value = float(num) / float(den or 1)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0
+    return value if value > 0 else 0.0
+
+
+def _video_timing(info: dict[str, Any]) -> tuple[float, float]:
+    """(video duration, length of one frame), both in seconds.
+
+    The video track's own duration, not the container's: phone and screen
+    recordings often carry audio that runs on after the last frame, and a seek
+    into that tail decodes no picture at all. Falls back to the Matroska
+    DURATION tag, then the container. The frame length falls back to 1/25 s.
+    """
+    streams = _streams(info, "video")
+    stream = streams[0] if streams else {}
+    duration = _seconds(stream.get("duration"))
+    if not duration:
+        tags = stream.get("tags") or {}
+        duration = _seconds(next((v for k, v in tags.items() if k.upper() == "DURATION"), None))
+    if not duration:
+        duration = _seconds(info.get("format", {}).get("duration"))
+    fps = _rate(stream.get("avg_frame_rate")) or _rate(stream.get("r_frame_rate"))
+    frame = 1.0 / fps if fps else 0.04
+    return duration, frame
+
+
+def _last_frame_start(info: dict[str, Any]) -> float:
+    """The latest time a seek can ask for and still decode a frame: the start
+    of the last frame. 0.0 when the duration is unknown. Seeks are handed to
+    ffmpeg through ``_seek``, which rounds down, so they never pass it."""
+    duration, frame = _video_timing(info)
+    if not duration:
+        return 0.0
+    return max(0.0, duration - frame)
+
+
+def _seek(seconds: float) -> str:
+    """A seek time for ffmpeg, rounded DOWN to the millisecond. Rounding up
+    could step past the start of the last frame, where a seek decodes nothing.
+    The 1e-6 absorbs float noise such as 0.1 + 0.1 + 0.1."""
+    return f"{math.floor(max(0.0, seconds) * 1000 + 1e-6) / 1000:.3f}"
+
+
+def _rotation(stream: dict[str, Any]) -> int:
+    """Display rotation in degrees (0, 90, 180 or 270) from a phone clip.
+
+    Modern ffprobe reports a display matrix in ``side_data_list``; older builds
+    put a ``rotate`` tag on the stream. Either way ffmpeg applies it when it
+    decodes (autorotate), so every filter sees the frame as it is displayed.
+    """
+    value: Any = None
+    for side in stream.get("side_data_list") or []:
+        if "rotation" in side:
+            value = side["rotation"]
+            break
+    if value is None:
+        value = (stream.get("tags") or {}).get("rotate")
+    try:
+        degrees = int(round(float(value)))
+    except (TypeError, ValueError):
+        return 0
+    return degrees % 360
+
+
 def _frame_size(info: dict[str, Any], path: Path) -> tuple[int, int]:
+    """The DISPLAYED frame size: width and height swap for a 90 or 270 degree
+    phone clip. This is the frame the editor shows and the frame every ffmpeg
+    filter receives, so crop and redact rectangles are checked against it."""
     stream = _require_video(info, path)
     try:
-        return int(stream["width"]), int(stream["height"])
+        width, height = int(stream["width"]), int(stream["height"])
     except (KeyError, TypeError, ValueError):
         raise UnsupportedInput(f"{path.name} does not report a frame size") from None
+    if _rotation(stream) in (90, 270):
+        return height, width
+    return width, height
 
 
 def _sample_rate(info: dict[str, Any]) -> int:
@@ -462,6 +566,44 @@ def _require_video(info: dict[str, Any], path: Path) -> dict[str, Any]:
     return streams[0]
 
 
+def _is_png(path: Path) -> bool:
+    """True when ``path`` is a whole PNG with a real frame size.
+
+    Checks the signature, a non-zero IHDR width and height, and the IEND chunk
+    at the end, which is what a decoder needs. Cheaper than an ffprobe per
+    frame on a 2000 frame Snapshot.
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(24)
+            if len(head) < 24 or head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+                return False
+            width = int.from_bytes(head[16:20], "big")
+            height = int.from_bytes(head[20:24], "big")
+            handle.seek(-12, os.SEEK_END)
+            tail = handle.read(12)
+    except OSError:
+        return False
+    return width > 0 and height > 0 and tail[4:8] == b"IEND"
+
+
+def _has_video(path: Path) -> bool:
+    """True when ffprobe finds a video stream with at least one frame."""
+    try:
+        info = probe(path)
+    except (RunnerFailed, UnsupportedInput):
+        return False
+    for stream in _streams(info, "video"):
+        frames = stream.get("nb_frames")
+        try:
+            if frames is not None and int(frames) == 0:
+                continue
+        except (TypeError, ValueError):
+            pass
+        return True
+    return False
+
+
 def _last_line(text: str) -> str:
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     return lines[-1] if lines else ""
@@ -481,7 +623,7 @@ def _ffmpeg(
     ]
     if progress is not None:
         command += ["-progress", "pipe:1"]
-    command += [str(a) for a in args]
+    command += [_arg(a) for a in args]
 
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as log:
         try:
@@ -759,7 +901,9 @@ def video_compress(job: Job) -> Result:
                 "cannot be fitted. Use the quality setting instead.",
                 code="no_duration",
             )
-        total_kbps = float(target_mb) * 8 * 1024 / duration
+        # 1 MB = 1,000,000 bytes = 8,000 kbit. 3% is left for the container
+        # (headers, index, interleaving), which a bitrate does not cover.
+        total_kbps = float(target_mb) * 8000 * 0.97 / duration
         audio_kbps = 96 if has_audio else 0
         video_kbps = max(64, int(total_kbps - audio_kbps))
         if not has_audio:
@@ -775,16 +919,28 @@ def video_compress(job: Job) -> Result:
         audio_args = _acodec_for_video(ext, audio=has_audio, audio_kbps=audio_kbps)
 
     target = job.output_path()
-    progress = _Progress(job, duration)
-    _ffmpeg(
-        [
-            "-i", job.source,
-            *_vcodec(ext, quality=job.params["quality"], video_kbps=video_kbps), *_filters(),
-            *audio_args,
-            target,
-        ],
-        progress=progress,
-    )
+    video_args = [
+        *_vcodec(ext, quality=job.params["quality"], video_kbps=video_kbps), *_filters(),
+    ]
+    # x264's one pass ABR lands on the bitrate. vp9, mpeg4 and wmv2 overshoot a
+    # one pass bitrate by half again or more, so a target size runs them as a
+    # two pass encode (the first pass only measures, into the scratch folder).
+    two_pass = video_kbps is not None and _VIDEO_CODECS[ext][0] != "libx264"
+    progress = _Progress(job, duration, steps=2 if two_pass else 1)
+    if two_pass:
+        # Both passes must see the same frames, or pass 2 stops with "input is
+        # longer than 2-pass log file": the null muxer and asf/avi would pick a
+        # different frame rate mode, so it is fixed for both.
+        video_args += ["-fps_mode", "cfr"]
+        log = job.scratch_dir(target) / "pass"
+        _ffmpeg(
+            ["-i", job.source, *video_args, "-pass", "1", "-passlogfile", log,
+             "-an", "-f", "null", os.devnull],
+            progress=progress.step(1),
+        )
+        video_args += ["-pass", "2", "-passlogfile", log]
+        progress.step(2)
+    _ffmpeg(["-i", job.source, *video_args, *audio_args, target], progress=progress)
     progress.done()
     before = job.source.stat().st_size
     after = target.stat().st_size
@@ -832,13 +988,21 @@ def video_trim(job: Job) -> Result:
     return ok([target], f"Wrote {target.name} ({end - start:.2f}s)")
 
 
-def _cut_points(params: dict[str, Any], duration: float) -> list[tuple[float, float]]:
-    """Segment boundaries from ``at`` timestamps or an ``every`` interval."""
+def _cut_points(
+    params: dict[str, Any], duration: float, last_cut: float | None = None
+) -> list[tuple[float, float]]:
+    """Segment boundaries from ``at`` timestamps or an ``every`` interval.
+
+    ``duration`` is the video track's length. ``last_cut`` is the latest cut
+    that still leaves the next part a frame of its own (see
+    ``_last_frame_start``); a cut after it would write a part with no picture.
+    """
     from ..registry import _parse_timecode
 
     if duration <= 0:
         raise RunnerFailed("the duration cannot be read, so the file cannot be split",
                            code="no_duration")
+    limit = duration if last_cut is None else min(duration, last_cut + 1e-6)
     at = params.get("at") or []
     every = params.get("every")
     cuts: list[float] = []
@@ -856,36 +1020,50 @@ def _cut_points(params: dict[str, Any], duration: float) -> list[tuple[float, fl
             position += step
     else:
         raise InvalidParams("give timestamps to cut at, or an interval in seconds")
-    inside = sorted({round(c, 3) for c in cuts if 0 < c < duration})
+    inside = sorted({round(c, 3) for c in cuts if 0 < c < duration and c <= limit})
     if not inside:
         raise InvalidParams(
-            f"no cut falls inside the file, which is {duration:.2f}s long"
+            f"no cut falls inside the video, which is {duration:.2f}s long"
         )
     bounds = [0.0] + inside + [duration]
     return [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
 
 
 def video_split(job: Job) -> Result:
+    """Cut a video into parts. Cuts are placed on the VIDEO track's timeline,
+    so every part has a picture; the last part runs to the end of the file and
+    keeps any audio that outlasts the video. Each part is probed after it is
+    written, and a part with no video fails the job rather than shipping."""
     info = probe(job.source)
     _require_video(info, job.source)
-    duration = _duration(info)
-    segments = _cut_points(job.params, duration)
+    video_length, _ = _video_timing(info)
+    segments = _cut_points(job.params, video_length, _last_frame_start(info))
+    total = max(_duration(info), video_length)
     ext = job.action.ext_for(job.source) or ""
     has_audio = bool(_streams(info, "audio"))
     quality = job.params["quality"]
-    progress = _Progress(job, duration, steps=len(segments))
+    progress = _Progress(job, total, steps=len(segments))
     outputs: list[Path] = []
     for index, (start, end) in enumerate(segments, start=1):
+        last = index == len(segments)
         target = job.output_path(suffix=str(index))
+        length = (total - start) if last else (end - start)
         _ffmpeg(
             [
-                "-ss", f"{start:.3f}", "-i", job.source, "-t", f"{end - start:.3f}",
+                "-ss", _seek(start), "-i", job.source,
+                *([] if last else ["-t", f"{end - start:.3f}"]),
                 *_vcodec(ext, quality=quality), *_filters(),
                 *_acodec_for_video(ext, audio=has_audio),
                 target,
             ],
-            progress=progress.step(index, duration=end - start),
+            progress=progress.step(index, duration=length),
         )
+        if not _has_video(target):
+            raise RunnerFailed(
+                f"part {index} (from {start:.2f}s) came out with no video, so the split "
+                "was stopped",
+                code="no_frame",
+            )
         outputs.append(target)
     progress.done()
     return ok(outputs, f"Wrote {len(outputs)} parts")
@@ -895,8 +1073,12 @@ def _join_signature(info: dict[str, Any]) -> tuple:
     video = _streams(info, "video")[:1]
     audio = _streams(info, "audio")[:1]
     return (
+        # Rotation is part of the shape: a stream copy keeps ONE display
+        # matrix for the whole file, so a portrait phone clip copied next to a
+        # landscape clip would play one of them sideways.
         tuple(
-            (s.get("codec_name"), s.get("width"), s.get("height"), s.get("pix_fmt"))
+            (s.get("codec_name"), s.get("width"), s.get("height"), s.get("pix_fmt"),
+             _rotation(s))
             for s in video
         ),
         tuple((s.get("codec_name"), s.get("sample_rate"), s.get("channels")) for s in audio),
@@ -907,6 +1089,11 @@ def video_join(job: Job) -> Result:
     """Concatenate clips. Identical streams are copied; anything else is
     re-encoded to the first clip's shape, which is what the spec's "join
     (multi-file)" has to mean when a drag mixes a phone clip and a screen grab.
+
+    The re-encode works on displayed frames (ffmpeg autorotates every input),
+    so mixed rotations come out upright with no display matrix. A clip with no
+    audio gets a silent track of its own length when any other clip has audio,
+    so one silent clip does not strip the sound from the whole join.
     """
     infos = [probe(path) for path in job.inputs]
     for path, info in zip(job.inputs, infos):
@@ -917,7 +1104,8 @@ def video_join(job: Job) -> Result:
     scratch = job.scratch_dir(target)
     progress = _Progress(job, total)
     identical = len({_join_signature(i) for i in infos}) == 1
-    every_has_audio = all(_streams(i, "audio") for i in infos)
+    any_audio = any(_streams(i, "audio") for i in infos)
+    filled = [not _streams(i, "audio") for i in infos] if any_audio else []
 
     if identical:
         listing = scratch / "inputs.txt"
@@ -957,30 +1145,43 @@ def video_join(job: Job) -> Result:
             f"pad={width}:{height}:-1:-1,setsar=1,fps={rate},format=yuv420p[v{index}]"
         )
         labels.append(f"[v{index}]")
-        if every_has_audio:
-            legs.append(
-                f"[{index}:a]aresample=48000,"
-                f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{index}]"
-            )
+        if any_audio:
+            if filled[index]:
+                length = _duration(infos[index]) or _video_timing(infos[index])[0]
+                legs.append(
+                    f"anullsrc=r=48000:cl=stereo,atrim=duration={max(length, 0.04):.3f},"
+                    f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{index}]"
+                )
+            else:
+                legs.append(
+                    f"[{index}:a]aresample=48000,"
+                    f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{index}]"
+                )
             labels.append(f"[a{index}]")
-    tail = f"concat=n={len(job.inputs)}:v=1:a={1 if every_has_audio else 0}"
-    tail += "[v][a]" if every_has_audio else "[v]"
+    tail = f"concat=n={len(job.inputs)}:v=1:a={1 if any_audio else 0}"
+    tail += "[v][a]" if any_audio else "[v]"
     graph = ";".join(legs + ["".join(labels) + tail])
 
     args: list[str] = []
     for path in job.inputs:
-        args += ["-i", str(path)]
+        args += ["-i", path]
     args += ["-filter_complex", graph, "-map", "[v]"]
-    if every_has_audio:
+    if any_audio:
         args += ["-map", "[a]"]
     args += [
         *_vcodec(ext, quality=job.params["quality"]),
-        *_acodec_for_video(ext, audio=every_has_audio),
-        str(target),
+        *_acodec_for_video(ext, audio=any_audio),
+        target,
     ]
     _ffmpeg(args, progress=progress)
     progress.done()
-    note = "" if every_has_audio else " (a clip had no audio, so the join is silent)"
+    count = sum(filled)
+    if not any_audio:
+        note = " (no clip had audio)"
+    elif count:
+        note = f" ({count} clip{'s' if count > 1 else ''} without audio filled with silence)"
+    else:
+        note = ""
     return ok([target], f"Joined {len(job.inputs)} clips into {target.name}{note}")
 
 
@@ -1063,13 +1264,16 @@ def video_snapshot(job: Job) -> Result:
     """
     info = probe(job.source)
     _require_video(info, job.source)
-    duration = _duration(info)
+    # Bounds come from the video track, not the container: audio that runs on
+    # after the last frame has no picture to save.
+    duration, _ = _video_timing(info)
+    last = _last_frame_start(info)
     every = job.params.get("every")
     if every:
         step = float(every)
         times = []
         position = 0.0
-        while position < duration or (not duration and not times):
+        while (duration and position <= last + 1e-6) or (not times):
             times.append(position)
             position += step
             if len(times) > 2000:
@@ -1081,7 +1285,7 @@ def video_snapshot(job: Job) -> Result:
         at = float(job.params.get("time") or 0.0)
         if duration and at >= duration:
             raise InvalidParams(
-                f"{at:g}s is past the end of the file ({duration:.2f}s)"
+                f"{at:g}s is past the end of the video ({duration:.2f}s)"
             )
         times = [at]
 
@@ -1090,14 +1294,30 @@ def video_snapshot(job: Job) -> Result:
     for index, at in enumerate(times, start=1):
         suffix = str(index) if len(times) > 1 else ""
         target = job.output_path(suffix=suffix)
+        # A time inside the last frame shows that frame, so the seek is held at
+        # its start: a seek past it decodes nothing and ffmpeg still exits 0.
+        seek = min(at, last) if duration else at
         _ffmpeg(
-            ["-ss", f"{at:.3f}", "-i", job.source, "-frames:v", "1", "-update", "1", target],
+            ["-ss", _seek(seek), "-i", job.source, "-frames:v", "1", "-update", "1", target],
             progress=progress.step(index, duration=max(duration, 0.001)),
         )
-        outputs.append(target)
+        # Never report a frame that is not a whole image. An empty claim that
+        # is left out of the outputs is removed by the registry after the run.
+        if _is_png(target):
+            outputs.append(target)
+        else:
+            # Empty the claim in place (never delete and recreate it), so the
+            # registry's cleanup of unused empty claims takes it away.
+            open(target, "wb").close()
     progress.done()
+    if not outputs:
+        raise RunnerFailed(
+            f"ffmpeg wrote no frame from {job.source.name}", code="no_frame"
+        )
     noun = "frame" if len(outputs) == 1 else "frames"
-    return ok(outputs, f"Saved {len(outputs)} {noun}")
+    skipped = len(times) - len(outputs)
+    note = f" ({skipped} past the last frame skipped)" if skipped else ""
+    return ok(outputs, f"Saved {len(outputs)} {noun}{note}")
 
 
 # --- audio tools ------------------------------------------------------------
@@ -1288,9 +1508,20 @@ def audio_visualize(job: Job) -> Result:
 
 
 def audio_metadata(job: Job) -> Result:
-    """Edit the title, artist and album. The stream is copied, so this is lossless."""
+    """Edit the title, artist and album. The stream is copied, so this is lossless.
+
+    Each field is written twice: as a file tag (MP3 ID3, M4A, FLAC, WAV INFO,
+    WMA) and as a tag on the audio stream, which is where OGG and Opus keep
+    their Vorbis comments and where players read them. Without the stream tag
+    a stream copy keeps the old comment and the edit is invisible. AIFF only
+    stores a title natively, so it gets an ID3 chunk that holds all three.
+
+    The output is read back with ffprobe and the message names only the fields
+    that actually landed. A field the container could not store is reported as
+    such, and a run that stored none of them fails.
+    """
     fields = {
-        key: job.params.get(key)
+        key: str(job.params.get(key))
         for key in ("title", "artist", "album")
         if job.params.get(key) is not None
     }
@@ -1298,12 +1529,46 @@ def audio_metadata(job: Job) -> Result:
         raise InvalidParams("give a title, an artist or an album to write")
     info = probe(job.source)
     _require_audio(info, job.source)
+    ext = job.action.ext_for(job.source) or ""
     target = job.output_path()
-    args: list[str] = ["-i", str(job.source), "-map", "0", "-c", "copy"]
+    args: list[Any] = ["-i", job.source, "-map", "0", "-c", "copy"]
+    if ext == "aiff":
+        args += ["-write_id3v2", "1"]
     for key, value in fields.items():
-        args += ["-metadata", f"{key}={value}"]
+        args += ["-metadata", f"{key}={value}", "-metadata:s:a:0", f"{key}={value}"]
     progress = _Progress(job, _duration(info))
-    _ffmpeg(args + [str(target)], progress=progress)
+    _ffmpeg(args + [target], progress=progress)
     progress.done()
-    written = ", ".join(sorted(fields))
-    return ok([target], f"Wrote {target.name} ({written})")
+
+    stored = _stored_tags(probe(target))
+    written = sorted(k for k, v in fields.items() if stored.get(k) == [v.strip()])
+    missing = sorted(set(fields) - set(written))
+    if not written:
+        raise RunnerFailed(
+            f"{LABELS.get(ext, ext.upper())} did not keep {', '.join(missing)}",
+            code="metadata_not_written",
+        )
+    note = (
+        f"; {', '.join(missing)} not supported in {LABELS.get(ext, ext.upper())}"
+        if missing else ""
+    )
+    return ok([target], f"Wrote {target.name} ({', '.join(written)}{note})")
+
+
+def _stored_tags(info: dict[str, Any]) -> dict[str, list[str]]:
+    """Every value each tag holds, in the file tags and the audio stream tags.
+
+    A field counts as written only when every place a player could read it
+    holds the new value, so a stale stream comment beside a fresh file tag is
+    caught rather than reported as done.
+    """
+    found: dict[str, list[str]] = {}
+    sources = [info.get("format", {}).get("tags") or {}]
+    sources += [s.get("tags") or {} for s in _streams(info, "audio")]
+    for tags in sources:
+        for key, value in tags.items():
+            values = found.setdefault(key.lower(), [])
+            text = str(value).strip()
+            if text not in values:
+                values.append(text)
+    return found
