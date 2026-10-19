@@ -19,11 +19,31 @@ internal enum DragSignal
 
     /// <summary>Escape was pressed: close the wheel and let the drag end normally.</summary>
     Cancel,
+
+    /// <summary>
+    /// A modifier was tapped during a gesture that is not a file drag (a
+    /// window being moved or sized). No wheel; Note says why.
+    /// </summary>
+    WheelRefused,
 }
 
-internal readonly record struct DragUpdate(DragSignal Signal, int X, int Y, string Modifier = "")
+internal readonly record struct DragUpdate(DragSignal Signal, int X, int Y, string Modifier = "", string Note = "")
 {
     internal static readonly DragUpdate Nothing = new(DragSignal.None, 0, 0);
+}
+
+/// <summary>
+/// What the state machine asks Windows at the moment a modifier is tapped,
+/// behind an interface so the tests can answer instead. Called on the hook
+/// thread: every answer must be a cheap call that sends no window message.
+/// </summary>
+internal interface IDragProbe
+{
+    /// <summary>The physical primary button, not the remembered one.</summary>
+    bool PrimaryButtonDown();
+
+    /// <summary>Null for a gesture that may be a file drag, else the reason it is not.</summary>
+    string? NotAFileDrag();
 }
 
 internal sealed class DragStateMachine
@@ -42,12 +62,14 @@ internal sealed class DragStateMachine
     private readonly int _thresholdX;
     private readonly int _thresholdY;
     private readonly HashSet<int> _keysDown = new();
+    private readonly IDragProbe? _probe;
     private bool _buttonDown;
     private int _downX;
     private int _downY;
 
-    internal DragStateMachine(int thresholdX, int thresholdY)
+    internal DragStateMachine(int thresholdX, int thresholdY, IDragProbe? probe = null)
     {
+        _probe = probe;
         // A zero threshold would call every click a drag.
         _thresholdX = thresholdX > 0 ? thresholdX : 4;
         _thresholdY = thresholdY > 0 ? thresholdY : 4;
@@ -114,6 +136,24 @@ internal sealed class DragStateMachine
         if (modifier.Length == 0 || !Dragging)
         {
             return DragUpdate.Nothing;
+        }
+        if (_probe is not null)
+        {
+            // A button up the hook never saw (released over an elevated
+            // window, Win+L, a UAC prompt) leaves Dragging true. Ask Windows
+            // for the physical button before opening anything, and end the
+            // stale drag if it is up.
+            if (!_probe.PrimaryButtonDown())
+            {
+                _buttonDown = false;
+                Dragging = false;
+                return new DragUpdate(DragSignal.DragEnded, 0, 0, modifier, "the button is up, a button up was missed");
+            }
+            var reason = _probe.NotAFileDrag();
+            if (reason is not null)
+            {
+                return new DragUpdate(DragSignal.WheelRefused, 0, 0, modifier, reason);
+            }
         }
         return new DragUpdate(DragSignal.WheelRequested, 0, 0, modifier);
     }

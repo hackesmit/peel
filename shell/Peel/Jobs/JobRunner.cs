@@ -3,6 +3,11 @@
 // Nothing here blocks the drag: by the time a job starts, the drop is over and
 // the wheel is gone. At most a few engine processes run at once, because one
 // drop of fifty files is already one process that handles all of them.
+//
+// Quit cancels every job: queued ones never start, running ones are killed
+// with their whole process tree (EngineClient owns them through job objects).
+// A result that carries data.clipboard_text is put on the clipboard before the
+// toast says done; if the clipboard stays busy the toast says that instead.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -24,6 +29,7 @@ internal sealed class JobRunner
     private readonly Dispatcher _ui;
     private readonly SemaphoreSlim _slots = new(3, 3);
     private readonly List<JobRecord> _recent = new();
+    private readonly CancellationTokenSource _quit = new();
 
     internal JobRunner(EngineClient engine, ToastHost toasts, Dispatcher ui)
     {
@@ -59,11 +65,17 @@ internal sealed class JobRunner
 
         _ = Task.Run(async () =>
         {
-            await _slots.WaitAsync().ConfigureAwait(false);
             RunResult result;
+            var holding = false;
             try
             {
-                result = await _engine.RunAsync(entry.Id, files, parameters).ConfigureAwait(false);
+                await _slots.WaitAsync(_quit.Token).ConfigureAwait(false);
+                holding = true;
+                result = await _engine.RunAsync(entry.Id, files, parameters, _quit.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (_quit.IsCancellationRequested)
+            {
+                result = RunResult.Failed($"{entry.Label} was stopped because Peel quit.", "cancelled");
             }
             catch (Exception error)
             {
@@ -72,20 +84,67 @@ internal sealed class JobRunner
             }
             finally
             {
-                _slots.Release();
+                if (holding)
+                {
+                    _slots.Release();
+                }
             }
 
-            await _ui.InvokeAsync(() =>
+            if (_quit.IsCancellationRequested)
             {
-                var message = result.Message.Length > 0
-                    ? result.Message
-                    : result.Ok ? $"{entry.Label} done" : $"{entry.Label} failed";
-                Log.Write($"job end {entry.Id} ok={result.Ok} outputs={result.Outputs.Count} {message}");
-                toast.Finish(result.Ok ? ToastKind.Done : ToastKind.Failed, message, result.Outputs);
-                Remember(new JobRecord(DateTime.Now, entry.Label, result.Ok, message, result.Outputs));
-                Completed?.Invoke(entry, result);
-            });
+                Log.Write($"job end {entry.Id} after quit: {result.Message}");
+                return;
+            }
+            try
+            {
+                await _ui.InvokeAsync(() => FinishAsync(entry, result, toast)).Task.Unwrap().ConfigureAwait(false);
+            }
+            catch (Exception error)
+            {
+                Log.Write($"job {entry.Id} could not report its result", error);
+            }
         });
+    }
+
+    /// <summary>
+    /// Quitting: queued jobs never start and running engines are killed with
+    /// everything they started. Synchronous, so App.OnExit can call it last.
+    /// </summary>
+    internal void Shutdown()
+    {
+        try
+        {
+            _quit.Cancel();
+        }
+        catch (Exception error)
+        {
+            Log.Write("cancelling the jobs failed", error);
+        }
+        _engine.KillAll();
+    }
+
+    /// <summary>On the UI thread: clipboard first, then the toast and the record.</summary>
+    private async Task FinishAsync(ActionEntry entry, RunResult result, ToastWindow toast)
+    {
+        var ok = result.Ok;
+        var message = result.Message.Length > 0
+            ? result.Message
+            : ok ? $"{entry.Label} done" : $"{entry.Label} failed";
+        if (ok && ClipboardWriter.TextFrom(result) is { } text)
+        {
+            var copied = await ClipboardWriter.TrySetAsync(
+                text, ClipboardWriter.SetOnce, ClipboardWriter.DefaultAttempts, ClipboardWriter.DefaultPause);
+            Log.Write($"clipboard for {entry.Id}: ok={copied.Ok} after {copied.Attempts} attempt(s) {copied.Error}");
+            if (!copied.Ok)
+            {
+                ok = false;
+                message = $"{entry.Label}: another app is holding the clipboard, so nothing was copied. Try again. ({copied.Error})";
+            }
+        }
+        Log.Write($"job end {entry.Id} ok={ok} outputs={result.Outputs.Count} {message}");
+        toast.Finish(ok ? ToastKind.Done : ToastKind.Failed, message, result.Outputs);
+        Remember(new JobRecord(DateTime.Now, entry.Label, ok, message, result.Outputs));
+        Completed?.Invoke(entry, result);
     }
 
     private void Remember(JobRecord record)

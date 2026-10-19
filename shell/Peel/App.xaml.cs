@@ -28,6 +28,8 @@ public partial class App : Application
     private Tray? _tray;
     private EngineClient? _engine;
     private DispatcherTimer? _hookReport;
+    private JobRunner? _jobs;
+    private readonly HookLiveness _liveness = new();
     private double _reportedWorst;
 
     protected override void OnStartup(StartupEventArgs e)
@@ -67,6 +69,7 @@ public partial class App : Application
 
         _toasts = new ToastHost();
         var jobs = new JobRunner(_engine, _toasts, Dispatcher);
+        _jobs = jobs;
         var editors = new MissingEditorHost(jobs);
 
         _wheel = new WheelWindow();
@@ -94,7 +97,11 @@ public partial class App : Application
         // Evidence for the hook budget: the worst callback so far, whenever it
         // changes. The end to end test asserts this stays far under 10 ms.
         _hookReport = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromSeconds(5) };
-        _hookReport.Tick += (_, _) => ReportHooks();
+        _hookReport.Tick += (_, _) =>
+        {
+            ReportHooks();
+            CheckHooksAlive();
+        };
         _hookReport.Start();
 
         ExitAfterIfAsked();
@@ -118,6 +125,23 @@ public partial class App : Application
         {
             _reportedWorst = worst;
             Log.Write($"worst hook call {worst:0.000}ms");
+        }
+    }
+
+    /// <summary>
+    /// Windows can take a low level hook away without a word. If input keeps
+    /// arriving that the hooks never saw, put them back.
+    /// </summary>
+    private void CheckHooksAlive()
+    {
+        if (_hooks is null || !_hooks.Installed || Native.LastInputTick() is not { } lastInput)
+        {
+            return;
+        }
+        var lastHook = _hooks.LastEventTick;
+        if (_liveness.Check(unchecked((uint)Environment.TickCount), lastInput, lastHook))
+        {
+            _hooks.Reinstall($"input at {lastInput} but the last hook call at {lastHook}");
         }
     }
 
@@ -163,6 +187,10 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        // First, so no engine process outlives the tray app: queued jobs are
+        // cancelled and running ones are killed with their whole tree.
+        _jobs?.Shutdown();
+        _engine?.KillAll();
         ReportHooks();
         _hookReport?.Stop();
         _watcher?.Dispose();

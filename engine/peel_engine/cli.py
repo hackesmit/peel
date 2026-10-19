@@ -7,6 +7,13 @@ Three commands, one JSON object on stdout each, exit 0 when ``ok`` is true and
     peel run <action-id> <files...>         run it, report the outputs
     peel doctor                             which backends are installed
 
+Both ``options`` and ``run`` also take ``--files-from <list>``: a UTF-8 text
+file with one path per line, read before any path given on the command line
+is appended. The shell switches to it when a drag carries more paths than fit
+in one Windows command line (32767 characters), so a folder of photos still
+reaches the engine as one call. Blank lines are skipped; nothing else in a
+line is trimmed, because a file name may end in a space.
+
 Errors come back as ``{"ok": false, "message": ..., "code": ...}``. A traceback
 is printed only with ``PEEL_DEBUG=1`` set, because the shell shows ``message``
 to the user in a toast.
@@ -57,6 +64,33 @@ class _Parser(argparse.ArgumentParser):
         raise UsageError(f"{self.prog}: {message}", usage=usage)
 
 
+_FILES_FROM_HELP = "read more paths from this UTF-8 file, one per line"
+
+
+def read_file_list(path: Path) -> list[Path]:
+    """The paths in a ``--files-from`` list, in order.
+
+    UTF-8 with or without a byte order mark, LF or CRLF line ends. Blank lines
+    are skipped. A line is otherwise taken exactly as written.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise UsageError(f"cannot read the file list {path}: {exc}") from None
+    except UnicodeDecodeError as exc:
+        raise UsageError(f"the file list {path} is not UTF-8: {exc}") from None
+    return [Path(line) for line in text.splitlines() if line.strip()]
+
+
+def collect_files(args: argparse.Namespace) -> list[Path]:
+    """Paths from ``--files-from`` first, then those on the command line."""
+    files: list[Path] = []
+    if getattr(args, "files_from", None) is not None:
+        files.extend(read_file_list(args.files_from))
+    files.extend(args.files)
+    return files
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog=PROG, description="Peel engine")
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
@@ -69,6 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="With no files, the whole registry is returned.",
     )
     options.add_argument("files", nargs="*", type=Path)
+    options.add_argument("--files-from", type=Path, metavar="LIST", help=_FILES_FROM_HELP)
     options.add_argument(
         "--include-unavailable",
         action="store_true",
@@ -77,7 +112,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="run one action on one or more files")
     run.add_argument("action")
-    run.add_argument("files", nargs="+", type=Path)
+    run.add_argument("files", nargs="*", type=Path)
+    run.add_argument("--files-from", type=Path, metavar="LIST", help=_FILES_FROM_HELP)
     run.add_argument(
         "--param",
         action="append",
@@ -137,12 +173,18 @@ def _dispatch(args: argparse.Namespace) -> dict[str, Any]:
 
         return check()
 
+    files = collect_files(args)
+    if args.command == "run" and not files:
+        raise UsageError(
+            "peel run: the following arguments are required: files (or --files-from)",
+            usage="peel run action [files ...] [--files-from LIST]",
+        )
     registry = load_registry()
     if args.command == "options":
-        return registry.options(args.files, include_unavailable=args.include_unavailable)
+        return registry.options(files, include_unavailable=args.include_unavailable)
 
     params = parse_params(args.param, args.params_file)
-    result = registry.run(args.action, args.files, params, out_dir=args.out_dir)
+    result = registry.run(args.action, files, params, out_dir=args.out_dir)
     return result.to_dict()
 
 

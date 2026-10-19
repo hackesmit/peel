@@ -4,6 +4,8 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Peel", "Peel\Peel.csproj", 
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Peel.Tests", "Peel.Tests\Peel.Tests.csproj", "{1C7B3A10-0002-4E2A-9B10-AE0000000002}"
 EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "FakeEngine", "tests\FakeEngine\FakeEngine.csproj", "{1C7B3A10-0003-4E2A-9B10-AE0000000003}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -18,5 +20,9 @@ Global
 		{1C7B3A10-0002-4E2A-9B10-AE0000000002}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{1C7B3A10-0002-4E2A-9B10-AE0000000002}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{1C7B3A10-0002-4E2A-9B10-AE0000000002}.Release|Any CPU.Build.0 = Release|Any CPU
+		{1C7B3A10-0003-4E2A-9B10-AE0000000003}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1C7B3A10-0003-4E2A-9B10-AE0000000003}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1C7B3A10-0003-4E2A-9B10-AE0000000003}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1C7B3A10-0003-4E2A-9B10-AE0000000003}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal
