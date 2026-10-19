@@ -595,6 +595,8 @@ def to_8bit(img):
         img = img.convert("I")
     else:
         low, high = (float(v) for v in img.getextrema())
+        if not (math.isfinite(low) and math.isfinite(high)):
+            img, low, high = _finite_only(img)
         if img.mode == "F" and 0.0 <= low and high <= 1.0:
             low, high = 0.0, 1.0
         elif 0.0 <= low and high <= 255.0:
@@ -606,6 +608,43 @@ def to_8bit(img):
     offset = -low * scale
     source = img if img.mode == "F" else img.convert("F")
     return source.point(lambda v: v * scale + offset).convert("L")
+
+
+def _finite_only(img):
+    """A float image with NaN and Inf pixels replaced, and its finite range.
+
+    Float TIFFs use NaN as nodata, and one NaN or Inf pixel makes
+    ``getextrema`` NaN or infinite, which would scale every pixel to 0. The
+    range comes from the finite pixels only; NaN and minus infinity become the
+    low end (black), plus infinity the high end (white). With no finite pixel
+    at all the image is all black.
+    """
+    Image = pillow()
+    if img.mode != "F":
+        img = img.convert("F")
+    try:
+        import numpy as np
+    except ImportError:  # pragma: no cover - numpy ships with the Peel venv
+        np = None
+    if np is not None:
+        values = np.frombuffer(img.tobytes(), dtype=np.float32)
+        finite = values[np.isfinite(values)]
+        low = float(finite.min()) if finite.size else 0.0
+        high = float(finite.max()) if finite.size else 0.0
+        clean = np.nan_to_num(values, nan=low, posinf=high, neginf=low)
+        data = clean.astype(np.float32).tobytes()
+    else:
+        from array import array
+
+        values = array("f", img.tobytes())
+        finite = [v for v in values if math.isfinite(v)]
+        low = min(finite) if finite else 0.0
+        high = max(finite) if finite else 0.0
+        clean = array("f", (
+            v if math.isfinite(v) else (high if v > 0 else low) for v in values
+        ))
+        data = clean.tobytes()
+    return Image.frombytes("F", img.size, data), low, high
 
 
 def to_rgba(img):
@@ -732,6 +771,9 @@ def load_frames(path: Path, longest: int = 0):
             return None
         frames, durations = [], []
         for frame in ImageSequence.Iterator(img):
+            # The WebP and AVIF decoders fill info["duration"] only when the
+            # frame is loaded, so load first or every frame reads as 100 ms.
+            frame.load()
             durations.append(int(frame.info.get("duration") or 100))
             rgba = to_rgba(frame)
             frames.append(fit_within(rgba, longest) if longest else rgba)
@@ -739,6 +781,7 @@ def load_frames(path: Path, longest: int = 0):
             "loop": int(img.info.get("loop", 0) or 0),
             "exif": carry_exif(img),
             "icc_profile": img.info.get("icc_profile"),
+            "size": img.size,
         }
     return frames, durations, info
 
@@ -762,6 +805,21 @@ def save_frames(frames, durations, info, target: Path, fmt: str, quality: int) -
             frames[0].save(handle, format=fmt, **options)
     except Exception as exc:
         raise RunnerFailed(f"cannot write an animated {fmt}: {exc}") from None
+
+
+def _only_first_frame(source: Path) -> tuple[str, dict[str, int]]:
+    """The message note and result data for a tool that edits one frame.
+
+    Strip, set, redact, edit and crop work on a single picture; an animated
+    source gives them its first frame, and the message must say so.
+    """
+    count = frame_count(source)
+    if count < 2:
+        return "", {}
+    return (
+        f" {source.name} has {count} frames; Peel used only the first frame.",
+        {"source_frames": count},
+    )
 
 
 def _first_frame_note(source: Path, count: int, fmt: str, why: str = "") -> str:
@@ -832,8 +890,9 @@ def compress(job: Job) -> Result:
             if loaded is not None:
                 frames, durations, info = loaded
                 save_frames(frames, durations, info, target, FORMATS[ext], quality)
+                resized = frames[0].size != info["size"]
                 return _compressed(source, target, ext, frames[0].size,
-                                   f" All {count} frames kept.")
+                                   f" All {count} frames kept.", resized)
             note = _first_frame_note(source, count, FORMATS[ext],
                                      "they are too large to keep together")
         else:
@@ -852,15 +911,38 @@ def compress(job: Job) -> Result:
             icc_profile=img.info.get("icc_profile"),
         )
         size = smaller.size
+        resized = smaller is not img
     finally:
         img.close()
-    return _compressed(source, target, ext, size, note)
+    return _compressed(source, target, ext, size, note, resized)
 
 
-def _compressed(source: Path, target: Path, ext: str, size, note: str) -> Result:
+def _compressed(source: Path, target: Path, ext: str, size, note: str,
+                resized: bool = False) -> Result:
+    """The Compress result, honest when the re-encode is not smaller.
+
+    When the output is not smaller and the picture was not resized and kept
+    its format, the target gets the source's bytes unchanged (as PDF compress
+    does), so Compress never hands back a bigger file than it was given.
+    """
+    import shutil
+
     before = source.stat().st_size
     after = target.stat().st_size
-    if FORMATS[ext] in LOSSY:
+    same_format = naming.normalise_ext(source.suffix) == ext
+    if after >= before and not resized and same_format:
+        with open(source, "rb") as src, open(target, "wb") as out:
+            shutil.copyfileobj(src, out)
+        after = target.stat().st_size
+        message = (
+            f"{source.name} is not smaller when re-encoded, so Peel kept the "
+            f"original bytes ({_kb(before)})"
+        )
+        # The original bytes hold every frame, so no frame note applies.
+        note = ""
+    elif after >= before:
+        message = f"{_kb(before)} to {_kb(after)}, not smaller"
+    elif FORMATS[ext] in LOSSY:
         saved = 100 - round(after * 100 / before) if before else 0
         message = f"{_kb(before)} to {_kb(after)}, {saved}% smaller"
     else:
@@ -893,6 +975,7 @@ def crop(job: Job) -> Result:
     """Cut out one rectangle. The editor supplies it in image pixels."""
     source = job.source
     x, y, w, h = (job.params[key] for key in ("x", "y", "w", "h"))
+    note, extra = _only_first_frame(source)
     img = load(source)
     try:
         width, height = img.size
@@ -911,7 +994,8 @@ def crop(job: Job) -> Result:
         )
     finally:
         img.close()
-    return ok([target], f"Cropped to {w} by {h}", width=w, height=h)
+    return ok([target], f"Cropped to {w} by {h}.{note}" if note else f"Cropped to {w} by {h}",
+              width=w, height=h, **extra)
 
 
 def edit(job: Job) -> Result:
@@ -937,6 +1021,7 @@ def edit(job: Job) -> Result:
         "vertical": Image.Transpose.FLIP_TOP_BOTTOM,
     }
 
+    note, extra = _only_first_frame(source)
     img = load(source)
     try:
         out = img
@@ -964,8 +1049,8 @@ def edit(job: Job) -> Result:
         )
     finally:
         img.close()
-    return ok([target], ", ".join(done).capitalize() if done else "Saved unchanged",
-              changes=done)
+    message = ", ".join(done).capitalize() if done else "Saved unchanged"
+    return ok([target], f"{message}.{note}" if note else message, changes=done, **extra)
 
 
 def annotate(job: Job) -> Result:
@@ -1052,6 +1137,20 @@ def _fit_shape(shape: dict[str, Any], size: tuple[int, int]) -> dict[str, Any]:
     fitted["width"] = min(shape["width"], diagonal)
     if "size" in shape:
         fitted["size"] = min(shape["size"], diagonal)
+    if "box" in shape:
+        # A box far bigger than the image (x=-1e9, w=2e9) makes pillow walk
+        # every outline ring of it. Clamping each edge to the image grown by
+        # the line width draws the same pixels: an edge pushed out by the
+        # margin puts its whole outline off the image, as it was before.
+        margin = fitted["width"]
+        width, height = size
+        left, top, right, bottom = shape["box"]
+        fitted["box"] = (
+            min(max(left, -margin), width + margin),
+            min(max(top, -margin), height + margin),
+            min(max(right, -margin), width + margin),
+            min(max(bottom, -margin), height + margin),
+        )
     return fitted
 
 
@@ -1139,6 +1238,7 @@ def redact(job: Job) -> Result:
     source = job.source
     mode = job.params["mode"]
     wanted = _regions(job.params["regions"])
+    note, extra = _only_first_frame(source)
 
     img = load(source)
     try:
@@ -1172,7 +1272,9 @@ def redact(job: Job) -> Result:
             icc_profile=img.info.get("icc_profile"),
         )
         noun = "region" if len(boxes) == 1 else "regions"
-        return ok([target], f"Hid {len(boxes)} {noun} with a {mode}", regions=len(boxes))
+        message = f"Hid {len(boxes)} {noun} with a {mode}"
+        return ok([target], f"{message}.{note}" if note else message,
+                  regions=len(boxes), **extra)
     finally:
         img.close()
 
@@ -1334,6 +1436,7 @@ def metadata(job: Job) -> Result:
         if action == "view":
             return ok([], f"Read the metadata of {source.name}", metadata=_read(img, source))
         ext = naming.normalise_ext(source.suffix)
+        note, extra = _only_first_frame(source)
         if action == "strip":
             from PIL import ImageOps
 
@@ -1344,7 +1447,10 @@ def metadata(job: Job) -> Result:
                  icc_profile=img.info.get("icc_profile"))
             return ok(
                 [target],
+                f"Removed every tag from {target.name} (the colour profile is kept).{note}"
+                if note else
                 f"Removed every tag from {target.name} (the colour profile is kept)",
+                **extra,
             )
         exif = _edited_exif(img, job.params)
         target = job.output_path()
@@ -1356,7 +1462,8 @@ def metadata(job: Job) -> Result:
             exif=exif,
             icc_profile=img.info.get("icc_profile"),
         )
-        return ok([target], f"Wrote the new metadata into {target.name}")
+        message = f"Wrote the new metadata into {target.name}"
+        return ok([target], f"{message}.{note}" if note else message, **extra)
     finally:
         img.close()
 

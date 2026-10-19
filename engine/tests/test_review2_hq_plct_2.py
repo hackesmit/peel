@@ -1,9 +1,9 @@
 """Adversarial review of hq-plct.2 (image family), round 2.
 
 Runnable failing checks for the round 2 blocking findings. Not collected by
-default (no test_ prefix); run explicitly:
+default before round 3; now collected as a regular test file:
 
-    cd engine && python3 -m pytest -q tests/review2_hq_plct_2.py
+    cd engine && python3 -m pytest -q tests/test_review2_hq_plct_2.py
 """
 
 from __future__ import annotations

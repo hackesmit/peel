@@ -1164,3 +1164,123 @@ def test_metadata_set_on_a_jpeg_keeps_its_quantisation_tables(real, make_image):
     assert result.ok, result.message
     with Image.open(result.outputs[0]) as after:
         assert after.quantization == tables
+
+
+# --- review round 3 (hq-plct.2) ---------------------------------------------
+
+
+def test_a_float_image_with_minus_inf_and_no_finite_pixel_still_converts(real, tmp_path):
+    needs("jpg")
+    Image = image.pillow()
+    source = tmp_path / "dem.tif"
+    ramp = Image.new("F", (256, 1))
+    ramp.putdata([float("-inf") if x == 0 else float("inf") if x == 255 else x / 255
+                  for x in range(256)])
+    ramp.save(source)
+
+    result = real.run("image.to_jpg", [source], {})
+
+    assert result.ok, result.message
+    with Image.open(result.outputs[0]) as out:
+        grey = out.convert("L")
+        assert 100 <= grey.getpixel((128, 0)) <= 160
+        assert grey.getpixel((0, 0)) < 20
+        assert grey.getpixel((255, 0)) > 235
+
+    nodata = tmp_path / "nodata.tif"
+    Image.new("F", (8, 8), float("nan")).save(nodata)
+    result = real.run("image.to_png", [nodata], {})
+    assert result.ok, result.message
+
+
+def test_annotate_a_huge_box_far_off_the_image_returns_quickly(real, make_image):
+    import time
+
+    needs("png")
+    source = make_image("small.png", size=(40, 30))
+    shapes = [{"type": "rect", "x": -10**9, "y": -10**9, "w": 2 * 10**9,
+               "h": 2 * 10**9, "width": 10**9, "color": "#ff0000"},
+              {"type": "rect", "x": -10**9, "y": -10**9, "w": 2 * 10**9,
+               "h": 2 * 10**9, "width": 3, "color": "#00ff00"}]
+
+    started = time.monotonic()
+    result = real.run("image.annotate", [source], {"shapes": shapes})
+
+    assert result.ok, result.message
+    assert time.monotonic() - started < 5
+
+
+def test_annotate_box_clamp_draws_the_same_pixels(real, make_image):
+    needs("png")
+    Image = image.pillow()
+    source = make_image("small.png", size=(40, 30))
+    inside = [{"type": "rect", "x": 5, "y": 5, "w": 20, "h": 10, "width": 2,
+               "color": "#ff0000"}]
+    edges = [{"type": "rect", "x": -3, "y": 10, "w": 100, "h": 100, "width": 2,
+              "color": "#ff0000", "fill": "#0000ff"}]
+    for shapes in (inside, edges):
+        result = real.run("image.annotate", [source], {"shapes": shapes})
+        assert result.ok, result.message
+        with Image.open(source) as img:
+            base = image.to_rgba(img)
+        from PIL import ImageDraw
+        overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        for shape in image._check_shapes(shapes):
+            image._draw_shape(ImageDraw.Draw(overlay), shape)
+        expected = Image.alpha_composite(base, overlay)
+        with Image.open(result.outputs[0]) as out:
+            assert out.convert("RGBA").tobytes() == expected.tobytes()
+
+
+@pytest.mark.parametrize("tool, params", [
+    ("image.metadata", {"action": "strip"}),
+    ("image.metadata", {"action": "set", "title": "Vendimia"}),
+    ("image.redact", {"regions": [{"x": 0, "y": 0, "w": 5, "h": 5}], "mode": "box"}),
+    ("image.edit", {"rotate": 90}),
+    ("image.crop", {"x": 0, "y": 0, "w": 10, "h": 8}),
+])
+def test_single_frame_tools_say_they_used_the_first_frame(real, tmp_path, tool, params):
+    needs("webp")
+    source = _animated(tmp_path / "spin.webp", "WEBP", frames=3)
+
+    result = real.run(tool, [source], params)
+
+    assert result.ok, result.message
+    assert "3 frames" in result.message and "first frame" in result.message
+    assert result.data["source_frames"] == 3
+
+
+def test_single_frame_tools_add_no_note_on_a_still_image(real, make_image):
+    needs("png")
+    source = make_image("still.png", size=(20, 20))
+
+    result = real.run("image.edit", [source], {"rotate": 90})
+
+    assert result.ok, result.message
+    assert "frame" not in result.message
+
+
+def test_compress_that_would_grow_keeps_the_original_bytes(real, tmp_path):
+    needs("webp")
+    source = _animated(tmp_path / "tiny.webp", "WEBP", frames=3)
+    before = source.read_bytes()
+
+    result = real.run("image.compress", [source], {"quality": 100, "max_dimension": 0})
+
+    assert result.ok, result.message
+    assert "%" not in result.message
+    out = result.outputs[0]
+    assert "not smaller" in result.message and "frames kept" not in result.message
+    assert out.read_bytes() == before
+    assert result.data["bytes_after"] == len(before)
+
+
+def test_compress_never_reports_a_negative_saving(real, make_image):
+    needs("jpg")
+    source = make_image("flat.jpg", size=(16, 16), quality=10)
+
+    result = real.run("image.compress", [source], {"quality": 100, "max_dimension": 0})
+
+    assert result.ok, result.message
+    assert "not smaller" in result.message and "%" not in result.message
+    assert result.outputs[0].read_bytes() == source.read_bytes()
