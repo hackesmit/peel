@@ -46,7 +46,25 @@ from typing import Any, Iterable, Sequence
 
 from .. import backends, naming
 from ..registry import CONVERT, TOOL, Job, Param, Registry
-from ..result import Result, RunnerFailed, failure, ok
+from ..result import Result, RunnerFailed, failure
+from ..result import ok as _plain_ok
+
+import contextvars
+
+#: Links the LibreOffice gate removed during the current run, named in the
+#: result message so a removal is never silent (hq-plct.4 verifier note N1).
+_GATE_NOTES: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "peel_docs_gate_notes", default=())
+
+
+def ok(outputs: Any, message: str = "", **kwargs: Any) -> Result:
+    """``result.ok`` plus a note for any links the LibreOffice gate removed."""
+    notes = _GATE_NOTES.get()
+    if notes:
+        _GATE_NOTES.set(())
+        message = f"{message}. " if message and not message.endswith(".") else (message + " " if message else "")
+        message += "Removed links to files outside the document: " + "; ".join(notes) + "."
+    return _plain_ok(outputs, message, **kwargs)
 
 RUNNER = "peel_engine.families.docs"
 
@@ -1122,6 +1140,9 @@ def _outside_ref(value: str, base: str = "", *, rooted: bool = False) -> bool:
     return True
 
 
+_XML_PART_SUFFIXES = (".xml", ".rels", ".xhtml", ".htm", ".html", ".svg", ".vml", ".opf", ".ncx")
+
+
 def _xml_kind(data: bytes) -> str:
     """"xml", "gzip", "zip", "rtf", or "" (a binary part such as a PNG)."""
     head = data[:8]
@@ -1129,7 +1150,9 @@ def _xml_kind(data: bytes) -> str:
         raise _Unsafe("is stored in UTF-32")
     if head.startswith((b"\xff\xfe", b"\xfe\xff", b"\xef\xbb\xbf", b"\x00<", b"<\x00")):
         return "xml"
-    stripped = data[:256].lstrip(b" \t\r\n")
+    # Leading whitespace of any length is legal before the root element, and
+    # LibreOffice reads such a part as XML, so never look at a fixed prefix.
+    stripped = data.lstrip(b" \t\r\n")
     if stripped.startswith(b"<"):
         return "xml"
     if head.startswith(b"\x1f\x8b"):
@@ -1258,6 +1281,10 @@ def _inspect_zip(package: Any, depth: int) -> _Findings:
             blockers.append(f"an embedded RTF part ({info.filename}) cannot be checked")
             continue
         if kind != "xml":
+            # Fail closed: a part named like XML that is not recognised as XML
+            # is not trusted to be harmless binary data.
+            if info.filename.lower().endswith(_XML_PART_SUFFIXES):
+                raise _Unsafe(f"has a part named like XML that is not XML ({info.filename})")
             continue
         root = _parse_xml(data)
         if _local(root.tag) == "encryption-data" or any(
@@ -1425,6 +1452,7 @@ def _soffice_gate(job: Job, source: Path, near: Path) -> tuple[Path, str | None]
         return source, _SOFFICE_INFILTER[ext]
     copy = job.scratch_dir(near) / source.name
     _write_package(source, copy, found.rewrites)
+    _GATE_NOTES.set(_GATE_NOTES.get() + (f"{source.name} ({', '.join(sorted(found.rewrites))})",))
     return copy, _SOFFICE_INFILTER[ext]
 
 
