@@ -137,6 +137,10 @@ SLIDE_DPI = Param(
     help="Dots per inch each page is rendered at.",
 )
 
+#: Document targets a web image can end up inside. Plain text has no
+#: images, and a Markdown output keeps a web image as the link it already is.
+REMOTE_TARGETS = ("docx", "epub", "odt", "rtf", "pdf", "html")
+
 ALLOW_REMOTE = Param(
     "allow_remote",
     "bool",
@@ -167,7 +171,7 @@ def _register_documents(registry: Registry) -> None:
             group="Documents",
             inputs=tuple(e for e in DOC_FORMATS if e != target),
             output_ext=target,
-            params=(ALLOW_REMOTE,),
+            params=(ALLOW_REMOTE,) if target in REMOTE_TARGETS else (),
             backends=("pandoc", "soffice") if target in LO_DOC_TARGETS else ("pandoc",),
             runner=f"{RUNNER}:doc_convert",
         )
@@ -393,12 +397,36 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 #: the source file's folder or one of its subfolders; anything else is left out
 #: and reported. Peel is local only, so a web image is not fetched either
 #: unless the run asks for it (``allow_remote``); it stays in the document as a
-#: link. The check is lexical (``..`` segments, absolute paths, drive letters,
-#: percent escapes, ``file:`` URLs); pandoc itself is only given the source
-#: folder as its resource path.
+#: link. The check here is lexical (``..`` segments, absolute paths, drive
+#: letters, percent escapes, ``file:`` URLs) and exists to say what was left
+#: out. The confinement itself is structural: pandoc runs with ``--sandbox``
+#: on a staged copy and can only get the files ``_stage`` copied (see there),
+#: which this filter loads into pandoc's media bag from the manifest.
 _RESOURCE_FILTER = r"""
 local root_ok = os.getenv("PEEL_RESOURCE_ROOT") ~= nil
 local allow_remote = os.getenv("PEEL_ALLOW_REMOTE") == "1"
+
+-- pandoc runs with --sandbox, so it reads no file but its input. The files
+-- Peel staged for this document (and any web image it downloaded) are handed
+-- over here, through the media bag, by the manifest Peel wrote.
+local manifest = os.getenv("PEEL_MANIFEST")
+if manifest then
+  local list = io.open(manifest, "rb")
+  if list then
+    for line in list:lines() do
+      local key, path, mime = line:match("^([^\t]*)\t([^\t]*)\t([^\t]*)$")
+      if key and key ~= "" then
+        local f = io.open(path, "rb")
+        if f then
+          local contents = f:read("a")
+          f:close()
+          pandoc.mediabag.insert(key, mime ~= "" and mime or nil, contents)
+        end
+      end
+    end
+    list:close()
+  end
+end
 
 local function report(kind, target)
   io.stderr:write("PEEL-RESOURCE\t" .. kind .. "\t" .. (target or "") .. "\n")
@@ -430,7 +458,9 @@ local function classify(src)
   if s == "" or s:match("^#") then return "ok" end
   local lower = s:lower()
   if lower:match("^data:") then return "ok" end
-  if lower:match("^https?:") or lower:match("^//") or lower:match("^ftps?:") then
+  -- Only a real web scheme is remote. //host/share and \\host\share are
+  -- Windows network paths: local files to pandoc, so they count as outside.
+  if lower:match("^https?:") or lower:match("^ftps?:") then
     return "remote"
   end
   if lower:match("^%a[%w+.-]+:") then return "outside" end
@@ -599,17 +629,184 @@ def _parse_dropped(stderr: str) -> Dropped:
     return dropped
 
 
-def _pandoc(source: Path, target: Path, *, src_ext: str = "", out_ext: str = "",
+#: Source formats that link to other files by name, so are scanned for them.
+#: DOCX, ODT, EPUB and RTF carry their pictures inside the file.
+_LINKING_SOURCES = ("md", "txt", "html", "htm")
+#: Limits on what one document may pull in.
+_STAGE_MAX_FILES = 500
+_STAGE_MAX_BYTES = 200 * 2**20
+_REMOTE_MAX_FILES = 50
+_REMOTE_MAX_BYTES = 20 * 2**20
+_REMOTE_TIMEOUT = 20
+
+#: Pieces of a document that could be a file name: quoted strings, the inside
+#: of brackets (Markdown links, CSS url()), and runs between separators. This
+#: is deliberately loose. It only decides what is copied into the staged
+#: folder; a name it misses is simply not available to pandoc.
+_QUOTED = re.compile(r'"([^"\r\n]*)"|\'([^\'\r\n]*)\'|\(([^()\r\n]*)\)|<([^<>\r\n]*)>')
+_SEPARATORS = re.compile(r'[\s"\'()<>\[\]=,;{}|*`]+')
+
+
+def _references(text: str) -> set[str]:
+    import html
+    from urllib.parse import unquote
+
+    found: set[str] = set()
+    for body in (text, html.unescape(text)):
+        for match in _QUOTED.finditer(body):
+            found.add(next(g for g in match.groups() if g is not None))
+        found.update(_SEPARATORS.split(body))
+    out: set[str] = set()
+    for ref in found:
+        ref = ref.strip()
+        if not ref or len(ref) > 1024 or "\t" in ref or "\x00" in ref:
+            continue
+        for variant in (ref, unquote(ref)):
+            out.add(variant)
+            out.add(re.split(r"[?#]", variant, maxsplit=1)[0])
+    out.discard("")
+    return out
+
+
+def _inside(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([os.path.normcase(path), os.path.normcase(root)]) == \
+            os.path.normcase(root)
+    except ValueError:  # another drive
+        return False
+
+
+def _local_file(root: str, base: str, ref: str) -> str | None:
+    """The real path ``ref`` names, if it is a file inside ``root``.
+
+    Absolute paths, drive letters, network paths and every URL scheme are
+    refused outright; a relative path is resolved with symlinks followed, so a
+    link inside the folder that points out of it is refused too.
+    """
+    if re.match(r"^[a-z][\w+.-]*:", ref, re.I) or ref.startswith(("/", "\\", "~")):
+        return None
+    path = os.path.realpath(os.path.join(base, ref.replace("\\", "/")))
+    if not _inside(path, root) or not os.path.isfile(path):
+        return None
+    return path
+
+
+def _download(url: str, folder: Path, index: int) -> tuple[Path, str] | None:
+    """A web image for a run that allows it, or None when it cannot be had."""
+    import urllib.request
+
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "Peel"})
+        with urllib.request.urlopen(request, timeout=_REMOTE_TIMEOUT) as response:  # noqa: S310
+            data = response.read(_REMOTE_MAX_BYTES + 1)
+            mime = response.headers.get_content_type() or ""
+    except Exception:  # noqa: BLE001 - an unreachable image stays a link
+        return None
+    if len(data) > _REMOTE_MAX_BYTES:
+        return None
+    folder.mkdir(exist_ok=True)
+    path = folder / f"web-{index}"
+    path.write_bytes(data)
+    return path, mime
+
+
+def _stage(job: Job, source: Path, near: Path, *, src_ext: str,
+           allow_remote: bool) -> tuple[Path, Path, list[tuple[str, Path, str]]]:
+    """Copy ``source`` and the files it names into a fresh scratch folder.
+
+    Returns (staged folder, staged source, manifest entries as (name in the
+    document, staged copy, media type)). Only files that resolve
+    (real path, symlinks followed) inside the source's own folder are copied;
+    a stylesheet among them is scanned in turn, relative to itself. pandoc then
+    runs with ``--sandbox`` on the staged copy, and the staged files reach it
+    only through the manifest, so whatever a document names (an absolute path,
+    an entity encoded ``src``, a ``url()`` in a stylesheet) it can only get a
+    file that was copied here. Nothing in the document is rewritten.
+
+    The copies get plain ASCII names (``res/0.png``): pandoc's Lua opens them
+    with the C library, which on Windows reads a path in the ANSI code page,
+    so an accented folder or file name would not open. The name the document
+    uses is kept as the media bag key instead.
+    """
+    import mimetypes
+    import shutil
+
+    scratch = job.scratch_dir(near)
+    stage = scratch / "stage"
+    stage.mkdir()
+    staged_source = stage / (source.name or "document")
+    shutil.copyfile(_abs(source), staged_source)
+    root = os.path.realpath(os.path.dirname(_abs(source)))
+    entries: list[tuple[str, Path, str]] = []
+
+    if src_ext in _LINKING_SOURCES:
+        copied: dict[str, Path] = {}
+        total = 0
+        queue: list[tuple[str, str]] = [(root, _read_text(source))]
+        remote: list[str] = []
+        while queue:
+            base, text = queue.pop(0)
+            for ref in sorted(_references(text)):
+                if ref.lower().startswith(("http://", "https://")):
+                    if allow_remote and base == root and ref not in remote:
+                        remote.append(ref)
+                    continue
+                real = _local_file(root, base, ref)
+                if real is None:
+                    continue
+                relative = os.path.relpath(real, root).replace(os.sep, "/")
+                if real not in copied:
+                    size = os.path.getsize(real)
+                    if len(copied) >= _STAGE_MAX_FILES or total + size > _STAGE_MAX_BYTES:
+                        continue
+                    total += size
+                    suffix = re.sub(r"[^A-Za-z0-9.]", "", Path(real).suffix)[:10]
+                    copy = stage / "res" / f"{len(copied)}{suffix}"
+                    copy.parent.mkdir(exist_ok=True)
+                    shutil.copyfile(real, copy)
+                    copied[real] = copy
+                    mime = mimetypes.guess_type(real)[0] or ""
+                    entries.append((relative, copy, mime))
+                    if real.lower().endswith(".css"):
+                        queue.append((os.path.dirname(real), _read_text(Path(real))))
+                if base == root:
+                    entries.append((ref, copied[real], mimetypes.guess_type(real)[0] or ""))
+        for index, url in enumerate(remote[:_REMOTE_MAX_FILES]):
+            got = _download(url, scratch / "web", index)
+            if got is not None:
+                entries.append((url, got[0], got[1]))
+
+    return stage, staged_source, entries
+
+
+def _write_manifest(stage: Path, entries: list[tuple[str, Path, str]], cwd: str) -> str:
+    """Write the manifest beside ``stage``; its path relative to ``cwd``.
+
+    Paths in it are relative to pandoc's working folder and so pure ASCII (see
+    ``_stage``). Written as bytes, so Windows does not add CR to line ends.
+    """
+    manifest = stage.parent / "manifest.tsv"
+    lines = "".join(
+        f"{key}\t{os.path.relpath(_abs(path), cwd).replace(os.sep, '/')}\t{mime}\n"
+        for key, path, mime in entries
+    )
+    manifest.write_bytes(lines.encode("utf-8"))
+    return os.path.relpath(_abs(manifest), cwd).replace(os.sep, "/")
+
+
+def _pandoc(source: Path, target: Path, *, job: Job, src_ext: str = "", out_ext: str = "",
             media: Path | None = None, reader: str = "",
             allow_remote: bool = False) -> Dropped:
     """Convert with pandoc straight onto ``target``.
 
-    ``media`` is a folder images are extracted into. pandoc is run from the
-    target's folder and given the folder's bare name, so the links it writes
-    are relative to the document and the pair still works after a move.
+    ``media`` is a folder images are extracted into. pandoc is then run from
+    the target's folder and given the folder's bare name, so the links it
+    writes are relative to the document and the pair still works after a move.
 
-    Every run goes through the resource filter above; what it kept out comes
-    back so the result message can say so.
+    pandoc never sees the user's folder: it converts a staged copy (see
+    ``_stage``) with ``--sandbox``. Every run also goes through the resource
+    filter above, which reports what the document named outside its folder or
+    on the web; that comes back so the result message can say so.
     """
     exe = backends.require("pandoc")
     reader = reader or PANDOC_READER.get(src_ext or _ext(source), "")
@@ -619,17 +816,20 @@ def _pandoc(source: Path, target: Path, *, src_ext: str = "", out_ext: str = "",
             f"Peel cannot convert {src_ext or _ext(source)} to {out_ext or _ext(target)}.",
             code="unsupported_pair",
         )
-    folder = os.path.dirname(_abs(source))
+    stage, staged, entries = _stage(job, source, target, src_ext=src_ext or _ext(source),
+                                    allow_remote=allow_remote)
+    # With a media folder pandoc runs from the target's folder (the scratch
+    # folder is a child of it, so the relative paths stay ASCII); otherwise
+    # from the staged folder.
+    cwd = os.path.dirname(_abs(target)) if media is not None else _abs(stage)
+    manifest = _write_manifest(stage, entries, cwd)
     args = [
         str(exe),
+        "--sandbox",
         "--from", reader,
         "--to", writer,
         "--output", _abs(target),
-        # Where to look for a file the document links to relatively: the
-        # source's own folder and nothing else. pandoc searches its working
-        # directory by default, which is wherever the shell happened to start
-        # peel, so an image beside the source would be silently dropped.
-        f"--resource-path={folder}",
+        f"--resource-path={_abs(stage)}",
         f"--lua-filter={_abs(_resource_filter())}",
     ]
     if writer in ("html", "epub"):
@@ -640,12 +840,12 @@ def _pandoc(source: Path, target: Path, *, src_ext: str = "", out_ext: str = "",
         args += ["--embed-resources"]
     if media is not None:
         args += [f"--extract-media={Path(media).name}"]
-    args += [_abs(source)]
+    args += [_abs(staged)]
     env = dict(os.environ)
-    env["PEEL_RESOURCE_ROOT"] = folder
+    env["PEEL_RESOURCE_ROOT"] = _abs(stage)
     env["PEEL_ALLOW_REMOTE"] = "1" if allow_remote else "0"
-    proc = _run(args, timeout=PANDOC_TIMEOUT, env=env,
-                cwd=os.path.dirname(_abs(target)) if media is not None else None)
+    env["PEEL_MANIFEST"] = manifest
+    proc = _run(args, timeout=PANDOC_TIMEOUT, env=env, cwd=cwd)
     return _parse_dropped(proc.stderr)
 
 
@@ -751,7 +951,7 @@ def doc_convert(job: Job) -> Result:
     src_ext = _ext(source)
     target = job.output_path()
     out_ext = _ext(target)
-    allow_remote = bool(job.params.get("allow_remote", False))
+    allow_remote = out_ext in REMOTE_TARGETS and bool(job.params.get("allow_remote", False))
 
     if out_ext in LO_DOC_TARGETS:
         given, dropped = _as_soffice_input(job, source, src_ext, target, allow_remote)
@@ -759,8 +959,8 @@ def doc_convert(job: Job) -> Result:
         return ok([target], _with_note(f"Wrote {target.name}", dropped))
 
     media = _claim_media(job, target) if out_ext == "md" else None
-    dropped = _pandoc(source, target, src_ext=src_ext, out_ext=out_ext, media=media,
-                      allow_remote=allow_remote)
+    dropped = _pandoc(source, target, job=job, src_ext=src_ext, out_ext=out_ext,
+                      media=media, allow_remote=allow_remote)
     outputs = [target] + _media_outputs(media)
     return ok(outputs, _with_note(f"Wrote {target.name}", dropped))
 
@@ -778,7 +978,7 @@ def _as_soffice_input(job: Job, source: Path, src_ext: str, near: Path,
     if src_ext in SOFFICE_DOC_IN and not _links_outside_files(source, src_ext):
         return source, None
     bridge = job.scratch_dir(near) / f"{source.stem or 'document'}.odt"
-    dropped = _pandoc(source, bridge, src_ext=src_ext, out_ext="odt",
+    dropped = _pandoc(source, bridge, job=job, src_ext=src_ext, out_ext="odt",
                       allow_remote=allow_remote)
     return bridge, dropped
 
@@ -836,7 +1036,8 @@ def _attr(tag: str, name: str) -> str:
 def extract_text(job: Job) -> Result:
     """The Extract Text and Extract Markdown tools: the words, no formatting."""
     target = job.output_path()
-    dropped = _pandoc(job.source, target, src_ext=_ext(job.source), out_ext=_ext(target))
+    dropped = _pandoc(job.source, target, job=job, src_ext=_ext(job.source),
+                      out_ext=_ext(target))
     return ok([target], _with_note(f"Wrote {target.name}", dropped))
 
 
@@ -1070,7 +1271,7 @@ def pdf_to_markup(job: Job) -> Result:
         encoding="utf-8",
     )
     media = _claim_media(job, target) if out_ext == "md" else None
-    _pandoc(bridge, target, src_ext="html", out_ext=out_ext, media=media,
+    _pandoc(bridge, target, job=job, src_ext="html", out_ext=out_ext, media=media,
             reader=PDF_MARKUP_READER)
     return ok([target] + _media_outputs(media), f"Wrote {target.name}" + _no_text_note(texted))
 
@@ -1297,22 +1498,30 @@ def _read_workbook(path: Path, job: Job | None = None) -> list[tuple[str, list[l
             if index >= len(backup):
                 break
             for column, cell in enumerate(row):
-                if cell == "" and column < len(backup[index]) and _is_formula(backup[index][column]):
+                if cell is None and column < len(backup[index]) and _is_formula(backup[index][column]):
                     row[column] = backup[index][column]
-    return [(title, _trim(rows)) for title, rows in values]
+    return [(title, _trim([[_cell_text(cell) for cell in row] for row in rows]))
+            for title, rows in values]
 
 
 def _is_formula(value: Any) -> bool:
+    if not isinstance(value, str):
+        value = getattr(value, "text", None)  # an openpyxl ArrayFormula
     return isinstance(value, str) and value.startswith("=")
 
 
 def _formula_gaps(values: list[tuple[str, list[list[Any]]]],
                   formulas: list[tuple[str, list[list[Any]]]]) -> bool:
-    """Whether some formula cell has no cached value."""
+    """Whether some formula cell has no cached value.
+
+    No cached value is ``None``. A cached empty string (``=IF(A1>5,"big","")``
+    that came out false) is a real result, shown blank in Excel, and is not a
+    gap.
+    """
     for (_, rows), (_, backup) in zip(values, formulas):
         for row, brow in zip(rows, backup):
             for cell, formula in zip(row, brow):
-                if cell == "" and _is_formula(formula):
+                if cell is None and _is_formula(formula):
                     return True
     return False
 
@@ -1348,13 +1557,26 @@ def _cell_text(value: Any) -> Any:
 
 
 def _sheet_rows(path: Path, *, data_only: bool) -> list[tuple[str, list[list[Any]]]]:
+    """Every sheet as (title, rows) of raw openpyxl values.
+
+    ``None`` is kept as ``None`` (an empty cell, or a formula with no cached
+    result) so it stays distinct from a cached empty string; ``_cell_text``
+    turns both into text only after the formula merge. openpyxl reads both a
+    missing and an empty cached result as ``None``; the cell's type tells
+    them apart: a formula whose cached result is text has type ``str``, and
+    one never calculated (as openpyxl itself saves it) has none.
+    """
     from openpyxl import load_workbook
+
+    def value(cell: Any) -> Any:
+        if cell.value is None and getattr(cell, "data_type", None) == "str":
+            return ""
+        return cell.value
 
     book = load_workbook(_abs(path), read_only=True, data_only=data_only)
     try:
         return [
-            (sheet.title, [[_cell_text(cell) for cell in row]
-                           for row in sheet.iter_rows(values_only=True)])
+            (sheet.title, [[value(cell) for cell in row] for row in sheet.iter_rows()])
             for sheet in book.worksheets
         ]
     finally:
@@ -1437,6 +1659,8 @@ def read_cues(source: Path) -> list[Cue]:
     mixes conventions still reads.
     """
     lines = _read_text(source).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    # Only SRT numbers its cues. In VTT a numeric last line is cue text.
+    srt = _ext(source) == "srt"
     cues: list[Cue] = []
     index = 0
     while index < len(lines):
@@ -1456,7 +1680,7 @@ def read_cues(source: Path) -> list[Cue]:
             if _is_timing(lines[index]):
                 # The blank line before the next cue is missing. Stop here, and
                 # give back an SRT index number that belongs to the next cue.
-                if body and body[-1].strip().isdigit():
+                if srt and body and body[-1].strip().isdigit():
                     body.pop()
                 break
             body.append(lines[index].rstrip())

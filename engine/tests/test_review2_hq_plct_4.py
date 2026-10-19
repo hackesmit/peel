@@ -1,8 +1,9 @@
 """Adversarial review checks for hq-plct.4 (docs family), round 2.
 
-Not collected by default (no test_ prefix). Run:
+Collected with the suite since round 3 (renamed from review2_hq_plct_4.py,
+assertions unchanged). Run:
 
-    cd engine && python3 -m pytest -q tests/review2_hq_plct_4.py
+    cd engine && python3 -m pytest -q tests/test_review2_hq_plct_4.py
 
 Each BLOCK test fails against f9dcf24. NOTE tests are xfail(strict=False).
 """
