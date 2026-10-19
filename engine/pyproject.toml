@@ -10,7 +10,21 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+# The engine itself has no dependencies on purpose: it runs with whatever
+# backends are present and hides the entries whose backend is missing. These
+# are what the test suite needs to BUILD its fixtures and to RE-OPEN outputs
+# with the library that owns each format, so `pip install -e .[dev]` is enough
+# to reproduce a full run. The two native backends (LibreOffice, pandoc) are
+# not pip installable and the tests that need them skip when they are absent.
+dev = [
+    "pytest>=8",
+    "pillow",
+    "pymupdf",
+    "pdf2docx",
+    "python-docx",
+    "python-pptx",
+    "openpyxl",
+]
 
 [project.scripts]
 peel = "peel_engine.cli:main"
