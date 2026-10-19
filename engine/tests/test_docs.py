@@ -664,12 +664,13 @@ def test_pptx_to_image_writes_one_image_per_slide(registry, work, target):
 
 
 @needs_soffice
-def test_a_legacy_ppt_is_accepted_as_a_source(registry, work):
-    import pymupdf
-
-    out = run(registry, "docs.slides_to_pdf", work("ppt")).outputs[0]
-    with pymupdf.open(out) as document:
-        assert document.page_count == 2
+@pytest.mark.parametrize("action", ["docs.slides_to_pdf", "docs.slides_to_png"])
+def test_a_legacy_ppt_is_refused_with_a_resave_hint(registry, work, action):
+    """A binary PPT cannot be checked for linked files before LibreOffice opens
+    it, so it is refused rather than opened unconfined."""
+    result = registry.run(action, [work("ppt")], None)
+    assert not result.ok and result.code == "unsafe_input"
+    assert "save it as PPTX" in result.message
 
 
 # --- spreadsheets -----------------------------------------------------------
@@ -751,10 +752,11 @@ def test_an_ods_source_round_trips_to_xlsx(registry, work):
 
 
 @needs_soffice
-def test_a_legacy_xls_source_exports_every_sheet_to_csv(registry, work):
-    result = run(registry, "docs.sheet_to_csv", work("xls"))
-    assert len(result.outputs) == 2
-    assert "apple,3" in result.outputs[0].read_text(encoding="utf-8-sig")
+@pytest.mark.parametrize("action", ["docs.sheet_to_csv", "docs.sheet_to_pdf", "docs.sheet_to_xlsx"])
+def test_a_legacy_xls_source_is_refused_with_a_resave_hint(registry, work, action):
+    result = registry.run(action, [work("xls")], None)
+    assert not result.ok and result.code == "unsafe_input"
+    assert "save it as XLSX" in result.message
 
 
 @needs_soffice
@@ -1530,3 +1532,370 @@ def test_a_numeric_last_line_in_a_tight_vtt_cue_is_text(tmp_path):
         encoding="utf-8",
     )
     assert [c.text for c in docs.read_cues(source)] == ["Room\n101", "next"]
+
+
+# --- LibreOffice confinement (final review, hq-plct.4) -----------------------
+#
+# LibreOffice loads whatever a package links to, so every file it opens passes
+# docs._soffice_gate. Each fixture below is a real document with its picture
+# turned into a link to a private file outside the source folder, written in a
+# way the round 3 regexes missed: single quotes, XML character references,
+# another namespace prefix, percent escapes, a hyperlink relationship reused
+# by a picture. Each must convert without the picture or be refused cleanly.
+
+from peel_engine.registry import Job  # noqa: E402
+
+
+def _red_secret(tmp_path: Path) -> tuple[Path, Path]:
+    from PIL import Image
+
+    secret, downloads = _secret(tmp_path)
+    Image.new("RGB", (200, 200), (200, 0, 0)).save(secret, format="PNG")
+    return secret, downloads
+
+
+def _swatch(folder: Path) -> Path:
+    from PIL import Image
+
+    path = folder / "swatch.png"
+    Image.new("RGB", (120, 80), (10, 160, 10)).save(path)
+    return path
+
+
+def _rezip(source: Path, target: Path, edit) -> Path:
+    with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w") as out:
+        for item in src.infolist():
+            out.writestr(item, edit(item.filename, src.read(item.filename)))
+    return target
+
+
+def _pdf_has_images(path: Path) -> bool:
+    import pymupdf
+
+    with pymupdf.open(path) as pdf:
+        return any(page.get_images() for page in pdf)
+
+
+def _red_pixels(path: Path) -> int:
+    from PIL import Image
+
+    with Image.open(path) as image:
+        raw = image.convert("RGB").tobytes()
+    return sum(1 for i in range(0, len(raw), 3) if raw[i] > 150 and raw[i + 1] < 70 and raw[i + 2] < 70)
+
+
+def _direct_soffice(registry, source: Path, action: str = "docs.doc_to_pdf") -> Path:
+    """Run _soffice itself, so the gate is tested without the pandoc detour."""
+    job = Job(action=registry.get(action), inputs=[source])
+    target = job.output_path(ext="pdf")
+    docs._soffice(source, target, "pdf", job)
+    return target
+
+
+_PREFIXED_RELS = (
+    ('<Relationships xmlns="', '<pr:Relationships xmlns:pr="'),
+    ("<Relationship ", "<pr:Relationship "),
+    ("</Relationships>", "</pr:Relationships>"),
+)
+
+_DOCX_LINKS = {
+    "single_quotes": lambda s: f"Target='{s.as_uri()}' TargetMode='External'",
+    "char_refs": lambda s: ("Target=\"&#102;ile://" + s.as_posix().replace("/", "&#47;")
+                            + "\" TargetMode=\"&#69;xternal\""),
+    "percent": lambda s: 'Target="..%2Fprivate%2Fsecret.png" TargetMode="External"',
+    "prefixed": lambda s: f'Target="{s.as_uri()}" TargetMode="External"',
+    "hyperlink_type": lambda s: f'Target="{s.as_uri()}" TargetMode="External"',
+}
+
+
+def _linked_docx(downloads: Path, secret: Path, way: str) -> Path:
+    clean = _make_docx_with_picture(downloads / "base.docx")
+
+    def edit(name: str, data: bytes) -> bytes:
+        if name == "word/_rels/document.xml.rels":
+            text = data.decode("utf-8")
+            text = re.sub(r'Target="media/[^"]+"', lambda _m: _DOCX_LINKS[way](secret), text)
+            if way == "hyperlink_type":
+                text = re.sub(r'Type="[^"]+/image"', 'Type="http://schemas.openxmlformats.org/'
+                              'officeDocument/2006/relationships/hyperlink"', text)
+            if way == "prefixed":
+                for old, new in _PREFIXED_RELS:
+                    text = text.replace(old, new)
+            return text.encode("utf-8")
+        if name == "word/document.xml":
+            return data.replace(b"r:embed=", b"r:link=")
+        return data
+
+    return _rezip(clean, downloads / "linked.docx", edit)
+
+
+@needs_office
+@pytest.mark.parametrize("way", sorted(_DOCX_LINKS))
+def test_a_docx_picture_link_out_of_the_folder_never_reaches_the_pdf(registry, tmp_path, way):
+    secret, downloads = _red_secret(tmp_path)
+    source = _linked_docx(downloads, secret, way)
+    assert docs._links_outside_files(source, "docx")
+    result = run(registry, "docs.doc_to_pdf", source)
+    assert not _pdf_has_images(result.outputs[0])
+    # The gate alone, without the pandoc detour, removes the link too.
+    assert not _pdf_has_images(_direct_soffice(registry, source))
+
+
+_ODT_LINKS = {
+    "char_ref_parent": lambda s: 'xlink:href="&#46;&#46;/&#46;&#46;/private/secret.png"',
+    "char_ref_file_url": lambda s: 'xlink:href="&#102;ile://' + s.as_posix() + '"',
+    "single_quotes": lambda s: f"xlink:href='{s.as_uri()}'",
+    "prefixed": lambda s: f'xlink:href="{s.as_uri()}"',
+}
+
+
+def _linked_odf(registry_folder: Path, source: Path, secret: Path, fmt: str, way: str) -> Path:
+    registry_folder.mkdir(parents=True, exist_ok=True)
+    made = _soffice_fixture(source, registry_folder, fmt)
+
+    def edit(name: str, data: bytes) -> bytes:
+        if name != "content.xml":
+            return data
+        text = data.decode("utf-8")
+        text, count = re.subn(r'xlink:href="Pictures/[^"]+"', lambda _m: _ODT_LINKS[way](secret), text)
+        assert count, "the fixture has no embedded picture to turn into a link"
+        if way == "prefixed":
+            text = text.replace('xmlns:xlink="', 'xmlns:xl="').replace("xlink:", "xl:")
+        return text.encode("utf-8")
+
+    return _rezip(made, source.parent / f"linked.{fmt}", edit)
+
+
+@needs_office
+@pytest.mark.parametrize("way", sorted(_ODT_LINKS))
+def test_an_odt_picture_link_out_of_the_folder_never_reaches_the_pdf(registry, tmp_path, way):
+    secret, downloads = _red_secret(tmp_path)
+    clean = _make_docx_with_picture(downloads / "base.docx")
+    source = _linked_odf(tmp_path / "made", clean, secret, "odt", way)
+    assert docs._links_outside_files(source, "odt")
+    result = run(registry, "docs.doc_to_pdf", source)
+    assert not _pdf_has_images(result.outputs[0])
+    assert not _pdf_has_images(_direct_soffice(registry, source))
+
+
+def _linked_pptx(downloads: Path, secret: Path, quote: str = "'") -> Path:
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    slide.shapes.add_picture(str(_swatch(downloads)), Inches(1), Inches(1), Inches(6), Inches(4))
+    clean = downloads / "base.pptx"
+    deck.save(clean)
+
+    def edit(name: str, data: bytes) -> bytes:
+        if name == "ppt/slides/_rels/slide1.xml.rels":
+            text = re.sub(r'Target="\.\./media/[^"]+"',
+                          f"Target={quote}{secret.as_uri()}{quote} TargetMode={quote}External{quote}",
+                          data.decode("utf-8"))
+            return text.encode("utf-8")
+        if name == "ppt/slides/slide1.xml":
+            assert b"r:embed=" in data
+            return data.replace(b"r:embed=", b"r:link=")
+        return data
+
+    return _rezip(clean, downloads / "linked.pptx", edit)
+
+
+@needs_soffice
+@needs_pymupdf
+def test_a_pptx_r_link_to_a_file_url_is_removed_for_pdf_and_png(registry, tmp_path):
+    secret, downloads = _red_secret(tmp_path)
+    source = _linked_pptx(downloads, secret)
+    pdf = run(registry, "docs.slides_to_pdf", source).outputs[0]
+    assert not _pdf_has_images(pdf)
+    png = run(registry, "docs.slides_to_png", source).outputs[0]
+    assert _red_pixels(png) == 0
+
+
+@needs_soffice
+@needs_pymupdf
+def test_an_odp_with_an_external_picture_link_converts_without_it(registry, tmp_path):
+    secret, downloads = _red_secret(tmp_path)
+    from pptx import Presentation
+    from pptx.util import Inches
+
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    slide.shapes.add_picture(str(_swatch(downloads)), Inches(1), Inches(1), Inches(6), Inches(4))
+    deck.save(downloads / "base.pptx")
+    source = _linked_odf(tmp_path / "made", downloads / "base.pptx", secret, "odp", "single_quotes")
+    given, infilter = docs._soffice_gate(
+        Job(action=registry.get("docs.slides_to_pdf"), inputs=[source]), source, source)
+    assert given != source and infilter == "impress8"
+    with zipfile.ZipFile(given) as package:
+        assert b"secret.png" not in package.read("content.xml")
+        assert package.infolist()[0].filename == "mimetype"
+    assert not _pdf_has_images(_direct_soffice(registry, source, "docs.slides_to_pdf"))
+
+
+@needs_soffice
+@needs_pymupdf
+def test_an_xlsx_with_an_external_picture_link_converts_without_it(registry, tmp_path):
+    pytest.importorskip("openpyxl")
+    from openpyxl import Workbook
+    from openpyxl.drawing.image import Image as SheetImage
+
+    secret, downloads = _red_secret(tmp_path)
+    book = Workbook()
+    book.active["A1"] = "total"
+    book.active.add_image(SheetImage(str(_swatch(downloads))), "B2")
+    clean = downloads / "base.xlsx"
+    book.save(clean)
+
+    def edit(name: str, data: bytes) -> bytes:
+        if name == "xl/drawings/_rels/drawing1.xml.rels":
+            text = re.sub(r'Target="[^"]*media/[^"]+"',
+                          f"Target='{secret.as_uri()}' TargetMode='External'", data.decode("utf-8"))
+            return text.encode("utf-8")
+        if name == "xl/drawings/drawing1.xml":
+            assert b"r:embed=" in data
+            return data.replace(b"r:embed=", b"r:link=")
+        return data
+
+    source = _rezip(clean, downloads / "linked.xlsx", edit)
+    pdf = run(registry, "docs.sheet_to_pdf", source).outputs[0]
+    assert not _pdf_has_images(pdf)
+
+
+@needs_soffice
+@pytest.mark.parametrize("formula", ['=WEBSERVICE("http://127.0.0.1:9/x")',
+                                     "='file:///C:/private/book.ods'#$Sheet1.A1"])
+def test_a_workbook_formula_that_reads_another_file_is_refused(registry, tmp_path, formula):
+    pytest.importorskip("openpyxl")
+    from openpyxl import Workbook
+
+    book = Workbook()
+    book.active["A1"] = formula
+    source = tmp_path / "book.xlsx"
+    book.save(source)
+    result = registry.run("docs.sheet_to_pdf", [source], None)
+    assert not result.ok and result.code == "unsafe_input"
+
+
+def test_the_gate_refuses_what_it_cannot_read(registry, tmp_path):
+    job = Job(action=registry.get("docs.slides_to_pdf"), inputs=[tmp_path / "x.pptx"])
+
+    def package(name: str, parts: dict[str, bytes]) -> Path:
+        path = tmp_path / name
+        with zipfile.ZipFile(path, "w") as out:
+            for part, data in parts.items():
+                out.writestr(part, data)
+        return path
+
+    bomb = package("dtd.pptx", {"ppt/slides/slide1.xml":
+                                b'<?xml version="1.0"?><!DOCTYPE a [<!ENTITY x "y">]><a>&x;</a>'})
+    broken = package("broken.pptx", {"ppt/slides/slide1.xml": b"<a><b></a>"})
+    twice = tmp_path / "twice.pptx"
+    with zipfile.ZipFile(twice, "w") as out:
+        out.writestr("ppt/slides/slide1.xml", b"<a/>")
+        out.writestr("PPT/slides/slide1.xml", b"<a/>")
+    utf32 = package("utf32.pptx", {"ppt/slides/slide1.xml": "<a/>".encode("utf-32")})
+    not_zip = tmp_path / "locked.pptx"
+    not_zip.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 512)  # an encrypted OOXML is OLE
+    for path in (bomb, broken, twice, utf32, not_zip):
+        with pytest.raises(docs.RunnerFailed) as caught:
+            docs._soffice_gate(job, path, path)
+        assert caught.value.code == "unsafe_input", path.name
+
+    utf16 = package("utf16.pptx", {"ppt/slides/slide1.xml":
+                                   '<?xml version="1.0" encoding="UTF-16"?><a xmlns:r="r">'
+                                   '<img src="file:///C:/x.png"/></a>'.encode("utf-16")})
+    with pytest.raises(docs.RunnerFailed):
+        docs._soffice_gate(job, utf16, utf16)
+
+
+@pytest.mark.parametrize("value, outside", [
+    ("Pictures/a.png", False),
+    ("./Object 1", False),
+    ("media/../media/a.png", False),
+    ("../a.png", True),
+    ("..\\a.png", True),
+    ("..%2Fa.png", True),
+    ("%252e%252e/a.png", True),
+    ("/etc/passwd", True),
+    ("C:/private/a.png", True),
+    ("c:\\private\\a.png", True),
+    ("\\\\server\\share\\a.png", True),
+    ("//server/share/a.png", True),
+    ("file:///C:/a.png", True),
+    (" fi\tle:///a.png", True),
+    ("https://example.com/a.png", True),
+    ("vnd.sun.star.script:Standard.x", True),
+])
+def test_outside_ref_classifies_every_way_out(value, outside):
+    assert docs._outside_ref(value) is outside
+
+
+def test_an_internal_relationship_may_name_a_part_from_the_root():
+    assert not docs._outside_ref("/xl/media/image1.png", "xl/drawings", rooted=True)
+    assert not docs._outside_ref("../media/image1.png", "xl/drawings", rooted=True)
+    assert docs._outside_ref("../../../a.png", "xl/drawings", rooted=True)
+
+
+@needs_soffice
+def test_a_clean_package_is_handed_over_unchanged(registry, work):
+    for key, action in (("docx", "docs.doc_to_pdf"), ("pptx", "docs.slides_to_pdf"),
+                        ("xlsx", "docs.sheet_to_pdf")):
+        source = work(key)
+        job = Job(action=registry.get(action), inputs=[source])
+        assert docs._soffice_gate(job, source, source)[0] == source
+
+
+# --- CSV to XLSX is lossless, and every route reads one dialect ---------------
+
+
+@needs("openpyxl")
+def test_csv_to_xlsx_keeps_newlines_and_surrounding_spaces(registry, tmp_path):
+    from openpyxl import load_workbook
+
+    source = tmp_path / "notes.csv"
+    source.write_bytes(b'id,note\n1,"  first\nsecond  "\n2,"\ttabbed"\n')
+    out = run(registry, "docs.sheet_to_xlsx", source).outputs[0]
+    sheet = load_workbook(out).active
+    assert sheet["B2"].value == "  first\nsecond  "
+    assert sheet["B3"].value == "\ttabbed"
+
+
+@needs("openpyxl")
+@pytest.mark.parametrize("cell, code", [("A" * 40000, "cell_too_long"), ("bell\x07", "bad_character")],
+                         ids=["40000_characters", "control_character"])
+def test_csv_to_xlsx_refuses_a_cell_it_cannot_store(registry, tmp_path, cell, code):
+    source = _write(tmp_path / "big.csv", f'id,note\n1,"{cell}"\n')
+    result = registry.run("docs.sheet_to_xlsx", [source], None)
+    assert not result.ok and result.code == code
+    assert "B2" in result.message
+    assert not (tmp_path / "big.xlsx").exists()
+
+
+@needs_soffice
+def test_a_semicolon_csv_splits_the_same_for_ods_and_pdf(registry, tmp_path):
+    import pymupdf
+    from openpyxl import load_workbook
+
+    source = _write(tmp_path / "semi.csv", "name;qty\napple;3\n")
+    xlsx = run(registry, "docs.sheet_to_xlsx", source).outputs[0]
+    assert [c.value for c in load_workbook(xlsx).active[1]] == ["name", "qty"]
+    ods = run(registry, "docs.sheet_to_ods", source).outputs[0]
+    with zipfile.ZipFile(ods) as package:
+        content = package.read("content.xml").decode("utf-8")
+    assert "<text:p>name</text:p>" in content and "<text:p>qty</text:p>" in content
+    pdf = run(registry, "docs.sheet_to_pdf", source).outputs[0]
+    with pymupdf.open(pdf) as document:
+        text = document[0].get_text()
+    assert "name;qty" not in text and "qty" in text
+
+
+@needs_soffice
+def test_a_csv_formula_is_text_not_run(registry, tmp_path):
+    source = _write(tmp_path / "f.csv", 'a,b\n=1+1,"=WEBSERVICE(""http://127.0.0.1:9/x"")"\n')
+    ods = run(registry, "docs.sheet_to_ods", source).outputs[0]
+    with zipfile.ZipFile(ods) as package:
+        content = package.read("content.xml").decode("utf-8")
+    assert "table:formula" not in content
+    assert "<text:p>=1+1</text:p>" in content
