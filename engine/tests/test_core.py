@@ -615,19 +615,21 @@ def test_an_engine_entry_still_has_to_name_a_runner():
 # --- the built in family and the plugin path --------------------------------
 
 
-def test_the_real_registry_loads_the_text_family():
+def test_the_real_registry_loads_the_shipped_families():
     real = load_registry(force=True)
-    assert "text.to_md" in real
+    assert "docs.sub_to_txt" in real
     assert "files.copy_path" in real
 
 
-def test_txt_to_md_writes_a_sibling_file(make_file):
+def test_a_real_conversion_writes_a_sibling_file(make_file):
+    """Through a shipped entry that needs no backend, so this holds on a bare
+    machine: subtitles to text is pure Python."""
     real = load_registry()
-    src = make_file("notes.txt", "# title\n")
-    result = real.run("text.to_md", [src])
+    src = make_file("notes.srt", "1\n00:00:01,000 --> 00:00:02,000\nhello\n")
+    result = real.run("docs.sub_to_txt", [src])
     assert result.ok
-    assert result.outputs[0] == src.parent / "notes.md"
-    assert result.outputs[0].read_text(encoding="utf-8") == "# title\n"
+    assert result.outputs[0] == src.parent / "notes.txt"
+    assert result.outputs[0].read_text(encoding="utf-8") == "hello\n"
 
 
 def test_copy_path_works_on_a_mixed_selection(make_file, tmp_path):
@@ -705,7 +707,7 @@ def test_a_family_module_without_register_is_skipped_and_reported():
         with pytest.raises(RuntimeError, match="has no register"):
             load_registry(strict=True)
         real = load_registry(force=True)
-        assert "text.to_md" in real
+        assert "docs.sub_to_txt" in real
         assert [w["module"] for w in real.warnings] == ["peel_engine.families.zz_broken"]
         assert "has no register" in real.warnings[0]["message"]
     finally:
@@ -737,8 +739,8 @@ def test_a_family_whose_register_raises_is_rolled_back_whole(make_file):
                     inputs=("txt",), output_ext="x", runner="peel_engine.families.zz_clash:run",
                 )
                 registry.add(
-                    id="zz.dup", family=CONVERT, label="MD", group="Documents",
-                    inputs=("txt",), output_ext="md", runner="peel_engine.families.zz_clash:run",
+                    id="zz.dup", family=CONVERT, label="TXT", group="Subtitles",
+                    inputs=("srt",), output_ext="txt", runner="peel_engine.families.zz_clash:run",
                 )
             '''
         ).lstrip(),
@@ -752,7 +754,7 @@ def test_a_family_whose_register_raises_is_rolled_back_whole(make_file):
             load_registry(strict=True)
         real = load_registry(force=True)
         assert "zz.first" not in real and "zz.dup" not in real
-        assert "text.to_md" in real
+        assert "docs.sub_to_txt" in real
         options = real.options([make_file("a.txt")])
         assert options["ok"] is True
         assert "duplicate wheel segment" in options["warnings"][0]["message"]
@@ -829,29 +831,29 @@ def run_cli(argv, capsys) -> tuple[int, dict]:
 
 
 def test_cli_options_prints_the_wheels(make_file, capsys):
-    code, payload = run_cli(["options", str(make_file("a.txt"))], capsys)
+    code, payload = run_cli(["options", str(make_file("a.srt"))], capsys)
     assert code == 0
     assert payload["ok"] is True
-    assert "text.to_md" in ids(payload)
+    assert "docs.sub_to_txt" in ids(payload)
 
 
 def test_cli_run_prints_outputs_and_exits_zero(make_file, capsys):
-    src = make_file("a.txt", "x")
-    code, payload = run_cli(["run", "text.to_md", str(src)], capsys)
+    src = make_file("a.srt", "1\n00:00:01,000 --> 00:00:02,000\nhello\n")
+    code, payload = run_cli(["run", "docs.sub_to_txt", str(src)], capsys)
     assert code == 0
     assert payload == {
         "ok": True,
-        "outputs": [str(src.parent / "a.md")],
-        "message": "Wrote a.md",
+        "outputs": [str(src.parent / "a.txt")],
+        "message": "Wrote 1 subtitle to a.txt",
     }
 
 
 def test_cli_run_failure_exits_one_with_a_code(tmp_path, capsys):
-    code, payload = run_cli(["run", "text.to_md", str(tmp_path / "ghost.txt")], capsys)
+    code, payload = run_cli(["run", "docs.sub_to_txt", str(tmp_path / "ghost.srt")], capsys)
     assert code == 1
     assert payload["ok"] is False
     assert payload["code"] == "missing_file"
-    assert "ghost.txt" in payload["message"]
+    assert "ghost.srt" in payload["message"]
 
 
 def test_cli_rejects_an_unknown_action(make_file, capsys):
@@ -889,9 +891,9 @@ def test_cli_params_file_is_merged_and_pairs_win(tmp_path):
         [],
         ["bogus"],
         ["run"],
-        ["run", "text.to_md"],
-        ["run", "text.to_md", "a.txt", "--param"],
-        ["run", "text.to_md", "a.txt", "--param", "noequals"],
+        ["run", "docs.sub_to_txt"],
+        ["run", "docs.sub_to_txt", "a.srt", "--param"],
+        ["run", "docs.sub_to_txt", "a.srt", "--param", "noequals"],
         ["--indent", "x", "options"],
         ["options", "--nope"],
     ],
