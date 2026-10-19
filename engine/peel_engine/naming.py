@@ -40,7 +40,7 @@ def normalise_ext(ext: str) -> str:
 
 def path_key(path: Path | str) -> str:
     """Comparison key for a path: case-insensitive, as on Windows."""
-    return os.path.normpath(str(path)).casefold()
+    return os.path.normcase(os.path.abspath(str(path))).casefold()
 
 
 def claim(path: Path, *, directory: bool = False) -> bool:
