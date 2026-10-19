@@ -26,6 +26,13 @@ internal sealed class HotkeyListener : IDisposable
 
     internal bool Active => _registered;
 
+    /// <summary>PEEL_HOTKEY=off turned the hotkey off on purpose; nothing to tell the user.</summary>
+    internal bool DisabledByEnvironment { get; private set; }
+
+    /// <summary>The message the tray shows when the chord could not be registered.</summary>
+    internal const string ConflictMessage =
+        "Peel could not use Ctrl+Alt+Enter because another app uses it. Drag files to open the wheel.";
+
     /// <summary>
     /// Register the default chord. Returns false (and logs) when it cannot,
     /// most often because another app already owns Ctrl+Alt+Enter; Peel then
@@ -36,6 +43,7 @@ internal sealed class HotkeyListener : IDisposable
         if (string.Equals(Environment.GetEnvironmentVariable("PEEL_HOTKEY"), "off", StringComparison.OrdinalIgnoreCase))
         {
             Log.Write("PEEL_HOTKEY=off, the keyboard hotkey is disabled");
+            DisabledByEnvironment = true;
             return false;
         }
         try
