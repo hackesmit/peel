@@ -25,13 +25,16 @@ Add-Type -AssemblyName System.Drawing
 # The user's own Windows Terminal windows must survive this test. Record the
 # ones already open so the cleanup kills only terminals the probe started.
 $terminalsBefore = @(Get-Process -Name 'WindowsTerminal' -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+$calcBefore = @(Get-Process -Name 'CalculatorApp', 'calc', 'win32calc' -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
 
 $probeProject = Join-Path $Root 'shell\tests\ActionProbe'
 $probe = Join-Path $probeProject 'bin\Release\net8.0-windows10.0.19041.0\Peel.ActionProbe.exe'
-if (-not (Test-Path $probe)) {
-    Write-Output 'building the action probe'
-    & dotnet build $probeProject -c Release -v q --nologo | Out-Null
-}
+# Always build: a probe left from an older checkout would test old checks.
+# The --files list is separated by '|', which Windows forbids in a file name,
+# because ';' is legal in one (and is the Windows Terminal injection test).
+Write-Output 'building the action probe'
+& dotnet build $probeProject -c Release -v q --nologo | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "the probe did not build (exit $LASTEXITCODE)" }
 if (-not (Test-Path $probe)) { throw "the probe did not build: $probe" }
 
 $dir = 'C:\peel-dev\actions-check'
@@ -57,7 +60,7 @@ New-Png $img
 Set-Content -Path $txt -Value 'peel action check'
 New-Item -ItemType Directory -Force $folder | Out-Null
 Set-Content -Path (Join-Path $folder 'inside.txt') -Value 'x'
-$shared = @($img, $txt, $folder) -join ';'
+$shared = @($img, $txt, $folder) -join '|'
 
 $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $results = @{}
@@ -85,8 +88,23 @@ function Invoke-Probe($name, $argline) {
 }
 
 try {
+    # A share sheet left on screen by an earlier run would sit in the screenshots.
+    Invoke-Probe 'clean-start' ('clean --out "{0}\clean-start.txt"' -f $dir)
     Invoke-Probe 'copy'     ('copy --out "{0}\copy.txt" --files "{1}"' -f $dir, $shared)
+    # Copy Path runs this branch's engine (not the installed one) with the
+    # Python on PATH, on a file whose name has a space, a folder and the mix.
+    $spaced = Join-Path $fixtures 'with space.txt'
+    Set-Content -Path $spaced -Value 'spaced'
+    $python = (Get-Command python.exe -All | Where-Object { $_.Source -notmatch 'WindowsApps' } | Select-Object -First 1).Source
+    if (-not $python) { throw 'no real python.exe on PATH for the Copy Path check' }
+    $engineRoot = Join-Path $Root 'engine'
+    Invoke-Probe 'copypath' ('copypath --out "{0}\copypath.txt" --files "{1}" --python "{2}" --engine "{3}"' -f $dir, (@($spaced, $folder, $img) -join '|'), $python, $engineRoot)
     Invoke-Probe 'terminal' ('terminal --out "{0}\terminal.txt" --files "{1}"' -f $dir, $img)
+    # Windows Terminal parses ';' as a new subcommand. A folder with that name
+    # must open one tab in that folder and start nothing else.
+    $evil = Join-Path $fixtures 'safe; new-tab powershell -Command calc'
+    New-Item -ItemType Directory -Force -Path $evil | Out-Null
+    Invoke-Probe 'terminal-inject' ('terminal --out "{0}\terminal-inject.txt" --files "{1}"' -f $dir, $evil)
     Invoke-Probe 'float'    ('float --out "{0}\float.txt" --files "{1}" --shot "{0}\float.png" --wait 2500' -f $dir, $shared)
     Invoke-Probe 'share'    ('share --out "{0}\share.txt" --files "{1}" --shot "{0}\share.png" --wait 3500' -f $dir, $shared)
 
@@ -97,7 +115,8 @@ try {
     $mImg = Join-Path $moveSrc 'clip.png'; New-Png $mImg
     $mDir = Join-Path $moveSrc 'docs'; New-Item -ItemType Directory -Force $mDir | Out-Null
     Set-Content -Path (Join-Path $mDir 'a.txt') -Value 'y'
-    Invoke-Probe 'move' ('move --out "{0}\move.txt" --files "{1}" --dest "{2}"' -f $dir, (@($mImg, $mDir) -join ';'), $moveDst)
+    Invoke-Probe 'move' ('move --out "{0}\move.txt" --files "{1}" --dest "{2}"' -f $dir, (@($mImg, $mDir) -join '|'), $moveDst)
+    Invoke-Probe 'clean-end' ('clean --out "{0}\clean-end.txt"' -f $dir)
 }
 finally {
     # Kill only a Windows Terminal the probe started (one not open at the start),
@@ -105,13 +124,16 @@ finally {
     Get-Process -Name 'WindowsTerminal' -ErrorAction SilentlyContinue |
         Where-Object { $terminalsBefore -notcontains $_.Id } |
         Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process -Name 'CalculatorApp', 'calc', 'win32calc' -ErrorAction SilentlyContinue |
+        Where-Object { $calcBefore -notcontains $_.Id } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
     Get-Process -Name 'Peel.ActionProbe' -ErrorAction SilentlyContinue |
         Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
 Write-Output '=== action checks ==='
 $overall = $true
-foreach ($name in 'copy', 'terminal', 'move', 'float', 'share') {
+foreach ($name in 'clean-start', 'copy', 'copypath', 'terminal', 'terminal-inject', 'move', 'float', 'share', 'clean-end') {
     Write-Output "--- $name ---"
     $text = $results[$name]
     Write-Output $text

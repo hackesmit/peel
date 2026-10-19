@@ -209,10 +209,12 @@ function DropOnAction($segmentLabel) {
 
 $peelProcess = $null
 try {
+    # A share sheet left by an earlier run sits over the test window and
+    # swallows the drag, so clear the desktop first (e2e-hygiene.ps1).
+    . (Join-Path $PSScriptRoot 'e2e-hygiene.ps1')
+    L ("start: " + (Close-ShareSheets).Text)
     if (-not $App) {
-        $App = Get-ChildItem -Path (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'Peel\bin\Release') -Filter 'net8.0-windows*' -Directory |
-            ForEach-Object { Join-Path $_.FullName 'Peel.exe' } | Where-Object { Test-Path $_ } |
-            Sort-Object { (Get-Item $_).LastWriteTime } -Descending | Select-Object -First 1
+        $App = Find-PeelApp (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
     }
     if (-not (Test-Path $App)) { throw "Peel.exe not found: $App" }
 
@@ -285,10 +287,11 @@ try {
         $bitmap.Save($shareShot, [System.Drawing.Imaging.ImageFormat]::Png)
         $graphics.Dispose(); $bitmap.Dispose()
         Check 'share sheet screenshot taken' (Test-Path $shareShot) $shareShot
-        # Dismiss the sheet so nothing lingers on Daniel's desktop.
-        [In]::Tap($VkEsc)
-        Start-Sleep -Milliseconds 500
-        [In]::Tap($VkEsc)
+        # Dismiss the sheet so nothing lingers on Daniel's desktop. Escape
+        # alone did not (a sheet stayed on George for over an hour), so close
+        # it by its window and check that it is gone.
+        $gone = Close-ShareSheets
+        Check 'share sheet dismissed after the screenshot' ($gone.Found -ge 1 -and $gone.Left -eq 0) $gone.Text
     }
 }
 catch {
@@ -299,6 +302,13 @@ finally {
         try { Stop-Process -Id $peelProcess.Id -Force -ErrorAction SilentlyContinue } catch { }
     }
     Get-Process -Name 'Peel' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Nothing may stay on Daniel's desktop, the share sheet least of all.
+    try {
+        $endClean = Close-ShareSheets
+        L ("end: " + $endClean.Text)
+        Check 'no share sheet left on screen' ($endClean.Left -eq 0) $endClean.Text
+    }
+    catch { Check 'no share sheet left on screen' $false "$_" }
     CloseTestExplorer
     # Leave the clipboard clean: the Copy scenario put files on it.
     try { [System.Windows.Forms.Clipboard]::Clear() } catch { }

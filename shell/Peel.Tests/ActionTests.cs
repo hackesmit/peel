@@ -87,7 +87,29 @@ public class ActionTests
         var info = TerminalAction.Primary(@"C:\some folder & more");
         Assert.Equal("wt.exe", info.FileName);
         Assert.False(info.UseShellExecute);
-        Assert.Equal(new[] { "-d", @"C:\some folder & more" }, info.ArgumentList.ToArray());
+        Assert.Equal(@"C:\some folder & more", info.WorkingDirectory);
+        Assert.Equal(new[] { "-d", "." }, info.ArgumentList.ToArray());
+    }
+
+    [Theory]
+    [InlineData(@"C:\PeelTest\safe; new-tab powershell -Command calc")]
+    [InlineData(@"C:\PeelTest\x;timeout 25")]
+    [InlineData(@"C:\PeelTest\a b & c ^ %PATH%")]
+    public void TheFolderNeverReachesAnyCommandLine(string folder)
+    {
+        // Windows Terminal parses ';' in its arguments as a new subcommand, so
+        // the folder may only travel as the working directory (lucy round 1).
+        foreach (var info in new[] { TerminalAction.Primary(folder), TerminalAction.Fallback(folder) })
+        {
+            Assert.Equal(folder, info.WorkingDirectory);
+            Assert.Equal(string.Empty, info.Arguments);
+            foreach (var arg in info.ArgumentList)
+            {
+                Assert.DoesNotContain(";", arg);
+                Assert.DoesNotContain("PeelTest", arg);
+            }
+        }
+        Assert.Equal(TerminalAction.PrimaryArguments, TerminalAction.Primary(folder).ArgumentList.ToArray());
     }
 
     [Fact]
@@ -469,7 +491,7 @@ public class ActionTests
         try
         {
             RunCmd($"mklink /J \"{Path.Combine(into, "link")}\" \"{elsewhere}\"");
-            Assert.Throws<IOException>(() => MoveAction.CopyTree(album, target));
+            Assert.Throws<IOException>(() => CrossVolumeMove.Move(album, target));
             Assert.False(Directory.Exists(target));
             Assert.Equal("precious", File.ReadAllText(keep));
         }

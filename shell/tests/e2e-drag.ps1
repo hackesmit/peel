@@ -187,6 +187,10 @@ function SegmentPoint($centre, $labels, $label) {
 $peelProcess = $null
 $originalCursor = [System.Windows.Forms.Cursor]::Position
 try {
+    # A share sheet left by an earlier run sits over the test window and
+    # swallows the drag, so clear the desktop first (e2e-hygiene.ps1).
+    . (Join-Path $PSScriptRoot 'e2e-hygiene.ps1')
+    L ("start: " + (Close-ShareSheets).Text)
     Set-Content -Path (Join-Path $test $Source) -Value "Peel end to end test`r`nline two`r`n" -Encoding UTF8
     L "source ready: $test\$Source"
 
@@ -369,6 +373,7 @@ catch {
     Check 'driver completed' $false "$_"
 }
 finally {
+    try { L ("end: " + (Close-ShareSheets).Text) } catch { L "end: share sheet check failed: $_" }
     [System.Windows.Forms.Cursor]::Position = $originalCursor
     if ($peelProcess) { Stop-Process -Id $peelProcess.Id -ErrorAction SilentlyContinue }
     CloseTestExplorer

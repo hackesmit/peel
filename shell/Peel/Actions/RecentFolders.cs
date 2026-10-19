@@ -34,6 +34,31 @@ internal static class RecentFolders
         return result.Count > Max ? result.GetRange(0, Max) : result;
     }
 
+    /// <summary>
+    /// The folders that still exist, in order. A local path whose folder is
+    /// gone is dropped, so Move never offers a dead destination. A network
+    /// (UNC) path is kept without a check: probing an unreachable server can
+    /// block for many seconds, and Move reports a missing folder anyway.
+    /// </summary>
+    internal static IReadOnlyList<string> Prune(IReadOnlyList<string> folders, Func<string, bool> exists) =>
+        folders.Where(f => f.StartsWith(@"\\", StringComparison.Ordinal) || exists(f)).ToList();
+
+    /// <summary>The saved list with missing local folders removed (and saved so).</summary>
+    internal static IReadOnlyList<string> LoadExisting()
+    {
+        var saved = Load();
+        var kept = Prune(saved, Directory.Exists);
+        if (kept.Count != saved.Count)
+        {
+            Save(kept);
+        }
+        return kept;
+    }
+
+    /// <summary>The text of a menu item for <paramref name="folder"/>: '&amp;'
+    /// is doubled so WinForms shows it instead of reading it as a mnemonic.</summary>
+    internal static string MenuText(string folder) => folder.Replace("&", "&&");
+
     private static string StorePath()
     {
         var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
@@ -77,5 +102,5 @@ internal static class RecentFolders
     }
 
     /// <summary>Record a destination just used, folding it into the saved list.</summary>
-    internal static void Remember(string folder) => Save(Promote(Load(), folder));
+    internal static void Remember(string folder) => Save(Promote(Prune(Load(), Directory.Exists), folder));
 }

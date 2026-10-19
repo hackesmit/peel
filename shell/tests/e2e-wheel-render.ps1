@@ -122,6 +122,10 @@ $peelProcess = $null
 $originalCursor = [System.Windows.Forms.Cursor]::Position
 $shots = [System.Collections.ArrayList]::new()
 try {
+    # A share sheet left by an earlier run sits over the test window and
+    # swallows the drag, so clear the desktop first (e2e-hygiene.ps1).
+    . (Join-Path $PSScriptRoot 'e2e-hygiene.ps1')
+    L ("start: " + (Close-ShareSheets).Text)
     if (-not (Test-Path $Fake)) { throw "build the fake engine first: $Fake" }
     Set-Content -Path (Join-Path $test 'sample.txt') -Value "wheel rendering test`r`n" -Encoding UTF8
 
@@ -201,6 +205,7 @@ catch {
     Check 'driver completed' $false "$_"
 }
 finally {
+    try { L ("end: " + (Close-ShareSheets).Text) } catch { L "end: share sheet check failed: $_" }
     [System.Windows.Forms.Cursor]::Position = $originalCursor
     if ($peelProcess) { Stop-Process -Id $peelProcess.Id -ErrorAction SilentlyContinue }
     CloseTestExplorer

@@ -124,9 +124,13 @@ public class ReviewActionsTests
                 File.WriteAllText(Path.Combine(album, $"f{i:D2}.txt"), $"data {i}");
             }
             var held = Path.Combine(album, "f10.txt");
+            // Round 1 fix: a delete that fails no longer fails the move. The copy
+            // is complete and verified, so it is reported as a partial move
+            // naming the source file that stayed.
             using (new FileStream(held, FileMode.Open, FileAccess.Read, FileShare.Read))
             {
-                Assert.ThrowsAny<Exception>(() => MoveAction.MoveInto(album, UncAlias(dst)));
+                MoveAction.MoveInto(album, UncAlias(dst), out var remaining);
+                Assert.Equal(new[] { "f10.txt" }, remaining.ToArray());
             }
             var copy = Path.Combine(dst, "album");
             for (var i = 0; i < 20; i++)

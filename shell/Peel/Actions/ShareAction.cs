@@ -9,6 +9,10 @@
 // the DataRequested handler, with a deferral because resolving a path to a
 // StorageFile is asynchronous. If the sheet cannot be raised from the tray
 // process the failure is a message, not a crash (the bead's stop-when).
+//
+// Closing the anchor does not take the sheet down, and a sheet left on screen
+// outlives Peel and swallows the next drag beneath it. So a sheet Peel raised
+// is dismissed (ShareSheet) when the anchor's timer ends and when Peel exits.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -120,14 +124,23 @@ internal static class ShareAction
             // fires the instant the sheet takes focus). A timer takes the 1x1
             // invisible window down well after the sheet is done, and app exit
             // closes it in any case.
-            var cleanup = new DispatcherTimer { Interval = TimeSpan.FromMinutes(2) };
+            var generation = ++_generation;
+            var cleanup = new DispatcherTimer { Interval = AnchorLifetime };
             cleanup.Tick += (_, _) =>
             {
                 cleanup.Stop();
+                // Only the newest share's timer may take a sheet down, so an
+                // older timer never closes a sheet the user just raised again.
+                if (generation == _generation)
+                {
+                    DismissRaised("the anchor timer ended");
+                }
                 anchor.Close();
             };
             cleanup.Start();
+            DismissOnExit();
             interop.ShowShareUIForWindow(hwnd);
+            _raised = true;
             Log.Write($"share: share sheet raised for {files.Count} file(s)");
             return true;
         }
@@ -137,6 +150,48 @@ internal static class ShareAction
             error = ex.Message;
             anchor.Close();
             return false;
+        }
+    }
+
+    /// <summary>How long a raised sheet may stay before Peel takes it down.</summary>
+    internal static readonly TimeSpan AnchorLifetime = TimeSpan.FromMinutes(2);
+
+    // Set once Peel has raised a sheet, so Peel only ever dismisses a sheet
+    // when it raised one (never one the user opened from another app while
+    // Peel happened to be running and idle).
+    private static bool _raised;
+    private static int _generation;
+    private static bool _exitHooked;
+
+    private static void DismissOnExit()
+    {
+        if (_exitHooked || Application.Current is null)
+        {
+            return;
+        }
+        _exitHooked = true;
+        Application.Current.Exit += (_, _) => DismissRaised("Peel is exiting");
+    }
+
+    /// <summary>Take down any share sheet on screen if Peel raised one.</summary>
+    internal static void DismissRaised(string why)
+    {
+        if (!_raised)
+        {
+            return;
+        }
+        try
+        {
+            var left = ShareSheet.CloseAll();
+            Log.Write($"share: closing sheets because {why}, {left} left on screen");
+            if (left == 0)
+            {
+                _raised = false;
+            }
+        }
+        catch (Exception error)
+        {
+            Log.Write("share: dismissing the share sheet failed", error);
         }
     }
 
