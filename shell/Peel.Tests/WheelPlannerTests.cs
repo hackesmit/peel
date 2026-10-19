@@ -145,3 +145,51 @@ public class WheelPlannerTests
         Assert.False(plan.Segments[^1].Runnable);
     }
 }
+
+// The overlay watchdog. The drag state cannot be trusted to notice a missed
+// button up, because that state is what the missed event would have changed.
+public class StuckOverlayWatchTests
+{
+    [Fact]
+    public void AWheelThatIsNotShownIsNeverStuck()
+    {
+        var watch = new StuckOverlayWatch();
+        Assert.False(watch.Tick(wheelVisible: false, buttonDown: false));
+        Assert.False(watch.Tick(wheelVisible: false, buttonDown: false));
+    }
+
+    [Fact]
+    public void AWheelOpenDuringADragIsLeftAlone()
+    {
+        var watch = new StuckOverlayWatch();
+        for (var i = 0; i < 10; i++)
+        {
+            Assert.False(watch.Tick(wheelVisible: true, buttonDown: true));
+        }
+    }
+
+    [Fact]
+    public void OneTickOfGraceLetsADropArriveFirst()
+    {
+        var watch = new StuckOverlayWatch();
+        Assert.False(watch.Tick(wheelVisible: true, buttonDown: false));
+    }
+
+    [Fact]
+    public void AWheelLeftUpWithTheButtonReleasedIsHidden()
+    {
+        var watch = new StuckOverlayWatch();
+        watch.Tick(wheelVisible: true, buttonDown: false);
+        Assert.True(watch.Tick(wheelVisible: true, buttonDown: false));
+    }
+
+    [Fact]
+    public void TheGraceStartsAgainAfterEachDrag()
+    {
+        var watch = new StuckOverlayWatch();
+        watch.Tick(wheelVisible: true, buttonDown: false);
+        Assert.False(watch.Tick(wheelVisible: true, buttonDown: true));
+        Assert.False(watch.Tick(wheelVisible: true, buttonDown: false));
+        Assert.True(watch.Tick(wheelVisible: true, buttonDown: false));
+    }
+}
