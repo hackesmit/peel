@@ -302,6 +302,8 @@ def register(registry: Registry) -> None:
             Param("author", "string", "Author"),
             Param("latitude", "float", "Latitude", minimum=-90.0, maximum=90.0),
             Param("longitude", "float", "Longitude", minimum=-180.0, maximum=180.0),
+            Param("clear_location", "bool", "Clear location", default=False,
+                  help="With set: remove the GPS location and keep every other tag."),
         ),
         runner="peel_engine.families.image:metadata",
     )
@@ -1231,6 +1233,13 @@ def _draw_arrow(draw, shape: dict[str, Any]) -> None:
     draw.polygon([(x2, y2), *wings], fill=shape["color"])
 
 
+#: The smallest pixelation block image.redact uses, in pixels. Text set at
+#: ordinary sizes has strokes and counters well under this, so a block this
+#: big averages a glyph away. A region smaller than one block becomes a single
+#: averaged block.
+REDACT_MIN_BLOCK = 12
+
+
 def redact(job: Job) -> Result:
     """Hide regions for good, with a blur that cannot be undone or a black box.
 
@@ -1265,7 +1274,12 @@ def redact(job: Job) -> Result:
             left, top, right, bottom = box
             region = out.crop(box)
             span_w, span_h = right - left, bottom - top
-            step = max(2, min(span_w, span_h) // 6)
+            # The block size and the blur follow the LARGER side, with a floor.
+            # Taken from the shorter side, a 600 by 20 line of text got 3
+            # pixel cells and a 3 pixel blur, and its letters stayed legible.
+            # Six blocks across the long side and at least REDACT_MIN_BLOCK
+            # pixels each leave nothing glyph sized in any direction.
+            step = max(REDACT_MIN_BLOCK, max(span_w, span_h) // 6)
             small = region.resize(
                 (max(1, span_w // step), max(1, span_h // step)), Image.Resampling.BOX
             )
@@ -1420,6 +1434,7 @@ TAG_ARTIST = 0x013B
 TAG_XP_TITLE = 0x9C9B
 TAG_XP_AUTHOR = 0x9C9D
 TAG_GPS_IFD = 0x8825
+TAG_XMP = 700
 
 
 def metadata(job: Job) -> Result:
@@ -1461,6 +1476,8 @@ def metadata(job: Job) -> Result:
                 **extra,
             )
         exif = _edited_exif(img, job.params)
+        if job.params.get("clear_location"):
+            _drop_xmp_location(img)
         target = job.output_path()
         save(
             img,
@@ -1470,6 +1487,11 @@ def metadata(job: Job) -> Result:
             exif=exif,
             icc_profile=img.info.get("icc_profile"),
         )
+        if job.params.get("clear_location") and _location_left(target):
+            target.unlink(missing_ok=True)
+            raise RunnerFailed(
+                f"the location could not be removed from {source.name}; nothing was written"
+            )
         message = f"Wrote the new metadata into {target.name}"
         return ok([target], f"{message}.{note}" if note else message, **extra)
     finally:
@@ -1481,12 +1503,28 @@ def _edited_exif(img, params: dict[str, Any]):
     author = params["author"]
     latitude = params["latitude"]
     longitude = params["longitude"]
+    # set keeps every tag it is not given, so without this a user who empties
+    # the location boxes in the editor would save a file that still says where
+    # it was taken. clear_location drops the GPS directory and nothing else.
+    clear_location = bool(params.get("clear_location"))
     if (latitude is None) != (longitude is None):
         raise InvalidParams("a location needs both a latitude and a longitude")
-    if not title and not author and latitude is None:
-        raise InvalidParams("give a title, an author or a location to set")
+    if clear_location and latitude is not None:
+        raise InvalidParams("clear_location and a new location contradict each other; send one")
+    if not title and not author and latitude is None and not clear_location:
+        raise InvalidParams("give a title, an author, a location or clear_location to set")
 
     exif = img.getexif()
+    if clear_location and TAG_GPS_IFD in exif:
+        del exif[TAG_GPS_IFD]
+    if clear_location and TAG_XMP in exif:
+        # A TIFF keeps its XMP packet in IFD0, so getexif() hands it back and
+        # it would be written out again with exif:GPSLatitude still inside.
+        packet = _xmp_without_location(exif[TAG_XMP])
+        if packet is None:
+            del exif[TAG_XMP]
+        else:
+            exif[TAG_XMP] = packet
     if title:
         exif[TAG_DESCRIPTION] = title
         exif[TAG_XP_TITLE] = title.encode("utf-16-le") + b"\x00\x00"
@@ -1503,6 +1541,207 @@ def _edited_exif(img, params: dict[str, Any]):
         return exif_bytes(exif)
     except Exception as exc:
         raise RunnerFailed(f"that metadata cannot be written: {exc}") from None
+
+
+# XMP is Unicode text in any of UTF-8, UTF-16 or UTF-32 (XMP spec part 1,
+# 7.1), told apart by a byte order mark or, without one, by where the zero
+# bytes fall around the first "<". Longest marks first: the UTF-32LE mark
+# starts with the UTF-16LE one.
+_XMP_BOMS = (
+    (b"\x00\x00\xfe\xff", "utf-32-be"),
+    (b"\xff\xfe\x00\x00", "utf-32-le"),
+    (b"\xfe\xff", "utf-16-be"),
+    (b"\xff\xfe", "utf-16-le"),
+    (b"\xef\xbb\xbf", "utf-8"),
+)
+_XMP_UNMARKED = (
+    (b"\x00\x00\x00<", "utf-32-be"),
+    (b"<\x00\x00\x00", "utf-32-le"),
+    (b"\x00<", "utf-16-be"),
+    (b"<\x00", "utf-16-le"),
+)
+_XMP_DECLARED = ("utf-8", "utf8", "utf-16", "utf-16le", "utf-16be",
+                 "utf-32", "utf-32le", "utf-32be")
+
+
+def _xmp_text(value: Any) -> tuple[str, bytes, str] | None:
+    """The packet as text plus the mark and codec to write it back, or None.
+
+    None means the packet cannot be read safely (not bytes or text, not valid
+    in the encoding it claims, or declaring one XMP does not allow), and the
+    callers treat that as a packet that may still hold a location.
+    """
+    if isinstance(value, str):
+        return value, b"", "utf-8"
+    if not isinstance(value, bytes):
+        return None
+    bom, codec = b"", "utf-8"
+    for mark, name in _XMP_BOMS:
+        if value.startswith(mark):
+            bom, codec = mark, name
+            break
+    else:
+        for lead, name in _XMP_UNMARKED:
+            if value.startswith(lead):
+                codec = name
+                break
+    try:
+        text = value[len(bom):].decode(codec)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    import re
+
+    # A NUL or other C0 control is not allowed in XML: a reader may skip it
+    # and see a GPS name this pass cannot, so such a packet is unreadable.
+    if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", text):
+        return None
+    declared = re.match(r"""\s*<\?xml[^>]*?\sencoding\s*=\s*["']([^"']*)["']""", text)
+    if declared and declared.group(1).strip().lower() not in _XMP_DECLARED:
+        return None
+    return text, bom, codec
+
+
+# Any XMP property named GPS<something> in any letter case (exif:GPSLatitude,
+# exifEX:GPS..., drone-dji:GpsLatitude), as an element name or as an attribute.
+_XMP_GPS_NAME = r"(?:[\w.-]+:)?GPS[\w.-]*"
+_XMP_GPS_ATTRIBUTE = r"""\s[\w.-]+:GPS[\w.-]*\s*=\s*(?:"[^"]*"|'[^']*')"""
+
+
+def _xmp_without_gps(text: str) -> str | None:
+    """The text with every GPS element and attribute cut out, None if unsure.
+
+    One pass over the markup with str.find, so the cost is linear in the
+    packet: a backtracking regex took seconds on a packet full of unclosed
+    GPS elements. Anything the pass cannot follow (an unclosed tag, comment
+    or GPS element) gives None.
+    """
+    import re
+
+    gps_name = re.compile(_XMP_GPS_NAME, re.IGNORECASE)
+    gps_attribute = re.compile(_XMP_GPS_ATTRIBUTE, re.IGNORECASE)
+    tag_name = re.compile(r"</?\s*([^\s/>]+)")
+    tag_stop = re.compile(r"""[>"']""")
+    kept: list[str] = []
+    skipping: list[str] = []  # open element names inside a GPS property being cut out
+    pos = 0
+    while True:
+        lt = text.find("<", pos)
+        if lt < 0:
+            if not skipping:
+                kept.append(text[pos:])
+            break
+        if not skipping:
+            kept.append(text[pos:lt])
+        for opener, closer in (("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")):
+            if text.startswith(opener, lt):
+                close = text.find(closer, lt + len(opener))
+                if close < 0:
+                    return None
+                end = close + len(closer)
+                if not skipping:
+                    kept.append(text[lt:end])
+                pos = end
+                break
+        else:
+            # An element tag: find its ">" outside quoted attribute values.
+            i = lt + 1
+            while True:
+                stop = tag_stop.search(text, i)
+                if stop is None:
+                    return None
+                if stop.group() == ">":
+                    end = stop.end()
+                    break
+                quote = text.find(stop.group(), stop.end())
+                if quote < 0:
+                    return None
+                i = quote + 1
+            tag = text[lt:end]
+            pos = end
+            closing = tag.startswith("</")
+            empty = tag.endswith("/>") or tag.startswith("<!")
+            name = tag_name.match(tag)
+            name = name.group(1) if name else ""
+            if skipping:
+                if closing:
+                    # A close that does not match is markup we cannot follow.
+                    if name != skipping.pop():
+                        return None
+                elif not empty:
+                    skipping.append(name)
+                continue
+            if not closing and gps_name.fullmatch(name):
+                if not empty:
+                    skipping.append(name)
+                continue
+            kept.append(gps_attribute.sub("", tag))
+    if skipping:
+        return None
+    return "".join(kept)
+
+
+def _xmp_without_location(value: Any) -> bytes | None:
+    """The XMP packet with every GPS property taken out, None to drop it whole.
+
+    Scrubbing keeps the rest of the packet (an XMP orientation, a rating) in
+    the encoding it came in; when the packet cannot be decoded, the scrub
+    cannot follow it, or a GPS mention survives, dropping it is the only
+    answer that cannot leave the place behind.
+    """
+    decoded = _xmp_text(value)
+    if decoded is None:
+        return None
+    text, bom, codec = decoded
+    scrubbed = _xmp_without_gps(text)
+    if scrubbed is None or "GPS" in scrubbed.upper():
+        return None
+    return bom + scrubbed.encode(codec)
+
+
+def _drop_xmp_location(img) -> None:
+    """Scrub the XMP copies pillow would write back on its own.
+
+    Pillow's TIFF writer copies tag 700 from the source's own directory
+    (``tag_v2``, which the legacy ``tag`` view shares) and other writers fall
+    back to ``info["xmp"]``, whatever EXIF blob ``save`` is handed.
+    """
+    if "xmp" in img.info:
+        packet = _xmp_without_location(img.info["xmp"])
+        if packet is None:
+            del img.info["xmp"]
+        else:
+            img.info["xmp"] = packet
+    for directory in (getattr(img, "tag_v2", None), getattr(img, "tag", None)):
+        if directory is None or TAG_XMP not in directory:
+            continue
+        value = directory[TAG_XMP]
+        if isinstance(value, tuple) and len(value) == 1:
+            value = value[0]
+        packet = _xmp_without_location(value)
+        if packet is None:
+            del directory[TAG_XMP]
+        else:
+            directory[TAG_XMP] = packet
+
+
+def _location_left(target: Path) -> bool:
+    """True when the written file still says where it was taken, anywhere."""
+    Image = pillow()
+    with Image.open(target) as out:
+        exif = out.getexif()
+        if dict(exif.get_ifd(TAG_GPS_IFD)):
+            return True
+        for packet in (exif.get(TAG_XMP), out.info.get("xmp"), out.info.get("XML:com.adobe.xmp")):
+            if packet is None:
+                continue
+            if isinstance(packet, tuple) and len(packet) == 1:
+                packet = packet[0]
+            # Read in the packet's own encoding: a UTF-16 "GPS" is not the
+            # bytes b"GPS". A packet that cannot be read counts as a place.
+            decoded = _xmp_text(packet)
+            if decoded is None or "GPS" in decoded[0].upper():
+                return True
+    return False
 
 
 def _dms(value: float) -> tuple[float, float, float]:

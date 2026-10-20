@@ -14,6 +14,21 @@
     <Version>0.1.0</Version>
     <!-- The tray app is long lived and must not be the reason a drag feels slow. -->
     <TieredPGO>true</TieredPGO>
+    <!-- InvariantGlobalization is deliberately NOT set. WPF does not work in
+         globalization-invariant mode: it asks for culture 1033 behind the
+         user's back and gets CultureNotFoundException. Two paths that do it
+         are in Peel today, both found by the editor end to end run on George
+         (hq-plct.10): giving a TextBox the keyboard focus, which is every
+         editor field the user types in, and any {Binding}, which throws from
+         Language.GetSpecificCulture before the value is ever shown. A third
+         is a FontFamily looked up by name, which throws a
+         TypeInitializationException from MS.Internal.FontCache.MajorLanguages.
+         The app's own handler catches all three, so the symptom is a window
+         that is subtly wrong and a line in the log, not a crash, which is
+         exactly why this comment is here instead of a one word setting.
+         Nothing in the shell compares or sorts strings by culture, and every
+         value that goes to the engine is formatted with InvariantCulture, so
+         loading ICU changes no behaviour. -->
     <!-- WFAC010 tells WinForms apps to set the DPI mode in code. Peel is a WPF
          app that borrows WinForms only for the tray icon, and WPF reads its
          per monitor awareness from the manifest, so the manifest stays. -->

@@ -1,0 +1,53 @@
+<editors:EditorWindowBase x:Class="Peel.Editors.Image.RedactEditor"
+                          x:ClassModifier="internal"
+                          xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                          xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                          xmlns:editors="clr-namespace:Peel.Editors"
+                          Title="Redact"
+                          Background="{DynamicResource EditorBack}"
+                          SizeToContent="WidthAndHeight"
+                          ResizeMode="NoResize"
+                          FontFamily="Segoe UI">
+    <Window.Resources>
+        <ResourceDictionary Source="/Peel;component/Editors/EditorStyles.xaml" />
+    </Window.Resources>
+    <StackPanel Margin="14">
+        <DockPanel Margin="0,0,0,10">
+            <TextBlock Style="{StaticResource EditorTitle}" Text="Redact" DockPanel.Dock="Left" />
+            <TextBlock x:Name="Subject" Style="{StaticResource EditorText}" Margin="10,0,0,0"
+                       TextTrimming="CharacterEllipsis" />
+        </DockPanel>
+
+        <Border Background="{StaticResource EditorCanvas}" BorderBrush="{StaticResource EditorEdge}"
+                BorderThickness="1" HorizontalAlignment="Center">
+            <Grid x:Name="Stage" ClipToBounds="True">
+                <Image x:Name="Picture" Stretch="Fill" />
+                <Canvas x:Name="Overlay" Background="Transparent"
+                        AutomationProperties.AutomationId="RedactCanvas"
+                        AutomationProperties.Name="Redact area" />
+            </Grid>
+        </Border>
+
+        <WrapPanel x:Name="ModePanel" Margin="0,10,0,0" />
+
+        <WrapPanel Margin="0,8,0,0">
+            <Button Style="{StaticResource EditorButton}" Content="Undo"
+                    AutomationProperties.AutomationId="RedactUndo" Click="OnUndo" />
+            <Button Style="{StaticResource EditorButton}" Content="Clear"
+                    AutomationProperties.AutomationId="RedactClear" Click="OnClear" />
+            <TextBlock x:Name="Note" Style="{StaticResource EditorText}" Margin="6,0,0,0"
+                       Text="Redacting also removes the file's tags, including where the photo was taken." />
+        </WrapPanel>
+
+        <DockPanel Margin="0,12,0,0">
+            <TextBlock x:Name="Hint" Style="{StaticResource EditorText}" DockPanel.Dock="Left"
+                       AutomationProperties.AutomationId="RedactHint" />
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" DockPanel.Dock="Right">
+                <Button Style="{StaticResource EditorButton}" Content="Cancel"
+                        AutomationProperties.AutomationId="RedactCancel" Click="OnCancel" />
+                <Button Style="{StaticResource EditorPrimary}" Content="Hide"
+                        AutomationProperties.AutomationId="RedactApply" Click="OnApply" />
+            </StackPanel>
+        </DockPanel>
+    </StackPanel>
+</editors:EditorWindowBase>

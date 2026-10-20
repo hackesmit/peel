@@ -1,0 +1,119 @@
+<!--
+  One look for every editor window, so Crop and Redact are plainly the same
+  app as the wheel: the wheel's dark panel colour, the tool wheel's blue accent
+  (these are all Ctrl wheel tools) and Segoe UI at the wheel's sizes.
+  Colours are literals rather than bindings to WheelTheme because a
+  ResourceDictionary cannot read a static class, and they are stated once here.
+-->
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <SolidColorBrush x:Key="EditorBack" Color="#FF1E1E24" />
+    <SolidColorBrush x:Key="EditorPanel" Color="#FF26262E" />
+    <SolidColorBrush x:Key="EditorEdge" Color="#33FFFFFF" />
+    <SolidColorBrush x:Key="EditorInk" Color="#FFFFFFFF" />
+    <SolidColorBrush x:Key="EditorQuiet" Color="#B0FFFFFF" />
+    <SolidColorBrush x:Key="EditorAccent" Color="#FF3FA7FF" />
+    <SolidColorBrush x:Key="EditorWarn" Color="#FFFFB020" />
+    <SolidColorBrush x:Key="EditorCanvas" Color="#FF14141A" />
+
+    <Style x:Key="EditorTitle" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="Segoe UI" />
+        <Setter Property="FontSize" Value="15" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{StaticResource EditorInk}" />
+    </Style>
+
+    <Style x:Key="EditorText" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="Segoe UI" />
+        <Setter Property="FontSize" Value="12" />
+        <Setter Property="Foreground" Value="{StaticResource EditorQuiet}" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+    </Style>
+
+    <Style x:Key="EditorLabel" TargetType="TextBlock" BasedOn="{StaticResource EditorText}">
+        <Setter Property="Margin" Value="0,0,6,0" />
+    </Style>
+
+    <Style x:Key="EditorField" TargetType="TextBox">
+        <Setter Property="FontFamily" Value="Segoe UI" />
+        <Setter Property="FontSize" Value="12" />
+        <Setter Property="Background" Value="#FF14141A" />
+        <Setter Property="Foreground" Value="{StaticResource EditorInk}" />
+        <Setter Property="CaretBrush" Value="{StaticResource EditorInk}" />
+        <Setter Property="BorderBrush" Value="{StaticResource EditorEdge}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="Padding" Value="5,3" />
+        <Setter Property="MinWidth" Value="64" />
+        <Setter Property="VerticalContentAlignment" Value="Center" />
+    </Style>
+
+    <Style x:Key="EditorButton" TargetType="ButtonBase">
+        <Setter Property="FontFamily" Value="Segoe UI" />
+        <Setter Property="FontSize" Value="12" />
+        <Setter Property="Foreground" Value="{StaticResource EditorInk}" />
+        <Setter Property="Background" Value="{StaticResource EditorPanel}" />
+        <Setter Property="BorderBrush" Value="{StaticResource EditorEdge}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="Padding" Value="11,5" />
+        <Setter Property="MinWidth" Value="64" />
+        <Setter Property="Margin" Value="0,0,6,0" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ButtonBase">
+                    <Border x:Name="Shell"
+                            Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="5">
+                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
+                                          Margin="{TemplateBinding Padding}" />
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="Shell" Property="Background" Value="#FF32323C" />
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter TargetName="Shell" Property="Opacity" Value="0.45" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <Style x:Key="EditorPrimary" TargetType="ButtonBase" BasedOn="{StaticResource EditorButton}">
+        <Setter Property="Background" Value="{StaticResource EditorAccent}" />
+        <Setter Property="Foreground" Value="#FF10131A" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Margin" Value="0" />
+    </Style>
+
+    <!--
+      Used by the RadioButtons that make up every choice group in the editors.
+      A RadioButton is a ToggleButton, so this style fits both, and the custom
+      template drops the radio circle: these read as a row of pressed buttons.
+      They are RadioButtons rather than ToggleButtons because a ToggleButton
+      driven through UI Automation gets OnToggle, which changes IsChecked
+      without raising Click, so a window that listened for Click would not
+      answer a screen reader or a scripted test at all.
+    -->
+    <Style x:Key="EditorToggle" TargetType="ToggleButton" BasedOn="{StaticResource EditorButton}">
+        <Setter Property="MinWidth" Value="52" />
+        <Setter Property="Padding" Value="9,4" />
+        <Style.Triggers>
+            <Trigger Property="IsChecked" Value="True">
+                <Setter Property="Background" Value="{StaticResource EditorAccent}" />
+                <Setter Property="Foreground" Value="#FF10131A" />
+            </Trigger>
+        </Style.Triggers>
+    </Style>
+
+    <Style x:Key="EditorSlider" TargetType="Slider">
+        <Setter Property="Width" Value="190" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+        <Setter Property="IsSnapToTickEnabled" Value="False" />
+        <Setter Property="Foreground" Value="{StaticResource EditorAccent}" />
+    </Style>
+
+</ResourceDictionary>
