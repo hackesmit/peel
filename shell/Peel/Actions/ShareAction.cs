@@ -11,8 +11,11 @@
 // process the failure is a message, not a crash (the bead's stop-when).
 //
 // Closing the anchor does not take the sheet down, and a sheet left on screen
-// outlives Peel and swallows the next drag beneath it. So a sheet Peel raised
-// is dismissed (ShareSheet) when the anchor's timer ends and when Peel exits.
+// outlives Peel and swallows the next drag beneath it. So the sheet Peel raised
+// is dismissed when the anchor's timer ends and when Peel exits. Only that
+// sheet: ShareOwner claims the one sheet that appeared after Peel raised its
+// own and drops the claim when it leaves the screen, so a sheet another app
+// opens is never closed (lucy round 2).
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -133,14 +136,15 @@ internal static class ShareAction
                 // older timer never closes a sheet the user just raised again.
                 if (generation == _generation)
                 {
-                    DismissRaised("the anchor timer ended");
+                    Dismiss("the anchor timer ended");
                 }
                 anchor.Close();
             };
             cleanup.Start();
             DismissOnExit();
+            Owner.BeforeRaise();
             interop.ShowShareUIForWindow(hwnd);
-            _raised = true;
+            Watch(generation);
             Log.Write($"share: share sheet raised for {files.Count} file(s)");
             return true;
         }
@@ -156,12 +160,56 @@ internal static class ShareAction
     /// <summary>How long a raised sheet may stay before Peel takes it down.</summary>
     internal static readonly TimeSpan AnchorLifetime = TimeSpan.FromMinutes(2);
 
-    // Set once Peel has raised a sheet, so Peel only ever dismisses a sheet
-    // when it raised one (never one the user opened from another app while
-    // Peel happened to be running and idle).
-    private static bool _raised;
+    /// <summary>How long Peel looks for its sheet after raising it.</summary>
+    internal static readonly TimeSpan ClaimWindow = TimeSpan.FromSeconds(10);
+
+    private static readonly ShareOwner Owner = new(ShareSheet.Find, ShareSheet.IsShown, ShareSheet.Close);
     private static int _generation;
     private static bool _exitHooked;
+
+    /// <summary>Find the sheet this share raised, then watch it until it
+    /// leaves the screen, so the claim never outlives Peel's own sheet.</summary>
+    private static void Watch(int generation)
+    {
+        var deadline = DateTime.UtcNow + ClaimWindow;
+        var watch = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
+        watch.Tick += (_, _) =>
+        {
+            if (generation != _generation)
+            {
+                watch.Stop();
+                return;
+            }
+            try
+            {
+                var before = Owner.Owned;
+                if (Owner.Waiting && DateTime.UtcNow > deadline)
+                {
+                    Owner.StopWaiting();
+                    Log.Write("share: no new share sheet appeared, so Peel owns none");
+                }
+                var watching = Owner.Poll();
+                if (before == IntPtr.Zero && Owner.Owned != IntPtr.Zero)
+                {
+                    Log.Write("share: found Peel's share sheet");
+                }
+                else if (before != IntPtr.Zero && Owner.Owned == IntPtr.Zero)
+                {
+                    Log.Write("share: Peel's share sheet was dismissed");
+                }
+                if (!watching)
+                {
+                    watch.Stop();
+                }
+            }
+            catch (Exception error)
+            {
+                watch.Stop();
+                Log.Write("share: watching the share sheet failed", error);
+            }
+        };
+        watch.Start();
+    }
 
     private static void DismissOnExit()
     {
@@ -170,23 +218,19 @@ internal static class ShareAction
             return;
         }
         _exitHooked = true;
-        Application.Current.Exit += (_, _) => DismissRaised("Peel is exiting");
+        Application.Current.Exit += (_, _) => Dismiss("Peel is exiting");
     }
 
-    /// <summary>Take down any share sheet on screen if Peel raised one.</summary>
-    internal static void DismissRaised(string why)
+    /// <summary>Take down Peel's own share sheet if it is still on screen.</summary>
+    private static void Dismiss(string why)
     {
-        if (!_raised)
-        {
-            return;
-        }
         try
         {
-            var left = ShareSheet.CloseAll();
-            Log.Write($"share: closing sheets because {why}, {left} left on screen");
-            if (left == 0)
+            var owned = Owner.Owned != IntPtr.Zero;
+            var gone = Owner.Dismiss();
+            if (owned)
             {
-                _raised = false;
+                Log.Write($"share: closing Peel's sheet because {why}: {(gone ? "closed" : "still on screen")}");
             }
         }
         catch (Exception error)

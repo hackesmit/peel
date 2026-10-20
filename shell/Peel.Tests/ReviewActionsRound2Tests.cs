@@ -61,7 +61,7 @@ public class ReviewActionsRound2Tests
 
     // --- Attributes, timestamps -------------------------------------------
 
-    [Fact(Skip = "review round 2 follow-up: FileDispositionInfo cannot delete a read-only source, so it stays and is reported as new, changed or in use")]
+    [Fact]
     public void AReadOnlyFileIsMovedAcrossVolumesNotLeftBehind()
     {
         var root = NewRoot();

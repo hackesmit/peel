@@ -1,6 +1,6 @@
 // The fallback for moving a folder to another volume, where one rename is not
 // possible. It is built so that no data is ever lost, even while other programs
-// keep writing into the folder (lucy round 1):
+// keep writing into the folder or into the destination (lucy rounds 1 and 2):
 //
 // 1. Preflight, before anything is touched: refuse a tree holding a junction or
 //    symbolic link (a copy would turn it into a plain folder), and refuse a
@@ -8,20 +8,32 @@
 //    keeps a directory's streams, so deleting the source would destroy them).
 // 2. Manifest: every file and folder with its relative path, identity (volume
 //    serial plus file index), size, last write time and named file streams.
-// 3. Copy from the manifest only. Any copy failure removes the destination
-//    folder this move created and leaves the source untouched.
-// 4. Verify every copy: same size as the manifest, the same named streams
-//    (File.Copy keeps a file's streams on NTFS; a FAT or exFAT destination
-//    would drop them, and that also fails the move before any delete), and a
-//    SHA-256 of the copy is recorded.
+// 3. Copy from the manifest into a private staging folder next to the target.
+//    The staging folder is reserved with a fresh random name that CreateDirectory
+//    must create itself (an existing folder is never taken over), and every
+//    folder and file inside it is created exclusively and recorded with its
+//    identity. A failure removes only those recorded entries, one at a time and
+//    only while they still have the recorded identity, so nothing another
+//    program put there is ever deleted. The finished copy is published with a
+//    rename that never replaces: a target that appeared meanwhile fails the
+//    move, and the target is never touched.
+// 4. Protect and verify the destination: every copied folder and file, and
+//    every named stream of every file, is opened with a handle that denies
+//    writers and deleters, its identity is checked against the staging record,
+//    and the main stream and each named stream are hashed through those
+//    handles. The handles stay open until the source deletion is over, so the
+//    verified copy cannot change or disappear in between. A copy that is
+//    missing or was replaced keeps its source.
 // 5. Delete only source entries that still match. Each source file is opened
-//    with DELETE access and no write or delete sharing, so nothing can change
-//    or replace it in the interval; through that handle its identity, size,
-//    last write time and SHA-256 are checked against the manifest and the
-//    copy, and only then is it marked delete-on-close through the same handle.
-//    Folders are removed deepest first and only when empty. Nothing is ever
-//    deleted recursively, so a file created during the move is never seen,
-//    never copied and never deleted: it stays in the source.
+//    with DELETE access and no write or delete sharing, and each of its named
+//    streams with a handle that denies writers; through those handles its
+//    identity, size, last write time, stream names and every stream's SHA-256
+//    are checked against the manifest and the protected copy, and only then is
+//    it marked delete-on-close through the same handle (read-only files
+//    included). The stream list is read once more after the mark, and the mark
+//    is withdrawn if a stream appeared. Folders are removed deepest first and
+//    only when empty. Nothing is ever deleted recursively, so a file created
+//    during the move is never seen, never copied and never deleted: it stays.
 // 6. Whatever is still in the source is reported by name as a partial move.
 using System;
 using System.Collections.Generic;
@@ -45,8 +57,15 @@ internal static class CrossVolumeMove
         string Relative, bool IsDirectory, FileId Id, long Size, DateTime LastWriteUtc,
         IReadOnlyList<(string Name, long Size)> Streams);
 
+    /// <summary>The hashes of one verified copy: the main stream and every
+    /// named stream by name.</summary>
+    internal sealed record Verified(byte[] Main, IReadOnlyDictionary<string, byte[]> Streams);
+
     /// <summary>How many remaining names a report lists before "and N more".</summary>
     internal const int ReportNames = 5;
+
+    /// <summary>The name prefix of a staging folder.</summary>
+    internal const string StagingPrefix = ".peel-move-";
 
     // --- Preflight and manifest -------------------------------------------
 
@@ -96,100 +115,337 @@ internal static class CrossVolumeMove
 
     /// <summary>
     /// Copy, verify, then delete matching sources. Throws (with the source
-    /// untouched and the partial destination removed) when the preflight, the
-    /// copy or the verification fails.
+    /// untouched, the target untouched and Peel's own staging entries removed)
+    /// when the preflight, the copy or the publish fails. The hooks are for
+    /// tests: <paramref name="duringCopy"/> gets the staging folder before the
+    /// first copy, <paramref name="afterCopy"/> the published target before it
+    /// is protected, <paramref name="whileProtected"/> the target while the
+    /// verified copy is held and before any source is deleted.
     /// </summary>
-    internal static CrossVolumeResult Move(string source, string target, Action<string>? afterCopy = null)
+    internal static CrossVolumeResult Move(
+        string source, string target, Action<string>? afterCopy = null,
+        Action<string>? duringCopy = null, Action<string>? whileProtected = null)
     {
         var manifest = Manifest(source);
         if (Directory.Exists(target) || File.Exists(target))
         {
             throw new IOException($"\"{target}\" already exists");
         }
-        Directory.CreateDirectory(target);
-        Dictionary<string, byte[]> hashes;
+        var staging = Staging.Reserve(Path.GetDirectoryName(Path.GetFullPath(target))!);
         try
         {
-            hashes = CopyAndVerify(source, target, manifest);
+            duringCopy?.Invoke(staging.Root);
+            CopyInto(source, staging, manifest);
+            staging.Publish(target);
         }
         catch
         {
-            RemovePartialCopy(target);
+            staging.Clean();
             throw;
         }
         afterCopy?.Invoke(target);
-        var remaining = DeleteMatching(source, manifest, hashes);
+        using var guard = DestinationGuard.Protect(target, manifest, staging.Ids);
+        whileProtected?.Invoke(target);
+        var remaining = DeleteMatching(source, manifest, guard.Verified);
         return new CrossVolumeResult(target, remaining);
     }
 
-    private static Dictionary<string, byte[]> CopyAndVerify(string source, string target, IReadOnlyList<Entry> manifest)
+    private static void CopyInto(string source, Staging staging, IReadOnlyList<Entry> manifest)
     {
-        var hashes = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         foreach (var entry in manifest)
         {
-            var copy = Path.GetFullPath(Path.Combine(target, entry.Relative));
             if (entry.IsDirectory)
             {
-                Directory.CreateDirectory(copy);
+                if (entry.Relative != ".")
+                {
+                    staging.CreateFolder(entry.Relative);
+                }
                 continue;
             }
-            Directory.CreateDirectory(Path.GetDirectoryName(copy)!);
-            File.Copy(Path.Combine(source, entry.Relative), copy, overwrite: false);
-            var copiedStreams = NamedStreams(copy);
-            if (!SameStreams(entry.Streams, copiedStreams))
+            var copy = staging.CopyFile(Path.Combine(source, entry.Relative), entry.Relative);
+            // A FAT or exFAT destination drops named streams; that fails the
+            // move here, before anything is deleted. Sizes and contents are
+            // compared later, under protection, against the source as it is
+            // when it is deleted.
+            var copied = NamedStreams(copy).Select(s => s.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (!entry.Streams.All(s => copied.Contains(s.Name)))
             {
                 throw new IOException(
                     $"the copy of \"{entry.Relative}\" lost its alternate data streams (is the destination NTFS?); nothing was moved");
             }
-            // A size that differs from the manifest means the file changed
-            // while it was copied; the copy is kept but the source will not
-            // match below, so the source stays. Its hash is still recorded.
-            using var stream = new FileStream(copy, FileMode.Open, FileAccess.Read, FileShare.Read);
-            hashes[entry.Relative] = SHA256.HashData(stream);
         }
-        return hashes;
     }
 
-    /// <summary>Remove the destination folder this move created. Only called
-    /// for a folder that did not exist before the move.</summary>
-    private static void RemovePartialCopy(string target)
+    // --- Staging ---------------------------------------------------------------
+
+    /// <summary>
+    /// A private folder next to the target that only this move created, plus
+    /// every entry the move created inside it. Cleaning removes those entries
+    /// and nothing else.
+    /// </summary>
+    internal sealed class Staging
     {
-        try
+        private readonly List<(string Relative, FileId Id, bool IsDirectory)> _owned = new();
+
+        private Staging(string root, FileId id)
         {
-            if (Directory.Exists(target))
+            Root = root;
+            _owned.Add((".", id, true));
+        }
+
+        internal string Root { get; private set; }
+
+        /// <summary>The identity of every owned entry by relative path ("." is the root).</summary>
+        internal IReadOnlyDictionary<string, FileId> Ids =>
+            _owned.ToDictionary(o => o.Relative, o => o.Id, StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Create a new folder with a random name in <paramref name="parent"/>.
+        /// CreateDirectoryW fails on an existing name, so success means this
+        /// call made it; an existing folder is never adopted.</summary>
+        internal static Staging Reserve(string parent)
+        {
+            for (var attempt = 0; ; attempt++)
             {
-                Directory.Delete(target, recursive: true);
+                var root = Path.Combine(parent, StagingPrefix + Guid.NewGuid().ToString("N"));
+                if (CreateDirectoryW(root, IntPtr.Zero))
+                {
+                    return new Staging(root, Stat(root).Id);
+                }
+                var error = Marshal.GetLastWin32Error();
+                if (error != ERROR_ALREADY_EXISTS || attempt >= 3)
+                {
+                    throw new IOException($"cannot create a staging folder in \"{parent}\": {new Win32Exception(error).Message}", error);
+                }
             }
         }
-        catch (Exception error)
+
+        internal void CreateFolder(string relative)
         {
-            Log.Write($"move: could not remove the partial copy {target}", error);
+            var path = Path.Combine(Root, relative);
+            if (!CreateDirectoryW(path, IntPtr.Zero))
+            {
+                var error = Marshal.GetLastWin32Error();
+                throw new IOException($"cannot create \"{path}\": {new Win32Exception(error).Message}", error);
+            }
+            _owned.Add((relative, Stat(path).Id, true));
+        }
+
+        /// <summary>Copy one file in; File.Copy without overwrite fails on an
+        /// existing name, so the copy is always a new file of this move's.</summary>
+        internal string CopyFile(string from, string relative)
+        {
+            var path = Path.Combine(Root, relative);
+            File.Copy(from, path, overwrite: false);
+            _owned.Add((relative, Stat(path).Id, false));
+            return path;
+        }
+
+        /// <summary>Rename the staging folder to <paramref name="target"/>,
+        /// failing (never replacing) when the target exists.</summary>
+        internal void Publish(string target)
+        {
+            if (!MoveFileExW(Root, target, 0))
+            {
+                var error = Marshal.GetLastWin32Error();
+                var why = error is ERROR_ALREADY_EXISTS or ERROR_FILE_EXISTS
+                    ? "already exists"
+                    : new Win32Exception(error).Message;
+                throw new IOException($"cannot publish the copy as \"{target}\": {why}", error);
+            }
+            Root = target;
+        }
+
+        /// <summary>
+        /// Remove what this move created: files first, then folders deepest
+        /// first, each only while it has the recorded identity, and a folder
+        /// only when empty. Anything else in the folder stays, and so does the
+        /// folder holding it.
+        /// </summary>
+        internal void Clean()
+        {
+            var order = _owned.Where(o => !o.IsDirectory)
+                .Concat(_owned.Where(o => o.IsDirectory).OrderByDescending(o => o.Relative == "." ? -1 : o.Relative.Length));
+            foreach (var (relative, id, isDirectory) in order)
+            {
+                var path = relative == "." ? Root : Path.Combine(Root, relative);
+                if (!TryDeleteOwned(path, id, isDirectory, out var why))
+                {
+                    Log.Write($"move: left {path} in place while cleaning up: {why}");
+                }
+            }
         }
     }
 
+    /// <summary>Delete one file or empty folder through a handle, only if it
+    /// still has identity <paramref name="id"/>.</summary>
+    private static bool TryDeleteOwned(string path, FileId id, bool isDirectory, out string why)
+    {
+        using var handle = CreateFileW(path, DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | (isDirectory ? FILE_FLAG_BACKUP_SEMANTICS : 0), IntPtr.Zero);
+        if (handle.IsInvalid || !GetFileInformationByHandle(handle, out var info))
+        {
+            why = new Win32Exception(Marshal.GetLastWin32Error()).Message;
+            return false;
+        }
+        if (Unpack(info).Id != id)
+        {
+            why = "it is not the entry this move created";
+            return false;
+        }
+        return MarkForDelete(handle, out why);
+    }
+
+    // --- Destination protection ------------------------------------------------
+
+    /// <summary>
+    /// Handles on every folder, file and named stream of the published copy,
+    /// opened so nothing else can write to or delete them, plus the hashes read
+    /// through them. Disposing releases the copy.
+    /// </summary>
+    private sealed class DestinationGuard : IDisposable
+    {
+        private readonly List<SafeFileHandle> _handles = new();
+        private readonly Dictionary<string, Verified> _verified = new(StringComparer.OrdinalIgnoreCase);
+
+        internal IReadOnlyDictionary<string, Verified> Verified => _verified;
+
+        internal static DestinationGuard Protect(string target, IReadOnlyList<Entry> manifest, IReadOnlyDictionary<string, FileId> ids)
+        {
+            var guard = new DestinationGuard();
+            try
+            {
+                // Folders first, the root first: a folder held without delete
+                // sharing cannot be renamed or removed, so the paths opened
+                // below stay the copy's. Folders above the target need no
+                // hold: every check is by identity through these handles, so a
+                // renamed ancestor moves the copy, it never loses it.
+                foreach (var entry in manifest.Where(e => e.IsDirectory).OrderBy(e => e.Relative == "." ? -1 : e.Relative.Length))
+                {
+                    var path = entry.Relative == "." ? target : Path.Combine(target, entry.Relative);
+                    var handle = CreateFileW(path, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+                    if (!guard.Keep(handle, path, ids.GetValueOrDefault(entry.Relative), out var why))
+                    {
+                        Log.Write($"move: cannot hold the copied folder {path}: {why}");
+                    }
+                }
+                foreach (var entry in manifest.Where(e => !e.IsDirectory))
+                {
+                    var path = Path.Combine(target, entry.Relative);
+                    if (guard.TryVerify(path, ids.GetValueOrDefault(entry.Relative), out var verified, out var why))
+                    {
+                        guard._verified[entry.Relative] = verified;
+                    }
+                    else
+                    {
+                        Log.Write($"move: the copy {path} cannot be verified, its source stays: {why}");
+                    }
+                }
+                return guard;
+            }
+            catch
+            {
+                guard.Dispose();
+                throw;
+            }
+        }
+
+        private bool Keep(SafeFileHandle handle, string path, FileId expected, out string why)
+        {
+            if (handle.IsInvalid || !GetFileInformationByHandle(handle, out var info))
+            {
+                why = new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                handle.Dispose();
+                return false;
+            }
+            if (Unpack(info).Id != expected)
+            {
+                why = "it is not the copy this move made";
+                handle.Dispose();
+                return false;
+            }
+            _handles.Add(handle);
+            why = string.Empty;
+            return true;
+        }
+
+        private bool TryVerify(string path, FileId expected, out Verified verified, out string why)
+        {
+            verified = null!;
+            try
+            {
+                var main = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, IntPtr.Zero,
+                    OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, IntPtr.Zero);
+                if (!Keep(main, path, expected, out why))
+                {
+                    return false;
+                }
+                var streams = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
+                foreach (var name in StreamNames(main))
+                {
+                    var stream = CreateFileW(path + name, GENERIC_READ, FILE_SHARE_READ, IntPtr.Zero,
+                        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, IntPtr.Zero);
+                    if (stream.IsInvalid)
+                    {
+                        why = $"cannot hold its stream {name}: {new Win32Exception(Marshal.GetLastWin32Error()).Message}";
+                        stream.Dispose();
+                        return false;
+                    }
+                    _handles.Add(stream);
+                    streams[name] = Hash(stream);
+                }
+                verified = new Verified(Hash(main), streams);
+                why = string.Empty;
+                return true;
+            }
+            catch (Exception error)
+            {
+                why = error.Message;
+                return false;
+            }
+        }
+
+        public void Dispose()
+        {
+            foreach (var handle in _handles)
+            {
+                handle.Dispose();
+            }
+            _handles.Clear();
+        }
+    }
+
+    // --- Source deletion -------------------------------------------------------
+
     private static IReadOnlyList<string> DeleteMatching(
-        string source, IReadOnlyList<Entry> manifest, IReadOnlyDictionary<string, byte[]> hashes)
+        string source, IReadOnlyList<Entry> manifest, IReadOnlyDictionary<string, Verified> copies)
     {
         var remaining = new List<string>();
         foreach (var entry in manifest.Where(e => !e.IsDirectory))
         {
             var path = Path.Combine(source, entry.Relative);
-            if (!TryDeleteIfUnchanged(path, entry, hashes[entry.Relative], out var why))
+            string why;
+            if (!copies.TryGetValue(entry.Relative, out var copy))
             {
-                Log.Write($"move: kept {path}: {why}");
-                remaining.Add(entry.Relative);
+                why = "its copy could not be verified";
             }
+            else if (TryDeleteIfUnchanged(path, entry, copy, out why))
+            {
+                continue;
+            }
+            Log.Write($"move: kept {path}: {why}");
+            remaining.Add(entry.Relative);
         }
-        // Deepest folders first, the root last; RemoveDirectory only removes an
-        // empty folder, so a folder holding a kept or new file stays.
+        // Deepest folders first, the root last; a folder is only removed when
+        // it is empty, so a folder holding a kept or new file stays.
         foreach (var entry in manifest.Where(e => e.IsDirectory).OrderByDescending(e => e.Relative == "." ? -1 : e.Relative.Length))
         {
             var path = entry.Relative == "." ? source : Path.Combine(source, entry.Relative);
             try
             {
-                if (Stat(path).Id == entry.Id && NamedStreams(path).Count == 0)
+                if (NamedStreams(path).Count == 0 && !TryDeleteOwned(path, entry.Id, isDirectory: true, out var why))
                 {
-                    Directory.Delete(path, recursive: false);
+                    Log.Write($"move: kept folder {path}: {why}");
                 }
             }
             catch (Exception error)
@@ -228,15 +484,15 @@ internal static class CrossVolumeMove
 
     /// <summary>
     /// Delete one source file only if it is still exactly the file that was
-    /// copied. The handle denies writers and other deleters for the whole
-    /// check, and the delete goes through that same handle, so nothing can
+    /// copied, every named stream included. The handles deny writers for the
+    /// whole check, and the delete goes through the main handle, so nothing can
     /// slip in between the check and the delete.
     /// </summary>
-    internal static bool TryDeleteIfUnchanged(string path, Entry entry, byte[] copyHash, out string why)
+    internal static bool TryDeleteIfUnchanged(string path, Entry entry, Verified copy, out string why)
     {
         try
         {
-            return DeleteIfUnchanged(path, entry, copyHash, out why);
+            return DeleteIfUnchanged(path, entry, copy, out why);
         }
         catch (Exception error)
         {
@@ -246,16 +502,8 @@ internal static class CrossVolumeMove
         }
     }
 
-    private static bool DeleteIfUnchanged(string path, Entry entry, byte[] copyHash, out string why)
+    private static bool DeleteIfUnchanged(string path, Entry entry, Verified copy, out string why)
     {
-        // Streams are listed before the locking handle is opened, since the
-        // listing opens the file itself; the handle's identity and hash checks
-        // below still catch a file replaced after this point.
-        if (!SameStreams(entry.Streams, NamedStreams(path)))
-        {
-            why = "its alternate data streams changed during the move";
-            return false;
-        }
         using var handle = CreateFileW(path, GENERIC_READ | DELETE, FILE_SHARE_READ, IntPtr.Zero,
             OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, IntPtr.Zero);
         if (handle.IsInvalid)
@@ -279,24 +527,107 @@ internal static class CrossVolumeMove
             why = "it changed during the move";
             return false;
         }
-        byte[] hash;
-        using (var stream = new FileStream(new SafeFileHandle(handle.DangerousGetHandle(), ownsHandle: false), FileAccess.Read))
+        var names = StreamNames(handle);
+        if (!SameNames(names, copy.Streams.Keys))
         {
-            hash = SHA256.HashData(stream);
+            why = "its alternate data streams differ from the copy";
+            return false;
         }
-        if (!hash.AsSpan().SequenceEqual(copyHash))
+        if (!Hash(handle).AsSpan().SequenceEqual(copy.Main))
         {
             why = "its content differs from the copy";
             return false;
         }
-        var dispose = new FILE_DISPOSITION_INFO { DeleteFile = true };
-        if (!SetFileInformationByHandle(handle, FileDispositionInfo, ref dispose, Marshal.SizeOf<FILE_DISPOSITION_INFO>()))
+        // Each named stream is held without write sharing while it is hashed
+        // and until the delete, so no stream can change after its check. Delete
+        // sharing is allowed, since a file whose stream is open without it
+        // cannot be deleted at all.
+        var held = new List<SafeFileHandle>();
+        try
         {
-            why = new Win32Exception(Marshal.GetLastWin32Error()).Message;
-            return false;
+            foreach (var name in names)
+            {
+                var stream = CreateFileW(path + name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, IntPtr.Zero,
+                    OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, IntPtr.Zero);
+                if (stream.IsInvalid)
+                {
+                    why = $"cannot hold its stream {name}: {new Win32Exception(Marshal.GetLastWin32Error()).Message}";
+                    stream.Dispose();
+                    return false;
+                }
+                held.Add(stream);
+                if (!Hash(stream).AsSpan().SequenceEqual(copy.Streams[name]))
+                {
+                    why = $"its stream {name} differs from the copy";
+                    return false;
+                }
+            }
+            if (!MarkForDelete(handle, out why))
+            {
+                return false;
+            }
+            // A stream created between the listing and the mark would be lost
+            // with the file; a delete-pending file accepts no new opens, so this
+            // last listing is final.
+            if (!SameNames(StreamNames(handle), copy.Streams.Keys))
+            {
+                Unmark(handle);
+                why = "a stream was added during the move";
+                return false;
+            }
+            return true;
         }
-        why = string.Empty;
-        return true;
+        finally
+        {
+            foreach (var stream in held)
+            {
+                stream.Dispose();
+            }
+        }
+    }
+
+    /// <summary>Mark a file or folder delete-on-close through its handle,
+    /// read-only ones included.</summary>
+    private static bool MarkForDelete(SafeFileHandle handle, out string why)
+    {
+        var ex = new FILE_DISPOSITION_INFO_EX { Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE };
+        if (SetFileInformationByHandle(handle, FileDispositionInfoEx, ref ex, Marshal.SizeOf<FILE_DISPOSITION_INFO_EX>()))
+        {
+            why = string.Empty;
+            return true;
+        }
+        var error = Marshal.GetLastWin32Error();
+        if (error is ERROR_INVALID_PARAMETER or ERROR_NOT_SUPPORTED or ERROR_INVALID_FUNCTION)
+        {
+            // A filesystem without the extended call (FAT, older Windows).
+            var plain = new FILE_DISPOSITION_INFO { DeleteFile = true };
+            if (SetFileInformationByHandle(handle, FileDispositionInfo, ref plain, Marshal.SizeOf<FILE_DISPOSITION_INFO>()))
+            {
+                why = string.Empty;
+                return true;
+            }
+            error = Marshal.GetLastWin32Error();
+        }
+        why = new Win32Exception(error).Message;
+        return false;
+    }
+
+    private static void Unmark(SafeFileHandle handle)
+    {
+        var ex = new FILE_DISPOSITION_INFO_EX { Flags = 0 };
+        var plain = new FILE_DISPOSITION_INFO { DeleteFile = false };
+        if (!SetFileInformationByHandle(handle, FileDispositionInfoEx, ref ex, Marshal.SizeOf<FILE_DISPOSITION_INFO_EX>())
+            && !SetFileInformationByHandle(handle, FileDispositionInfo, ref plain, Marshal.SizeOf<FILE_DISPOSITION_INFO>()))
+        {
+            throw new IOException($"cannot withdraw a delete: {new Win32Exception(Marshal.GetLastWin32Error()).Message}");
+        }
+    }
+
+    private static byte[] Hash(SafeFileHandle handle)
+    {
+        using var stream = new FileStream(new SafeFileHandle(handle.DangerousGetHandle(), ownsHandle: false), FileAccess.Read);
+        stream.Position = 0;
+        return SHA256.HashData(stream);
     }
 
     private static (FileId Id, long Size, DateTime LastWriteUtc) Unpack(BY_HANDLE_FILE_INFORMATION info) => (
@@ -328,11 +659,60 @@ internal static class CrossVolumeMove
 
     // --- Alternate data streams ----------------------------------------------
 
-    private static bool SameStreams(IReadOnlyList<(string Name, long Size)> a, IReadOnlyList<(string Name, long Size)> b) =>
-        a.Count == b.Count
-        && a.OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
-            .Zip(b.OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase))
-            .All(p => string.Equals(p.First.Name, p.Second.Name, StringComparison.OrdinalIgnoreCase) && p.First.Size == p.Second.Size);
+    private static bool SameNames(IEnumerable<string> a, IEnumerable<string> b) =>
+        a.ToHashSet(StringComparer.OrdinalIgnoreCase).SetEquals(b);
+
+    /// <summary>
+    /// The named streams (":name:$DATA") of an open file, read through the
+    /// handle itself so no second open is needed. The unnamed main stream is
+    /// left out. Throws when they cannot be read, so a caller fails closed.
+    /// </summary>
+    internal static IReadOnlyList<string> StreamNames(SafeFileHandle handle)
+    {
+        var size = 4096;
+        while (true)
+        {
+            var buffer = Marshal.AllocHGlobal(size);
+            try
+            {
+                if (!GetFileInformationByHandleEx(handle, FileStreamInfo, buffer, (uint)size))
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    if (error == ERROR_MORE_DATA && size < 1 << 22)
+                    {
+                        size *= 4;
+                        continue;
+                    }
+                    if (error == ERROR_HANDLE_EOF)
+                    {
+                        return Array.Empty<string>();
+                    }
+                    throw new IOException($"cannot list streams: {new Win32Exception(error).Message}", error);
+                }
+                var names = new List<string>();
+                var offset = 0;
+                while (true)
+                {
+                    var next = Marshal.ReadInt32(buffer, offset);
+                    var length = Marshal.ReadInt32(buffer, offset + 4);
+                    var name = Marshal.PtrToStringUni(buffer + offset + 24, length / 2);
+                    if (!string.Equals(name, "::$DATA", StringComparison.OrdinalIgnoreCase))
+                    {
+                        names.Add(name);
+                    }
+                    if (next == 0)
+                    {
+                        return names;
+                    }
+                    offset += next;
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+    }
 
     /// <summary>
     /// The named alternate data streams of a file or folder (the unnamed main
@@ -380,6 +760,7 @@ internal static class CrossVolumeMove
 
     private const uint GENERIC_READ = 0x80000000;
     private const uint DELETE = 0x00010000;
+    private const uint FILE_LIST_DIRECTORY = 0x0001;
     private const uint FILE_SHARE_READ = 0x1;
     private const uint FILE_SHARE_WRITE = 0x2;
     private const uint FILE_SHARE_DELETE = 0x4;
@@ -389,8 +770,17 @@ internal static class CrossVolumeMove
     private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
     private const uint FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000;
     private const int FileDispositionInfo = 4;
+    private const int FileStreamInfo = 7;
+    private const int FileDispositionInfoEx = 21;
+    private const uint FILE_DISPOSITION_FLAG_DELETE = 0x1;
+    private const uint FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE = 0x10;
+    private const int ERROR_INVALID_FUNCTION = 1;
     private const int ERROR_HANDLE_EOF = 38;
+    private const int ERROR_NOT_SUPPORTED = 50;
+    private const int ERROR_FILE_EXISTS = 80;
     private const int ERROR_INVALID_PARAMETER = 87;
+    private const int ERROR_ALREADY_EXISTS = 183;
+    private const int ERROR_MORE_DATA = 234;
     private static readonly IntPtr INVALID_HANDLE_VALUE = new(-1);
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -423,6 +813,12 @@ internal static class CrossVolumeMove
         public bool DeleteFile;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILE_DISPOSITION_INFO_EX
+    {
+        public uint Flags;
+    }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr FindFirstStreamW(string fileName, int infoLevel, out WIN32_FIND_STREAM_DATA data, uint flags);
 
@@ -438,11 +834,27 @@ internal static class CrossVolumeMove
     private static extern SafeFileHandle CreateFileW(
         string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
 
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateDirectoryW(string path, IntPtr security);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool MoveFileExW(string existing, string target, uint flags);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out BY_HANDLE_FILE_INFORMATION info);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, IntPtr buffer, uint size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass, ref FILE_DISPOSITION_INFO info, int size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass, ref FILE_DISPOSITION_INFO_EX info, int size);
 }
