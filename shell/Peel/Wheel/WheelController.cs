@@ -110,8 +110,14 @@ internal sealed class WheelController
         });
     }
 
-    private void OnWheelRequested(string modifier, int x, int y)
+    /// <summary>Every wheel the engine registers, for the settings window.</summary>
+    internal WheelCatalog Registry => _registry;
+
+    private void OnWheelRequested(string pressed, int x, int y)
     {
+        // Settings may have remapped the keys: look the wheel up by the
+        // engine's name for the key that was pressed.
+        var modifier = Peel.Settings.SettingsStore.Current.WheelKeyFor(pressed);
         var family = _forFiles.FamilyForModifier(modifier) ?? _registry.FamilyForModifier(modifier);
         if (family is null)
         {

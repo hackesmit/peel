@@ -176,9 +176,15 @@ internal sealed class EngineClient
         string actionId,
         IReadOnlyList<string> files,
         IReadOnlyDictionary<string, string>? parameters = null,
-        CancellationToken token = default)
+        CancellationToken token = default,
+        string? outDir = null)
     {
         var tail = new List<string>();
+        if (outDir is not null)
+        {
+            tail.Add("--out-dir");
+            tail.Add(outDir);
+        }
         if (parameters is not null)
         {
             foreach (var pair in parameters)
