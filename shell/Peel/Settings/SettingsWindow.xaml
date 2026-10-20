@@ -58,7 +58,7 @@
         <ComboBox x:Name="QualityBox" Width="200" HorizontalAlignment="Left"
                   AutomationProperties.Name="Compress quality" />
         <TextBlock Style="{StaticResource Hint}"
-                   Text="Used by Compress for images (quality) and audio (bitrate)." />
+                   Text="Used by Compress for images, video and audio." />
 
         <TextBlock Style="{StaticResource Heading}" Text="START UP" />
         <CheckBox x:Name="StartBox" Content="Start Peel when I sign in to Windows" />
