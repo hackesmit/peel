@@ -126,7 +126,7 @@ internal static class MoveAction
                     var name = Path.GetFileName(Path.TrimEndingDirectorySeparator(source));
                     partials.Add(remaining.Count == 1 && remaining[0] == "."
                         ? $"{name}: copied, but an empty folder stayed in the source"
-                        : $"{name}: copied, but {remaining.Count} item(s) stayed in the source because they are new, changed or in use: {CrossVolumeMove.Describe(remaining)}");
+                        : $"{name}: copied, but {remaining.Count} item(s) stayed in the source because they are new, changed, in use or their copy could not be verified: {CrossVolumeMove.Describe(remaining)}");
                 }
             }
             catch (Exception error)

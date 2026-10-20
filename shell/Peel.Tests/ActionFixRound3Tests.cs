@@ -374,86 +374,8 @@ public class ActionFixRound3Tests
     }
 
     // --- 4. Share closes only Peel's own sheet ---------------------------------
-
-    private sealed class FakeDesktop
-    {
-        public readonly HashSet<IntPtr> Visible = new();
-        public readonly List<IntPtr> Closed = new();
-
-        public ShareOwner Owner() => new(
-            () => Visible.ToList(),
-            h => Visible.Contains(h),
-            h =>
-            {
-                Closed.Add(h);
-                Visible.Remove(h);
-                return true;
-            });
-    }
-
-    private static readonly IntPtr SheetA = new(0x1001);
-    private static readonly IntPtr SheetB = new(0x2002);
-
-    [Fact]
-    public void PeelClosesItsOwnSheetWhenItIsStillUp()
-    {
-        var desk = new FakeDesktop();
-        var owner = desk.Owner();
-        owner.BeforeRaise();
-        desk.Visible.Add(SheetA);
-        Assert.True(owner.Poll());
-        Assert.Equal(SheetA, owner.Owned);
-        Assert.True(owner.Dismiss());
-        Assert.Equal(new[] { SheetA }, desk.Closed);
-    }
-
-    [Fact]
-    public void ASheetOpenedByAnotherAppAfterPeelsWasDismissedIsNeverClosed()
-    {
-        var desk = new FakeDesktop();
-        var owner = desk.Owner();
-        owner.BeforeRaise();
-        desk.Visible.Add(SheetA);
-        owner.Poll();
-        // The user dismisses Peel's sheet; the claim ends with it.
-        desk.Visible.Remove(SheetA);
-        Assert.False(owner.Poll());
-        Assert.Equal(IntPtr.Zero, owner.Owned);
-        // Explorer's sheet opens, even in the same reused window, then the
-        // anchor timer ends or Peel exits.
-        desk.Visible.Add(SheetA);
-        desk.Visible.Add(SheetB);
-        Assert.True(owner.Dismiss());
-        Assert.Empty(desk.Closed);
-    }
-
-    [Fact]
-    public void ASheetAlreadyOpenWhenPeelSharesIsNotClaimed()
-    {
-        var desk = new FakeDesktop();
-        desk.Visible.Add(SheetB);
-        var owner = desk.Owner();
-        owner.BeforeRaise();
-        owner.Poll();
-        Assert.Equal(IntPtr.Zero, owner.Owned);
-        owner.StopWaiting();
-        Assert.False(owner.Poll());
-        owner.Dismiss();
-        Assert.Empty(desk.Closed);
-    }
-
-    [Fact]
-    public void TwoNewSheetsAtOnceAreNeitherClaimed()
-    {
-        var desk = new FakeDesktop();
-        var owner = desk.Owner();
-        owner.BeforeRaise();
-        desk.Visible.Add(SheetA);
-        desk.Visible.Add(SheetB);
-        Assert.False(owner.Poll());
-        owner.Dismiss();
-        Assert.Empty(desk.Closed);
-    }
+    // The ownership checks moved to ActionFixRound4Tests when round 4 replaced
+    // the claim by appearance with proof by window owner.
 
     [Fact]
     public void ShareNeverInjectsAGlobalKeystroke()

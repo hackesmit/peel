@@ -11,14 +11,15 @@
 // process the failure is a message, not a crash (the bead's stop-when).
 //
 // Closing the anchor does not take the sheet down, and a sheet left on screen
-// outlives Peel and swallows the next drag beneath it. So the sheet Peel raised
-// is dismissed when the anchor's timer ends and when Peel exits. Only that
-// sheet: ShareOwner claims the one sheet that appeared after Peel raised its
-// own and drops the claim when it leaves the screen, so a sheet another app
-// opens is never closed (lucy round 2).
+// outlives Peel and swallows the next drag beneath it. So when the anchor's
+// timer ends, and when Peel exits, Peel closes a sheet only if Windows shows it
+// is owned by that live anchor window. Nothing else counts as proof (not which
+// sheet appeared after Peel's, not a window handle that stayed the same: lucy
+// rounds 2 and 3), so a sheet Peel cannot prove its own is left open.
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
@@ -127,24 +128,20 @@ internal static class ShareAction
             // fires the instant the sheet takes focus). A timer takes the 1x1
             // invisible window down well after the sheet is done, and app exit
             // closes it in any case.
-            var generation = ++_generation;
             var cleanup = new DispatcherTimer { Interval = AnchorLifetime };
             cleanup.Tick += (_, _) =>
             {
                 cleanup.Stop();
-                // Only the newest share's timer may take a sheet down, so an
-                // older timer never closes a sheet the user just raised again.
-                if (generation == _generation)
-                {
-                    Dismiss("the anchor timer ended");
-                }
+                // Before the anchor goes: once it is closed nothing proves a
+                // sheet is Peel's any more.
+                Dismiss(hwnd, "the anchor timer ended");
+                Anchors.Remove(hwnd);
                 anchor.Close();
             };
             cleanup.Start();
             DismissOnExit();
-            Owner.BeforeRaise();
             interop.ShowShareUIForWindow(hwnd);
-            Watch(generation);
+            Anchors.Add(hwnd);
             Log.Write($"share: share sheet raised for {files.Count} file(s)");
             return true;
         }
@@ -160,56 +157,11 @@ internal static class ShareAction
     /// <summary>How long a raised sheet may stay before Peel takes it down.</summary>
     internal static readonly TimeSpan AnchorLifetime = TimeSpan.FromMinutes(2);
 
-    /// <summary>How long Peel looks for its sheet after raising it.</summary>
-    internal static readonly TimeSpan ClaimWindow = TimeSpan.FromSeconds(10);
+    private static readonly ShareOwner Owner = new(ShareSheet.Find, ShareSheet.OwnedBy, ShareSheet.Close);
 
-    private static readonly ShareOwner Owner = new(ShareSheet.Find, ShareSheet.IsShown, ShareSheet.Close);
-    private static int _generation;
+    /// <summary>The anchor windows still open, one per raised sheet.</summary>
+    private static readonly HashSet<IntPtr> Anchors = new();
     private static bool _exitHooked;
-
-    /// <summary>Find the sheet this share raised, then watch it until it
-    /// leaves the screen, so the claim never outlives Peel's own sheet.</summary>
-    private static void Watch(int generation)
-    {
-        var deadline = DateTime.UtcNow + ClaimWindow;
-        var watch = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
-        watch.Tick += (_, _) =>
-        {
-            if (generation != _generation)
-            {
-                watch.Stop();
-                return;
-            }
-            try
-            {
-                var before = Owner.Owned;
-                if (Owner.Waiting && DateTime.UtcNow > deadline)
-                {
-                    Owner.StopWaiting();
-                    Log.Write("share: no new share sheet appeared, so Peel owns none");
-                }
-                var watching = Owner.Poll();
-                if (before == IntPtr.Zero && Owner.Owned != IntPtr.Zero)
-                {
-                    Log.Write("share: found Peel's share sheet");
-                }
-                else if (before != IntPtr.Zero && Owner.Owned == IntPtr.Zero)
-                {
-                    Log.Write("share: Peel's share sheet was dismissed");
-                }
-                if (!watching)
-                {
-                    watch.Stop();
-                }
-            }
-            catch (Exception error)
-            {
-                watch.Stop();
-                Log.Write("share: watching the share sheet failed", error);
-            }
-        };
-        watch.Start();
-    }
 
     private static void DismissOnExit()
     {
@@ -218,20 +170,24 @@ internal static class ShareAction
             return;
         }
         _exitHooked = true;
-        Application.Current.Exit += (_, _) => Dismiss("Peel is exiting");
+        Application.Current.Exit += (_, _) =>
+        {
+            foreach (var anchor in Anchors.ToList())
+            {
+                Dismiss(anchor, "Peel is exiting");
+            }
+        };
     }
 
-    /// <summary>Take down Peel's own share sheet if it is still on screen.</summary>
-    private static void Dismiss(string why)
+    /// <summary>Take down the sheets proven to belong to <paramref name="anchor"/>;
+    /// any other sheet stays open.</summary>
+    private static void Dismiss(IntPtr anchor, string why)
     {
         try
         {
-            var owned = Owner.Owned != IntPtr.Zero;
-            var gone = Owner.Dismiss();
-            if (owned)
-            {
-                Log.Write($"share: closing Peel's sheet because {why}: {(gone ? "closed" : "still on screen")}");
-            }
+            var left = Owner.Dismiss(anchor);
+            Log.Write($"share: {why}; Peel closes only a sheet its anchor owns"
+                + (left > 0 ? $", {left} of them stayed on screen" : string.Empty));
         }
         catch (Exception error)
         {
