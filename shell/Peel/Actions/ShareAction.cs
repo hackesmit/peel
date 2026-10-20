@@ -10,12 +10,10 @@
 // StorageFile is asynchronous. If the sheet cannot be raised from the tray
 // process the failure is a message, not a crash (the bead's stop-when).
 //
-// Closing the anchor does not take the sheet down, and a sheet left on screen
-// outlives Peel and swallows the next drag beneath it. So when the anchor's
-// timer ends, and when Peel exits, Peel closes a sheet only if Windows shows it
-// is owned by that live anchor window. Nothing else counts as proof (not which
-// sheet appeared after Peel's, not a window handle that stayed the same: lucy
-// rounds 2 and 3), so a sheet Peel cannot prove its own is left open.
+// Peel never closes a share sheet: the sheet is left to the user (Daniel,
+// review round 4). A sheet does not say which app raised it, and every attempt
+// to prove one was Peel's (lucy rounds 2 to 4) still risked closing someone
+// else's, so no message is ever posted to a sheet from here.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -132,16 +130,10 @@ internal static class ShareAction
             cleanup.Tick += (_, _) =>
             {
                 cleanup.Stop();
-                // Before the anchor goes: once it is closed nothing proves a
-                // sheet is Peel's any more.
-                Dismiss(hwnd, "the anchor timer ended");
-                Anchors.Remove(hwnd);
                 anchor.Close();
             };
             cleanup.Start();
-            DismissOnExit();
             interop.ShowShareUIForWindow(hwnd);
-            Anchors.Add(hwnd);
             Log.Write($"share: share sheet raised for {files.Count} file(s)");
             return true;
         }
@@ -154,46 +146,8 @@ internal static class ShareAction
         }
     }
 
-    /// <summary>How long a raised sheet may stay before Peel takes it down.</summary>
+    /// <summary>How long the anchor window stays open after a sheet is raised.</summary>
     internal static readonly TimeSpan AnchorLifetime = TimeSpan.FromMinutes(2);
-
-    private static readonly ShareOwner Owner = new(ShareSheet.Find, ShareSheet.OwnedBy, ShareSheet.Close);
-
-    /// <summary>The anchor windows still open, one per raised sheet.</summary>
-    private static readonly HashSet<IntPtr> Anchors = new();
-    private static bool _exitHooked;
-
-    private static void DismissOnExit()
-    {
-        if (_exitHooked || Application.Current is null)
-        {
-            return;
-        }
-        _exitHooked = true;
-        Application.Current.Exit += (_, _) =>
-        {
-            foreach (var anchor in Anchors.ToList())
-            {
-                Dismiss(anchor, "Peel is exiting");
-            }
-        };
-    }
-
-    /// <summary>Take down the sheets proven to belong to <paramref name="anchor"/>;
-    /// any other sheet stays open.</summary>
-    private static void Dismiss(IntPtr anchor, string why)
-    {
-        try
-        {
-            var left = Owner.Dismiss(anchor);
-            Log.Write($"share: {why}; Peel closes only a sheet its anchor owns"
-                + (left > 0 ? $", {left} of them stayed on screen" : string.Empty));
-        }
-        catch (Exception error)
-        {
-            Log.Write("share: dismissing the share sheet failed", error);
-        }
-    }
 
     private static string Title(IReadOnlyList<string> files) =>
         files.Count == 1 ? Path.GetFileName(files[0]) : $"{files.Count} files";

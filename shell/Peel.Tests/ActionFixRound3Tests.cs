@@ -380,7 +380,7 @@ public class ActionFixRound3Tests
     [Fact]
     public void ShareNeverInjectsAGlobalKeystroke()
     {
-        foreach (var type in new[] { typeof(ShareSheet), typeof(ShareOwner), typeof(ShareAction) })
+        foreach (var type in new[] { typeof(ShareSheet), typeof(ShareAction) })
         {
             var names = type.GetMethods(BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
                 .Select(m => m.Name).ToList();
