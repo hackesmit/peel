@@ -465,13 +465,38 @@ try {
     $files = @(Get-ChildItem $test -File | ForEach-Object { $_.Name })
     Check 'soak wrote and moved nothing' (($files.Count -eq 1) -and ($files[0] -eq 'sample.txt')) ($files -join ',')
 
-    # Lag or leak: an idle minute later, a lagging count settles, a leak stays.
+    # Lag or leak. An idle minute does not run the GC, so handles a finalizer
+    # would free (released COM objects, disposed-late WPF sources) stay put.
+    # dotnet-gcdump forces a full GC; the second one also collects what the
+    # first one's finalizers released. A lagging count drops, a leak stays.
     Start-Sleep -Seconds 60
     Sample $smokePeel 'idle 60 s'
+    $gcdump = Get-Command dotnet-gcdump -ErrorAction SilentlyContinue
+    if (-not $gcdump) {
+        $candidate = Join-Path $env:USERPROFILE '.dotnet\tools\dotnet-gcdump.exe'
+        if (Test-Path $candidate) { $gcdump = Get-Item $candidate }
+    }
+    if ($gcdump) {
+        foreach ($pass in 1, 2) {
+            $dump = Join-Path $Dir "gc$pass.gcdump"
+            # It warns on stderr, which Windows PowerShell 5.1 would turn
+            # into a terminating error under Stop.
+            $ErrorActionPreference = 'Continue'
+            & $gcdump.Source collect -p $smokePeel.Id -o $dump 2>&1 | Out-Null
+            $ErrorActionPreference = 'Stop'
+            Remove-Item $dump -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+        }
+        Sample $smokePeel 'after forced GC'
+    }
+    else {
+        L 'dotnet-gcdump not installed (dotnet tool install -g dotnet-gcdump): no forced GC sample'
+    }
     $first = $samples | Where-Object { $_.at -eq 'before presses' } | Select-Object -First 1
+    $pressed = $samples | Where-Object { $_.at -eq "after $Presses presses" } | Select-Object -First 1
     $last = $samples[$samples.Count - 1]
-    Check 'soak: handles do not grow per use' (($last.handles - $first.handles) -lt 100) ("handles {0} to {1}, gdi {2} to {3}, user {4} to {5}, threads {6} to {7}" -f `
-        $first.handles, $last.handles, $first.gdi, $last.gdi, $first.user, $last.user, $first.threads, $last.threads)
+    Check 'soak: handles return to the start level' (($last.handles - $first.handles) -lt 100) ("handles {0} before, {1} after the presses, {2} at '{3}'; gdi {4} to {5}, user {6} to {7}, threads {8} to {9}" -f `
+        $first.handles, $pressed.handles, $last.handles, $last.at, $first.gdi, $last.gdi, $first.user, $last.user, $first.threads, $last.threads)
     Check 'soak: GDI and USER objects do not grow' ((($last.gdi - $first.gdi) -lt 50) -and (($last.user - $first.user) -lt 50)) "gdi +$($last.gdi - $first.gdi), user +$($last.user - $first.user)"
 
     $text = PeelLog
@@ -486,10 +511,16 @@ finally {
     CloseTestExplorer
     Remove-Item Env:PEEL_LOG, Env:PEEL_SETTINGS, Env:PEEL_EXIT_AFTER, Env:PEEL_KEYBOARD_IDLE_MS -ErrorAction SilentlyContinue
     # Leave Daniel's Peel the way it was found: running, on his own settings.
-    if ($wasRunning -and (Installed).Count -eq 0) {
+    # Wait for the test copy to be gone first: while it holds the single
+    # instance lock a new start only asks it for its settings and quits.
+    if ($wasRunning) {
+        $deadline = (Get-Date).AddSeconds(15)
+        while (@(Installed).Count -gt 0 -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
         Start-Process $app | Out-Null
-        Start-Sleep -Seconds 3
-        L "restarted the installed Peel: $((Installed).Count) running"
+        Start-Sleep -Seconds 4
+        $back = @(Installed).Count
+        L "restarted the installed Peel: $back running"
+        Check 'the installed Peel is running again' ($back -gt 0) "$back running"
     }
     $failed = @($checks | Where-Object { -not $_.ok })
     [pscustomobject]@{

@@ -126,7 +126,8 @@ foreach ($process in $running) {
 foreach ($process in $running) {
     Wait-Process -Id $process.Id -Timeout 15 -ErrorAction SilentlyContinue
 }
-$others = @(Get-Process -Name Peel -ErrorAction SilentlyContinue)
+$stopped = @($running | ForEach-Object { $_.Id })
+$others = @(Get-Process -Name Peel -ErrorAction SilentlyContinue | Where-Object { $stopped -notcontains $_.Id })
 if ($others.Count -gt 0) {
     # A dev build holds the per session single instance lock, so the installed
     # one would start, see it and quit. Say so instead of guessing.
