@@ -200,6 +200,10 @@ public static class In {
   [DllImport("user32.dll")] public static extern uint GetGuiResources(IntPtr process, uint flags);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
   public static void Move(int x, int y) {
     int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77), vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
@@ -323,6 +327,42 @@ function SelectItem($item) {
     Start-Sleep -Milliseconds 350
 }
 
+# The top level window that holds an Explorer item, found by walking up the
+# UI Automation tree to the child of the desktop.
+function ExplorerWindowOf($item) {
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $node = $item
+    while ($node) {
+        $parent = $walker.GetParent($node)
+        if (-not $parent -or [System.Windows.Automation.Automation]::Compare($parent, $UIA::RootElement)) { break }
+        $node = $parent
+    }
+    if (-not $node) { return [IntPtr]::Zero }
+    return [IntPtr]$node.Current.NativeWindowHandle
+}
+
+# Bring the Explorer window that holds $item to the front and prove it with
+# GetForegroundWindow, retrying for up to 5 s. From the second try a lone Alt tap
+# lets SetForegroundWindow through the foreground lock. True when Explorer is in front.
+function FocusExplorer($item) {
+    $deadline = (Get-Date).AddSeconds(5)
+    $attempt = 0
+    do {
+        $hwnd = ExplorerWindowOf $item
+        if ($hwnd -ne [IntPtr]::Zero) {
+            if ([In]::GetForegroundWindow() -eq $hwnd) { return $true }
+            if ([In]::IsIconic($hwnd)) { [void][In]::ShowWindow($hwnd, 9) }
+            if ($attempt -gt 0) { [In]::Tap([byte]0x12) }
+            [void][In]::SetForegroundWindow($hwnd)
+            Start-Sleep -Milliseconds 250
+            if ([In]::GetForegroundWindow() -eq $hwnd) { return $true }
+        }
+        else { Start-Sleep -Milliseconds 250 }
+        $attempt++
+    } while ((Get-Date) -lt $deadline)
+    return $false
+}
+
 function AimAt($target, $count) {
     for ($i = 0; $i -lt ($count + 2); $i++) {
         if ((Highlight) -eq $target) { return }
@@ -335,6 +375,7 @@ function AimAt($target, $count) {
 # Open the keyboard wheel on the selected file, switch with a key, run a label.
 function RunByKeyboard($item, $switchKey, $family, $label) {
     SelectItem $item
+    if (-not (FocusExplorer $item)) { return "Explorer never took the foreground" }
     $shownSeen = CountLog 'keyboard wheel shown at'
     [In]::Chord($VkP)
     $shown = WaitLog 'keyboard wheel shown at' 6000 ($shownSeen + 1)
@@ -501,7 +542,12 @@ try {
         if ($clip) { break }
         Start-Sleep -Milliseconds 200
     }
-    Check 'action: Copy Path via Ctrl (remapped) fills the clipboard' ($clip.Trim() -ieq $source) "$action; clipboard=$clip"
+    # Copy Path puts the path in double quotes (shipped behavior): require the
+    # pair, then compare the path inside it.
+    $clipText = $clip.Trim()
+    $quoted = $clipText.Length -ge 2 -and $clipText.StartsWith('"') -and $clipText.EndsWith('"')
+    $clipPath = if ($quoted) { $clipText.Substring(1, $clipText.Length - 2) } else { $clipText }
+    Check 'action: Copy Path via Ctrl (remapped) fills the clipboard, in quotes' ($quoted -and ($clipPath -ieq $source)) "$action; quoted=$quoted; clipboard=$clip"
 
     # 4. Soak: hotkey presses.
     Sample $smokePeel 'before presses'
@@ -511,6 +557,7 @@ try {
     for ($i = 1; $i -le $Presses; $i++) {
         $shownSeen = CountLog 'keyboard wheel shown at'
         $hiddenSeen = CountLog 'keyboard wheel hidden'
+        if (-not (FocusExplorer $item)) { $missed++; continue }
         [In]::Chord($VkP)
         if (-not (WaitLog 'keyboard wheel shown at' 4000 ($shownSeen + 1))) {
             $missed++
