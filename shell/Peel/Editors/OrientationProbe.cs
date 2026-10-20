@@ -11,10 +11,12 @@
 // This reads the bytes the preview is decoded from and answers one question:
 // can WPF's own decode be trusted to be what the engine sees? Any doubt (a
 // tag that is not 1, EXIF this cannot parse, a raw profile, an XMP
-// orientation) sends the file to the engine to rasterise, which is upright by
+// orientation, plain or in a compressed text chunk) sends the file to the engine to rasterise, which is upright by
 // construction. Being wrong in that direction costs a second; being wrong in
 // the other costs a leak.
 using System;
+using System.IO;
+using System.IO.Compression;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -152,6 +154,13 @@ internal static class OrientationProbe
                     // Hex encoded, maybe compressed: not worth decoding here.
                     return Unknown;
                 }
+                // An XMP packet in a compressed chunk is invisible to the
+                // plain byte search in XmpTurned, but pillow inflates it and
+                // turns the picture. Inflate it here too; failing that, doubt.
+                if (CompressedTextTurned(type, data, keyword.Length))
+                {
+                    return Unknown;
+                }
             }
             else if (type == "IEND")
             {
@@ -160,6 +169,78 @@ internal static class OrientationProbe
             at += 12 + length;
         }
         return found;
+    }
+
+    // Pillow refuses a text chunk that inflates past this, so a bigger one
+    // cannot turn the picture in the engine either; still, doubt costs only a
+    // second, so it goes to the engine rather than being called upright.
+    private const int MaxInflated = 1024 * 1024;
+
+    /// <summary>
+    /// True when a zTXt chunk or a compressed iTXt chunk holds an XMP
+    /// orientation other than 1, or cannot be inflated. False for any other
+    /// chunk, compressed or not (plain text is left to XmpTurned).
+    /// </summary>
+    private static bool CompressedTextTurned(string type, ReadOnlySpan<byte> data, int keywordLength)
+    {
+        int at;
+        if (type == "zTXt")
+        {
+            // keyword NUL, method, zlib data
+            at = keywordLength + 2;
+        }
+        else if (type == "iTXt")
+        {
+            // keyword NUL, flag, method, language NUL, translated keyword NUL, text
+            var flag = keywordLength + 1;
+            if (flag >= data.Length)
+            {
+                return true;
+            }
+            if (data[flag] == 0)
+            {
+                return false;
+            }
+            at = flag + 2;
+            for (var nul = 0; nul < 2; nul++)
+            {
+                var end = at < data.Length ? data[at..].IndexOf((byte)0) : -1;
+                if (end < 0)
+                {
+                    return true;
+                }
+                at += end + 1;
+            }
+        }
+        else
+        {
+            return false;
+        }
+        if (at > data.Length)
+        {
+            return true;
+        }
+        try
+        {
+            using var input = new MemoryStream(data[at..].ToArray(), writable: false);
+            using var inflate = new ZLibStream(input, CompressionMode.Decompress);
+            using var output = new MemoryStream();
+            var buffer = new byte[16 * 1024];
+            int read;
+            while ((read = inflate.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                output.Write(buffer, 0, read);
+                if (output.Length > MaxInflated)
+                {
+                    return true;
+                }
+            }
+            return XmpTurned(output.GetBuffer().AsSpan(0, (int)output.Length));
+        }
+        catch (InvalidDataException)
+        {
+            return true;
+        }
     }
 
     private static int FromWebp(ReadOnlySpan<byte> file)
