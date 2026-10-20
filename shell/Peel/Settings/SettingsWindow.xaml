@@ -1,0 +1,74 @@
+<Window x:Class="Peel.Settings.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Peel settings"
+        Width="500"
+        SizeToContent="Height"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen"
+        ShowInTaskbar="True"
+        Background="#FAFAF7"
+        FontSize="13">
+    <Window.Resources>
+        <Style x:Key="Heading" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Foreground" Value="#C2560C" />
+            <Setter Property="Margin" Value="0,16,0,6" />
+        </Style>
+        <Style x:Key="Hint" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#6B6B66" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="Margin" Value="0,4,0,0" />
+        </Style>
+    </Window.Resources>
+
+    <StackPanel Margin="22,10,22,18">
+        <TextBlock Style="{StaticResource Heading}" Text="WHEELS" />
+        <TextBlock Style="{StaticResource Hint}" Margin="0,0,0,8"
+                   Text="While you drag a file, tap a key to open a wheel. Each wheel needs its own key." />
+        <Grid x:Name="WheelRows">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="120" />
+            </Grid.ColumnDefinitions>
+        </Grid>
+
+        <TextBlock Style="{StaticResource Heading}" Text="KEYBOARD SHORTCUT" />
+        <DockPanel>
+            <Button x:Name="HotkeyReset" DockPanel.Dock="Right" Content="Reset" Padding="12,3" Margin="8,0,0,0" />
+            <TextBox x:Name="HotkeyBox" IsReadOnly="True" IsReadOnlyCaretVisible="False" Padding="4,3"
+                     AutomationProperties.Name="Keyboard shortcut" />
+        </DockPanel>
+        <TextBlock Style="{StaticResource Hint}"
+                   Text="Select files in Explorer and press this to open the wheel without a drag. Click the box, then press the new shortcut." />
+
+        <TextBlock Style="{StaticResource Heading}" Text="OUTPUT" />
+        <RadioButton x:Name="OutputSource" GroupName="Output" Content="Next to the source file" Margin="0,0,0,6" />
+        <RadioButton x:Name="OutputFolder" GroupName="Output" Content="In this folder:" />
+        <DockPanel Margin="20,6,0,0">
+            <Button x:Name="ChooseFolder" DockPanel.Dock="Right" Content="Choose..." Padding="12,3" Margin="8,0,0,0" />
+            <TextBox x:Name="FolderBox" Padding="4,3" AutomationProperties.Name="Output folder" />
+        </DockPanel>
+        <TextBlock Style="{StaticResource Hint}"
+                   Text="Peel never overwrites a file. It adds 2, 3 and so on to the name." />
+
+        <TextBlock Style="{StaticResource Heading}" Text="COMPRESS QUALITY" />
+        <ComboBox x:Name="QualityBox" Width="200" HorizontalAlignment="Left"
+                  AutomationProperties.Name="Compress quality" />
+        <TextBlock Style="{StaticResource Hint}"
+                   Text="Used by Compress for images, video and audio." />
+
+        <TextBlock Style="{StaticResource Heading}" Text="START UP" />
+        <CheckBox x:Name="StartBox" Content="Start Peel when I sign in to Windows" />
+
+        <TextBlock x:Name="ProblemText" Foreground="#B42318" TextWrapping="Wrap" Margin="0,14,0,0"
+                   Visibility="Collapsed" />
+
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+            <Button x:Name="CancelButton" Content="Cancel" Width="88" Padding="0,4" IsCancel="True" />
+            <Button x:Name="SaveButton" Content="Save" Width="88" Padding="0,4" Margin="8,0,0,0" IsDefault="True" />
+        </StackPanel>
+    </StackPanel>
+</Window>
