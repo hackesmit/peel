@@ -7,10 +7,10 @@
 // On Windows 11 the sheet is a top level ApplicationFrameWindow (owned by
 // explorer.exe) whose child is a Windows.UI.Core.CoreWindow titled "Share" from
 // ShellExperienceHost. Only that pair is matched. A sheet does not say which
-// app raised it, so Peel never closes "every sheet": ShareOwner below claims
-// only the one sheet that appeared after Peel raised its own, forgets it the
-// moment it leaves the screen, and closes only that window, with messages
-// posted to it (never a keystroke sent to whatever has the foreground).
+// app raised it, so Peel never closes "every sheet": ShareOwner below closes
+// only a sheet owned by Peel's own live anchor window, and leaves any other
+// sheet open, with messages posted to that window (never a keystroke sent to
+// whatever has the foreground).
 // shell/tests/e2e-hygiene.ps1 uses the same match for the GUI tests.
 using System;
 using System.Collections.Generic;
@@ -28,6 +28,7 @@ internal static class ShareSheet
     private const uint WM_SYSCOMMAND = 0x0112;
     private const int SC_CLOSE = 0xF060;
     private const int DWMWA_CLOAKED = 14;
+    private const uint GW_OWNER = 4;
 
     private delegate bool EnumProc(IntPtr hwnd, IntPtr lParam);
 
@@ -39,6 +40,7 @@ internal static class ShareSheet
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr h, uint command);
     [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr h, int attribute, out int value, int size);
 
     private static string Text(IntPtr h)
@@ -111,17 +113,43 @@ internal static class ShareSheet
     /// screen (not destroyed, hidden or cloaked).</summary>
     internal static bool IsShown(IntPtr sheet) => IsWindow(sheet) && IsShareFrame(sheet);
 
-    /// <summary>Ask one sheet to close and report whether it left the screen.
-    /// Only messages posted to that window are used.</summary>
-    internal static bool Close(IntPtr sheet)
+    /// <summary>True when <paramref name="sheet"/> is owned, directly or up
+    /// its owner chain, by the live window <paramref name="anchor"/>.</summary>
+    internal static bool OwnedBy(IntPtr sheet, IntPtr anchor)
     {
-        if (!IsShown(sheet))
+        if (anchor == IntPtr.Zero || !IsWindow(anchor))
         {
-            return true;
+            return false;
+        }
+        var h = sheet;
+        for (var depth = 0; depth < 8; depth++)
+        {
+            h = GetWindow(h, GW_OWNER);
+            if (h == IntPtr.Zero)
+            {
+                return false;
+            }
+            if (h == anchor)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>Ask one sheet to close and report whether it left the screen.
+    /// <paramref name="mayClose"/> is checked again right before each message,
+    /// so a sheet that stopped qualifying is left alone. Only messages posted
+    /// to that window are used.</summary>
+    internal static bool Close(IntPtr sheet, Func<IntPtr, bool> mayClose)
+    {
+        if (!IsShown(sheet) || !mayClose(sheet))
+        {
+            return !IsShown(sheet);
         }
         PostMessage(sheet, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
         Thread.Sleep(500);
-        if (IsShown(sheet))
+        if (IsShown(sheet) && mayClose(sheet))
         {
             PostMessage(sheet, WM_SYSCOMMAND, (IntPtr)SC_CLOSE, IntPtr.Zero);
             Thread.Sleep(300);
@@ -132,91 +160,55 @@ internal static class ShareSheet
     /// <summary>
     /// Close every share sheet on screen and return how many are left. Only
     /// the scripted probe uses it, to leave the desktop clean; Peel itself
-    /// closes only the sheet it owns (ShareOwner).
+    /// closes only a sheet proven its own (ShareOwner).
     /// </summary>
     internal static int CloseAll()
     {
         var sheets = Find();
-        var left = sheets.Count(h => !Close(h));
+        var left = sheets.Count(h => !Close(h, _ => true));
         Log.Write($"share: dismissed {sheets.Count - left} of {sheets.Count} share sheet(s)");
         return left;
     }
 }
 
 /// <summary>
-/// Which share sheet is Peel's. Before Peel raises its sheet it notes the sheets
-/// already on screen; the one sheet that appears afterwards is claimed (none
-/// when two appear, since then it cannot tell). The claim ends as soon as that
-/// sheet leaves the screen, so a sheet another app opens later, even in the
-/// same reused window, is never Peel's. Dismiss closes only the claimed sheet.
+/// Which share sheets Peel may close. A sheet does not say which app raised it,
+/// and neither visibility nor a window handle that stays the same proves
+/// anything (a dismissed sheet's window can come back as another app's, lucy
+/// round 3). So the one proof accepted is a window relation Windows keeps: the
+/// sheet is owned by Peel's own anchor window, which is still alive (a live
+/// window's handle is never reused). It is checked when the sheet is closed,
+/// not remembered from an earlier look. A sheet without that proof is left
+/// open, whoever raised it (fail closed).
 /// </summary>
 internal sealed class ShareOwner
 {
     private readonly Func<IReadOnlyCollection<IntPtr>> _visible;
-    private readonly Func<IntPtr, bool> _shown;
-    private readonly Func<IntPtr, bool> _close;
-    private HashSet<IntPtr> _before = new();
+    private readonly Func<IntPtr, IntPtr, bool> _ownedBy;
+    private readonly Func<IntPtr, Func<IntPtr, bool>, bool> _close;
 
-    internal ShareOwner(Func<IReadOnlyCollection<IntPtr>> visible, Func<IntPtr, bool> shown, Func<IntPtr, bool> close)
+    /// <param name="visible">The sheets on screen now.</param>
+    /// <param name="ownedBy">True when the sheet is owned by the anchor now.</param>
+    /// <param name="close">Close a sheet while the check still holds; true
+    /// when it left the screen.</param>
+    internal ShareOwner(
+        Func<IReadOnlyCollection<IntPtr>> visible, Func<IntPtr, IntPtr, bool> ownedBy,
+        Func<IntPtr, Func<IntPtr, bool>, bool> close)
     {
         _visible = visible;
-        _shown = shown;
+        _ownedBy = ownedBy;
         _close = close;
     }
 
-    /// <summary>The claimed sheet, or IntPtr.Zero.</summary>
-    internal IntPtr Owned { get; private set; }
-
-    /// <summary>True while Peel has raised a sheet it has not found yet.</summary>
-    internal bool Waiting { get; private set; }
-
-    /// <summary>Note the sheets on screen just before Peel raises its own.
-    /// Peel's earlier sheet, if still up, is not counted as someone else's,
-    /// since the system may reuse its window for the new request.</summary>
-    internal void BeforeRaise()
+    /// <summary>Close every sheet on screen that is proven to belong to
+    /// <paramref name="anchor"/>. Returns how many of those stayed up.</summary>
+    internal int Dismiss(IntPtr anchor)
     {
-        _before = _visible().Where(h => h != Owned).ToHashSet();
-        Owned = IntPtr.Zero;
-        Waiting = true;
-    }
-
-    /// <summary>Claim the new sheet, or drop a claimed sheet that has left the
-    /// screen. Returns true while there is still something to watch.</summary>
-    internal bool Poll()
-    {
-        if (Owned != IntPtr.Zero)
+        if (anchor == IntPtr.Zero)
         {
-            if (!_shown(Owned))
-            {
-                Owned = IntPtr.Zero;
-            }
+            return 0;
         }
-        else if (Waiting)
-        {
-            var fresh = _visible().Where(h => !_before.Contains(h)).ToList();
-            if (fresh.Count == 1)
-            {
-                Owned = fresh[0];
-                Waiting = false;
-            }
-            else if (fresh.Count > 1)
-            {
-                Waiting = false;
-            }
-        }
-        return Owned != IntPtr.Zero || Waiting;
-    }
-
-    /// <summary>Stop looking for a sheet that never appeared.</summary>
-    internal void StopWaiting() => Waiting = false;
-
-    /// <summary>Close Peel's sheet if it is still up. Returns false only when
-    /// Peel's sheet stayed on screen.</summary>
-    internal bool Dismiss()
-    {
-        Waiting = false;
-        var sheet = Owned;
-        Owned = IntPtr.Zero;
-        return sheet == IntPtr.Zero || !_shown(sheet) || _close(sheet);
+        bool Ours(IntPtr sheet) => _ownedBy(sheet, anchor);
+        return _visible().Count(sheet => Ours(sheet) && !_close(sheet, Ours));
     }
 }

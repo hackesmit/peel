@@ -31,10 +31,14 @@
 //    are checked against the manifest and the protected copy, and only then is
 //    it marked delete-on-close through the same handle (read-only files
 //    included). The stream list is read once more after the mark, and the mark
-//    is withdrawn if a stream appeared. Folders are removed deepest first and
-//    only when empty. Nothing is ever deleted recursively, so a file created
-//    during the move is never seen, never copied and never deleted: it stays.
-// 6. Whatever is still in the source is reported by name as a partial move.
+//    is withdrawn if a stream appeared (or cannot be listed). Folders are
+//    removed deepest first, only when empty and only when their copy is held
+//    by step 4, each through one handle the same way: identity and an empty
+//    stream list, the mark, the stream list again. Nothing is ever deleted
+//    recursively, so a file created during the move is never seen, never
+//    copied and never deleted: it stays.
+// 6. Whatever is still in the source (files and empty folders) is reported by
+//    name as a partial move.
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -48,7 +52,8 @@ namespace Peel.Actions;
 
 /// <summary>A cross-volume folder move whose copy is complete and verified.
 /// <paramref name="Remaining"/> lists the source entries (relative paths) that
-/// were left in place: new, changed, in use or not removable.</summary>
+/// were left in place: new, changed, in use, not removable or without a
+/// verified copy.</summary>
 internal sealed record CrossVolumeResult(string Target, IReadOnlyList<string> Remaining);
 
 internal static class CrossVolumeMove
@@ -120,11 +125,14 @@ internal static class CrossVolumeMove
     /// tests: <paramref name="duringCopy"/> gets the staging folder before the
     /// first copy, <paramref name="afterCopy"/> the published target before it
     /// is protected, <paramref name="whileProtected"/> the target while the
-    /// verified copy is held and before any source is deleted.
+    /// verified copy is held and before any source is deleted,
+    /// <paramref name="beforeFolderMark"/> each source folder after its stream
+    /// check and before it is marked for deletion.
     /// </summary>
     internal static CrossVolumeResult Move(
         string source, string target, Action<string>? afterCopy = null,
-        Action<string>? duringCopy = null, Action<string>? whileProtected = null)
+        Action<string>? duringCopy = null, Action<string>? whileProtected = null,
+        Action<string>? beforeFolderMark = null)
     {
         var manifest = Manifest(source);
         if (Directory.Exists(target) || File.Exists(target))
@@ -146,7 +154,7 @@ internal static class CrossVolumeMove
         afterCopy?.Invoke(target);
         using var guard = DestinationGuard.Protect(target, manifest, staging.Ids);
         whileProtected?.Invoke(target);
-        var remaining = DeleteMatching(source, manifest, guard.Verified);
+        var remaining = DeleteMatching(source, manifest, guard, beforeFolderMark);
         return new CrossVolumeResult(target, remaining);
     }
 
@@ -244,6 +252,16 @@ internal static class CrossVolumeMove
         /// failing (never replacing) when the target exists.</summary>
         internal void Publish(string target)
         {
+            // FAT and exFAT number a folder by where its entry sits, so the
+            // rename gives the root a new identity. A handle held across the
+            // rename follows the folder itself, and its identity afterwards is
+            // the one the destination check expects.
+            using var root = CreateFileW(Root, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+            if (root.IsInvalid || !GetFileInformationByHandle(root, out var before) || Unpack(before).Id != _owned[0].Id)
+            {
+                throw new IOException($"cannot publish the copy as \"{target}\": the staging folder is not the one this move made");
+            }
             if (!MoveFileExW(Root, target, 0))
             {
                 var error = Marshal.GetLastWin32Error();
@@ -253,6 +271,12 @@ internal static class CrossVolumeMove
                 throw new IOException($"cannot publish the copy as \"{target}\": {why}", error);
             }
             Root = target;
+            if (!GetFileInformationByHandle(root, out var after))
+            {
+                var error = Marshal.GetLastWin32Error();
+                throw new IOException($"cannot read the published copy \"{target}\": {new Win32Exception(error).Message}", error);
+            }
+            _owned[0] = (".", Unpack(after).Id, true);
         }
 
         /// <summary>
@@ -306,8 +330,13 @@ internal static class CrossVolumeMove
     {
         private readonly List<SafeFileHandle> _handles = new();
         private readonly Dictionary<string, Verified> _verified = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _folders = new(StringComparer.OrdinalIgnoreCase);
 
         internal IReadOnlyDictionary<string, Verified> Verified => _verified;
+
+        /// <summary>The copied folders (relative paths, "." the root) that
+        /// passed the identity check and are held until disposal.</summary>
+        internal IReadOnlySet<string> Folders => _folders;
 
         internal static DestinationGuard Protect(string target, IReadOnlyList<Entry> manifest, IReadOnlyDictionary<string, FileId> ids)
         {
@@ -324,9 +353,13 @@ internal static class CrossVolumeMove
                     var path = entry.Relative == "." ? target : Path.Combine(target, entry.Relative);
                     var handle = CreateFileW(path, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
                         IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
-                    if (!guard.Keep(handle, path, ids.GetValueOrDefault(entry.Relative), out var why))
+                    if (guard.Keep(handle, path, ids.GetValueOrDefault(entry.Relative), out var why))
                     {
-                        Log.Write($"move: cannot hold the copied folder {path}: {why}");
+                        guard._folders.Add(entry.Relative);
+                    }
+                    else
+                    {
+                        Log.Write($"move: cannot hold the copied folder {path}, its source stays: {why}");
                     }
                 }
                 foreach (var entry in manifest.Where(e => !e.IsDirectory))
@@ -418,8 +451,9 @@ internal static class CrossVolumeMove
     // --- Source deletion -------------------------------------------------------
 
     private static IReadOnlyList<string> DeleteMatching(
-        string source, IReadOnlyList<Entry> manifest, IReadOnlyDictionary<string, Verified> copies)
+        string source, IReadOnlyList<Entry> manifest, DestinationGuard guard, Action<string>? beforeFolderMark)
     {
+        var copies = guard.Verified;
         var remaining = new List<string>();
         foreach (var entry in manifest.Where(e => !e.IsDirectory))
         {
@@ -437,24 +471,25 @@ internal static class CrossVolumeMove
             remaining.Add(entry.Relative);
         }
         // Deepest folders first, the root last; a folder is only removed when
-        // it is empty, so a folder holding a kept or new file stays.
+        // it is empty, so a folder holding a kept or new file stays. A folder
+        // whose copy is missing or not held stays too, even when empty.
         foreach (var entry in manifest.Where(e => e.IsDirectory).OrderByDescending(e => e.Relative == "." ? -1 : e.Relative.Length))
         {
             var path = entry.Relative == "." ? source : Path.Combine(source, entry.Relative);
-            try
+            string why;
+            if (!guard.Folders.Contains(entry.Relative))
             {
-                if (NamedStreams(path).Count == 0 && !TryDeleteOwned(path, entry.Id, isDirectory: true, out var why))
-                {
-                    Log.Write($"move: kept folder {path}: {why}");
-                }
+                why = "its copy could not be verified";
             }
-            catch (Exception error)
+            else if (TryDeleteFolder(path, entry.Id, out why, beforeFolderMark))
             {
-                Log.Write($"move: kept folder {path}: {error.Message}");
+                continue;
             }
+            Log.Write($"move: kept folder {path}: {why}");
         }
-        // Report every file still in the source, whether it was kept above or
-        // appeared during the move and was never in the manifest.
+        // Report every file and every empty folder still in the source, whether
+        // kept above or created during the move and never in the manifest. A
+        // folder that stays only because it holds them is not listed itself.
         if (Directory.Exists(source))
         {
             try
@@ -462,7 +497,8 @@ internal static class CrossVolumeMove
                 foreach (var left in Directory.EnumerateFileSystemEntries(source, "*", SearchOption.AllDirectories))
                 {
                     var relative = Path.GetRelativePath(source, left);
-                    if (File.Exists(left) && !remaining.Contains(relative, StringComparer.OrdinalIgnoreCase))
+                    var report = File.Exists(left) || !Directory.EnumerateFileSystemEntries(left).Any();
+                    if (report && !remaining.Contains(relative, StringComparer.OrdinalIgnoreCase))
                     {
                         remaining.Add(relative);
                     }
@@ -474,8 +510,8 @@ internal static class CrossVolumeMove
             }
             if (remaining.Count == 0)
             {
-                // Only empty folders are left (for example one recreated during
-                // the move); say so rather than claim the move was whole.
+                // Only the empty root is left; say so rather than claim the
+                // move was whole.
                 remaining.Add(".");
             }
         }
@@ -569,13 +605,7 @@ internal static class CrossVolumeMove
             // A stream created between the listing and the mark would be lost
             // with the file; a delete-pending file accepts no new opens, so this
             // last listing is final.
-            if (!SameNames(StreamNames(handle), copy.Streams.Keys))
-            {
-                Unmark(handle);
-                why = "a stream was added during the move";
-                return false;
-            }
-            return true;
+            return StreamsStillAre(handle, copy.Streams.Keys, out why);
         }
         finally
         {
@@ -584,6 +614,73 @@ internal static class CrossVolumeMove
                 stream.Dispose();
             }
         }
+    }
+
+    /// <summary>
+    /// Delete one empty source folder through a single handle, only if it
+    /// still has identity <paramref name="id"/> and no named stream. Its
+    /// streams are listed through that handle before and after it is marked
+    /// delete-on-close; a delete-pending folder accepts no new opens, so no
+    /// stream can be added after the second listing, and one added before it
+    /// withdraws the mark. Any doubt keeps the folder.
+    /// </summary>
+    internal static bool TryDeleteFolder(string path, FileId id, out string why, Action<string>? beforeMark = null)
+    {
+        try
+        {
+            using var handle = CreateFileW(path, DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, IntPtr.Zero,
+                OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+            if (handle.IsInvalid || !GetFileInformationByHandle(handle, out var info))
+            {
+                why = new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                return false;
+            }
+            if (Unpack(info).Id != id)
+            {
+                why = "it was replaced during the move";
+                return false;
+            }
+            if (StreamNames(handle).Count > 0)
+            {
+                why = "it has an alternate data stream that was not copied";
+                return false;
+            }
+            beforeMark?.Invoke(path);
+            if (!MarkForDelete(handle, out why))
+            {
+                return false;
+            }
+            return StreamsStillAre(handle, Array.Empty<string>(), out why);
+        }
+        catch (Exception error)
+        {
+            why = error.Message;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// After a delete mark: true when the streams of <paramref name="handle"/>
+    /// are exactly <paramref name="expected"/>. Otherwise, or when they cannot
+    /// be listed, the mark is withdrawn and false returned.
+    /// </summary>
+    private static bool StreamsStillAre(SafeFileHandle handle, IEnumerable<string> expected, out string why)
+    {
+        try
+        {
+            if (SameNames(StreamNames(handle), expected))
+            {
+                why = string.Empty;
+                return true;
+            }
+            why = "a stream was added during the move";
+        }
+        catch (Exception error)
+        {
+            why = $"its streams cannot be listed: {error.Message}";
+        }
+        Unmark(handle);
+        return false;
     }
 
     /// <summary>Mark a file or folder delete-on-close through its handle,
@@ -683,8 +780,11 @@ internal static class CrossVolumeMove
                         size *= 4;
                         continue;
                     }
-                    if (error == ERROR_HANDLE_EOF)
+                    if (error == ERROR_HANDLE_EOF || (NoStreamsError(error) && !HasNamedStreams(handle)))
                     {
+                        // No named streams, or a volume (FAT, exFAT) that
+                        // cannot hold any. On a volume that can, every other
+                        // error throws so the caller fails closed.
                         return Array.Empty<string>();
                     }
                     throw new IOException($"cannot list streams: {new Win32Exception(error).Message}", error);
@@ -714,6 +814,18 @@ internal static class CrossVolumeMove
         }
     }
 
+    /// <summary>The errors a stream listing returns on a filesystem without
+    /// named streams.</summary>
+    private static bool NoStreamsError(int error) =>
+        error is ERROR_INVALID_PARAMETER or ERROR_INVALID_FUNCTION or ERROR_NOT_SUPPORTED;
+
+    /// <summary>True when the volume holding <paramref name="handle"/> can
+    /// hold named streams (NTFS, ReFS). Unknown counts as true, so a listing
+    /// error there still throws.</summary>
+    private static bool HasNamedStreams(SafeFileHandle handle) =>
+        !GetVolumeInformationByHandleW(handle, IntPtr.Zero, 0, IntPtr.Zero, IntPtr.Zero, out var flags, IntPtr.Zero, 0)
+        || (flags & FILE_NAMED_STREAMS) != 0;
+
     /// <summary>
     /// The named alternate data streams of a file or folder (the unnamed main
     /// stream "::$DATA" is left out). Empty on a filesystem without streams.
@@ -726,7 +838,7 @@ internal static class CrossVolumeMove
         if (handle == INVALID_HANDLE_VALUE)
         {
             var error = Marshal.GetLastWin32Error();
-            if (error == ERROR_HANDLE_EOF || error == ERROR_INVALID_PARAMETER)
+            if (error == ERROR_HANDLE_EOF || NoStreamsError(error))
             {
                 // No streams at all (a folder), or a filesystem that has none.
                 return found;
@@ -774,6 +886,7 @@ internal static class CrossVolumeMove
     private const int FileDispositionInfoEx = 21;
     private const uint FILE_DISPOSITION_FLAG_DELETE = 0x1;
     private const uint FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE = 0x10;
+    private const uint FILE_NAMED_STREAMS = 0x00040000;
     private const int ERROR_INVALID_FUNCTION = 1;
     private const int ERROR_HANDLE_EOF = 38;
     private const int ERROR_NOT_SUPPORTED = 50;
@@ -845,6 +958,12 @@ internal static class CrossVolumeMove
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out BY_HANDLE_FILE_INFORMATION info);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetVolumeInformationByHandleW(
+        SafeFileHandle handle, IntPtr name, uint nameSize, IntPtr serial, IntPtr maxComponent,
+        out uint flags, IntPtr fsName, uint fsNameSize);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
