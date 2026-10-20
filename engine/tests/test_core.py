@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -639,9 +640,9 @@ def test_copy_path_works_on_a_mixed_selection(make_file, tmp_path):
     result = real.run("files.copy_path", [make_file("a.txt"), folder])
     assert result.ok
     assert result.outputs == []
-    assert result.data["clipboard_text"].splitlines() == [
-        str((tmp_path / "a.txt").resolve()),
-        str(folder.resolve()),
+    assert result.data["clipboard_text"].split("\r\n") == [
+        '"' + os.path.abspath(tmp_path / "a.txt") + '"',
+        '"' + os.path.abspath(folder) + '"',
     ]
 
 

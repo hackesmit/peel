@@ -21,6 +21,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Threading;
+using Peel.Actions;
 using Peel.Engine;
 using Peel.Hooks;
 using Peel.Jobs;
@@ -340,10 +341,11 @@ internal sealed class WheelController
         }
         if (entry.IsShellAction)
         {
-            // Share, Float and Terminal are Windows UI, not engine work. The
-            // file actions bead implements them; until then say so plainly.
-            Log.Write($"{entry.Id} is a shell action and is not built yet");
-            _jobs.Report($"{entry.Label} is not built yet.");
+            // Share, Float, Copy, Move and Terminal are Windows UI, not engine
+            // work; the engine marks them handled_by=shell and ActionHost turns
+            // the drop into the action. This handler runs on the UI thread (a
+            // WPF Drop event), which is where ActionHost needs to be called.
+            ActionHost.Run(entry, files, _jobs, _ui);
             return;
         }
         var parameters = new Dictionary<string, string>();
