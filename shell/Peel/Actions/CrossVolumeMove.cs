@@ -304,7 +304,7 @@ internal static class CrossVolumeMove
     /// still has identity <paramref name="id"/>.</summary>
     private static bool TryDeleteOwned(string path, FileId id, bool isDirectory, out string why)
     {
-        using var handle = CreateFileW(path, DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        using var handle = CreateFileW(path, DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             IntPtr.Zero, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | (isDirectory ? FILE_FLAG_BACKUP_SEMANTICS : 0), IntPtr.Zero);
         if (handle.IsInvalid || !GetFileInformationByHandle(handle, out var info))
         {
@@ -316,7 +316,7 @@ internal static class CrossVolumeMove
             why = "it is not the entry this move created";
             return false;
         }
-        return MarkForDelete(handle, out why);
+        return MarkForDelete(handle, out _, out why);
     }
 
     // --- Destination protection ------------------------------------------------
@@ -540,7 +540,7 @@ internal static class CrossVolumeMove
 
     private static bool DeleteIfUnchanged(string path, Entry entry, Verified copy, out string why)
     {
-        using var handle = CreateFileW(path, GENERIC_READ | DELETE, FILE_SHARE_READ, IntPtr.Zero,
+        using var handle = CreateFileW(path, GENERIC_READ | DELETE | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ, IntPtr.Zero,
             OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, IntPtr.Zero);
         if (handle.IsInvalid)
         {
@@ -598,14 +598,14 @@ internal static class CrossVolumeMove
                     return false;
                 }
             }
-            if (!MarkForDelete(handle, out why))
+            if (!MarkForDelete(handle, out var cleared, out why))
             {
                 return false;
             }
             // A stream created between the listing and the mark would be lost
             // with the file; a delete-pending file accepts no new opens, so this
             // last listing is final.
-            return StreamsStillAre(handle, copy.Streams.Keys, out why);
+            return StreamsStillAre(handle, copy.Streams.Keys, cleared, out why);
         }
         finally
         {
@@ -628,7 +628,7 @@ internal static class CrossVolumeMove
     {
         try
         {
-            using var handle = CreateFileW(path, DELETE | FILE_READ_ATTRIBUTES, FILE_SHARE_READ, IntPtr.Zero,
+            using var handle = CreateFileW(path, DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ, IntPtr.Zero,
                 OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
             if (handle.IsInvalid || !GetFileInformationByHandle(handle, out var info))
             {
@@ -646,11 +646,11 @@ internal static class CrossVolumeMove
                 return false;
             }
             beforeMark?.Invoke(path);
-            if (!MarkForDelete(handle, out why))
+            if (!MarkForDelete(handle, out var cleared, out why))
             {
                 return false;
             }
-            return StreamsStillAre(handle, Array.Empty<string>(), out why);
+            return StreamsStillAre(handle, Array.Empty<string>(), cleared, out why);
         }
         catch (Exception error)
         {
@@ -662,9 +662,10 @@ internal static class CrossVolumeMove
     /// <summary>
     /// After a delete mark: true when the streams of <paramref name="handle"/>
     /// are exactly <paramref name="expected"/>. Otherwise, or when they cannot
-    /// be listed, the mark is withdrawn and false returned.
+    /// be listed, the mark is withdrawn (and <paramref name="cleared"/>, the
+    /// attributes MarkForDelete cleared, put back) and false returned.
     /// </summary>
-    private static bool StreamsStillAre(SafeFileHandle handle, IEnumerable<string> expected, out string why)
+    private static bool StreamsStillAre(SafeFileHandle handle, IEnumerable<string> expected, uint cleared, out string why)
     {
         try
         {
@@ -679,14 +680,18 @@ internal static class CrossVolumeMove
         {
             why = $"its streams cannot be listed: {error.Message}";
         }
-        Unmark(handle);
+        Unmark(handle, cleared);
         return false;
     }
 
     /// <summary>Mark a file or folder delete-on-close through its handle,
-    /// read-only ones included.</summary>
-    private static bool MarkForDelete(SafeFileHandle handle, out string why)
+    /// read-only ones included. Where the filesystem lacks the extended call
+    /// (FAT32, exFAT) a read-only entry has its read-only attribute cleared
+    /// through the same handle first; <paramref name="cleared"/> is then its
+    /// original attributes, for Unmark to put back, and 0 otherwise.</summary>
+    private static bool MarkForDelete(SafeFileHandle handle, out uint cleared, out string why)
     {
+        cleared = 0;
         var ex = new FILE_DISPOSITION_INFO_EX { Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE };
         if (SetFileInformationByHandle(handle, FileDispositionInfoEx, ref ex, Marshal.SizeOf<FILE_DISPOSITION_INFO_EX>()))
         {
@@ -696,7 +701,23 @@ internal static class CrossVolumeMove
         var error = Marshal.GetLastWin32Error();
         if (error is ERROR_INVALID_PARAMETER or ERROR_NOT_SUPPORTED or ERROR_INVALID_FUNCTION)
         {
-            // A filesystem without the extended call (FAT, older Windows).
+            // A filesystem without the extended call (FAT, older Windows): the
+            // plain mark refuses a read-only entry, so clear that first.
+            if (!GetFileInformationByHandle(handle, out var info))
+            {
+                why = new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                return false;
+            }
+            var original = info.FileAttributes & SETTABLE_ATTRIBUTES;
+            if ((original & FILE_ATTRIBUTE_READONLY) != 0)
+            {
+                if (!SetAttributes(handle, original & ~FILE_ATTRIBUTE_READONLY))
+                {
+                    why = $"cannot clear its read-only attribute: {new Win32Exception(Marshal.GetLastWin32Error()).Message}";
+                    return false;
+                }
+                cleared = original;
+            }
             var plain = new FILE_DISPOSITION_INFO { DeleteFile = true };
             if (SetFileInformationByHandle(handle, FileDispositionInfo, ref plain, Marshal.SizeOf<FILE_DISPOSITION_INFO>()))
             {
@@ -704,12 +725,16 @@ internal static class CrossVolumeMove
                 return true;
             }
             error = Marshal.GetLastWin32Error();
+            RestoreAttributes(handle, cleared);
+            cleared = 0;
         }
         why = new Win32Exception(error).Message;
         return false;
     }
 
-    private static void Unmark(SafeFileHandle handle)
+    /// <summary>Withdraw a delete mark, then put back the attributes
+    /// MarkForDelete cleared (<paramref name="cleared"/>, 0 for none).</summary>
+    private static void Unmark(SafeFileHandle handle, uint cleared)
     {
         var ex = new FILE_DISPOSITION_INFO_EX { Flags = 0 };
         var plain = new FILE_DISPOSITION_INFO { DeleteFile = false };
@@ -718,6 +743,24 @@ internal static class CrossVolumeMove
         {
             throw new IOException($"cannot withdraw a delete: {new Win32Exception(Marshal.GetLastWin32Error()).Message}");
         }
+        RestoreAttributes(handle, cleared);
+    }
+
+    private static void RestoreAttributes(SafeFileHandle handle, uint cleared)
+    {
+        if (cleared != 0 && !SetAttributes(handle, cleared))
+        {
+            Log.Write($"move: cannot put back the read-only attribute: {new Win32Exception(Marshal.GetLastWin32Error()).Message}");
+        }
+    }
+
+    /// <summary>Set the attributes of an entry through its handle, leaving its
+    /// times as they are (0 means unchanged).</summary>
+    private static bool SetAttributes(SafeFileHandle handle, uint attributes)
+    {
+        // 0 would mean "leave the attributes unchanged", so none is NORMAL.
+        var basic = new FILE_BASIC_INFO { FileAttributes = attributes == 0 ? FILE_ATTRIBUTE_NORMAL : attributes };
+        return SetFileInformationByHandle(handle, FileBasicInfo, ref basic, Marshal.SizeOf<FILE_BASIC_INFO>());
     }
 
     private static byte[] Hash(SafeFileHandle handle)
@@ -877,10 +920,17 @@ internal static class CrossVolumeMove
     private const uint FILE_SHARE_WRITE = 0x2;
     private const uint FILE_SHARE_DELETE = 0x4;
     private const uint FILE_READ_ATTRIBUTES = 0x0080;
+    private const uint FILE_WRITE_ATTRIBUTES = 0x0100;
+    private const uint FILE_ATTRIBUTE_READONLY = 0x1;
+    private const uint FILE_ATTRIBUTE_NORMAL = 0x80;
+    // The attributes SetFileAttributes accepts: read-only, hidden, system,
+    // archive, normal, temporary, offline, not content indexed.
+    private const uint SETTABLE_ATTRIBUTES = 0x1 | 0x2 | 0x4 | 0x20 | 0x80 | 0x100 | 0x1000 | 0x2000;
     private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
     private const uint OPEN_EXISTING = 3;
     private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
     private const uint FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000;
+    private const int FileBasicInfo = 0;
     private const int FileDispositionInfo = 4;
     private const int FileStreamInfo = 7;
     private const int FileDispositionInfoEx = 21;
@@ -924,6 +974,16 @@ internal static class CrossVolumeMove
     {
         [MarshalAs(UnmanagedType.U1)]
         public bool DeleteFile;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILE_BASIC_INFO
+    {
+        public long CreationTime;
+        public long LastAccessTime;
+        public long LastWriteTime;
+        public long ChangeTime;
+        public uint FileAttributes;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -976,4 +1036,8 @@ internal static class CrossVolumeMove
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass, ref FILE_DISPOSITION_INFO_EX info, int size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass, ref FILE_BASIC_INFO info, int size);
 }

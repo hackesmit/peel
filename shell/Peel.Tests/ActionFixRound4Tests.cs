@@ -7,6 +7,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using Peel.Actions;
 using Xunit;
 
@@ -248,116 +249,146 @@ public class ActionFixRound4Tests
         }
     }
 
-    // --- 3. Share closes only a sheet proven Peel's ---------------------------
+    // --- 4. Read-only entries on FAT32 and exFAT ----------------------------
+    // Those lack the extended delete mark, so Peel clears the read-only
+    // attribute through the handle for the plain mark and puts it back when the
+    // mark fails. They need PEEL_REVIEW_FAT (a folder on a FAT32 or exFAT
+    // volume); without it the NTFS temp folder is used.
 
-    /// <summary>Sheets on screen, each with the window that owns it now.</summary>
-    private sealed class FakeDesktop
+    private static string FatOrNtfsRoot()
     {
-        public readonly Dictionary<IntPtr, IntPtr> OwnerOf = new();
-        public readonly List<IntPtr> Closed = new();
+        var fat = Environment.GetEnvironmentVariable("PEEL_REVIEW_FAT");
+        if (string.IsNullOrEmpty(fat) || !Directory.Exists(fat))
+        {
+            return NewRoot();
+        }
+        var root = Path.Combine(fat, "peel-fix4-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        return root;
+    }
 
-        /// <summary>Runs inside close, after the check and before the close.</summary>
-        public Action? WhileClosing;
+    [Fact]
+    public void AReadOnlyEmptyFolderIsDeletedThroughItsHandle()
+    {
+        var root = FatOrNtfsRoot();
+        try
+        {
+            var dir = Path.Combine(root, "ro");
+            Directory.CreateDirectory(dir);
+            File.SetAttributes(dir, FileAttributes.Directory | FileAttributes.ReadOnly);
+            Assert.True(CrossVolumeMove.TryDeleteFolder(dir, CrossVolumeMove.Stat(dir).Id, out var why), why);
+            Assert.False(Directory.Exists(dir));
+        }
+        finally
+        {
+            Wipe(root);
+        }
+    }
 
-        public ShareOwner Owner() => new(
-            () => OwnerOf.Keys.ToList(),
-            (sheet, anchor) => OwnerOf.TryGetValue(sheet, out var o) && o == anchor,
-            (sheet, mayClose) =>
+    [Fact]
+    public void AReadOnlyFolderThatCannotBeMarkedKeepsItsAttributes()
+    {
+        var root = FatOrNtfsRoot();
+        var dir = Path.Combine(root, "ro");
+        try
+        {
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "keep.txt"), "keep");
+            File.SetAttributes(dir, FileAttributes.Directory | FileAttributes.ReadOnly | FileAttributes.Hidden);
+            // Not empty, so the delete mark itself fails after the attribute
+            // was cleared for it.
+            Assert.False(CrossVolumeMove.TryDeleteFolder(dir, CrossVolumeMove.Stat(dir).Id, out _));
+            var attributes = File.GetAttributes(dir);
+            Assert.True(attributes.HasFlag(FileAttributes.ReadOnly), attributes.ToString());
+            Assert.True(attributes.HasFlag(FileAttributes.Hidden), attributes.ToString());
+            Assert.Equal("keep", File.ReadAllText(Path.Combine(dir, "keep.txt")));
+        }
+        finally
+        {
+            if (Directory.Exists(dir))
             {
-                WhileClosing?.Invoke();
-                if (OwnerOf.ContainsKey(sheet) && mayClose(sheet))
+                File.SetAttributes(dir, FileAttributes.Directory);
+            }
+            Wipe(root);
+        }
+    }
+
+    // --- 3. Peel never closes a share sheet -----------------------------------
+    // Round 4 leaves the sheet to the user: no method in Peel calls the sheet
+    // closer. Only the scripted probe (another assembly) uses CloseAll.
+
+    [Fact]
+    public void NothingInPeelClosesAShareSheet()
+    {
+        var closers = typeof(ShareSheet).GetMethods(BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public)
+            .Where(m => m.Name is "Close" or "CloseAll").ToList();
+        Assert.Equal(2, closers.Count);
+        var callers = new List<string>();
+        foreach (var type in typeof(ShareSheet).Assembly.GetTypes().Where(t => t != typeof(ShareSheet) && t.DeclaringType != typeof(ShareSheet)))
+        {
+            const BindingFlags all = BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic
+                | BindingFlags.Public | BindingFlags.DeclaredOnly;
+            foreach (var method in type.GetMethods(all).Cast<MethodBase>().Concat(type.GetConstructors(all)))
+            {
+                if (CallsAny(method, closers))
                 {
-                    Closed.Add(sheet);
-                    OwnerOf.Remove(sheet);
+                    callers.Add($"{type.FullName}.{method.Name}");
                 }
-                return !OwnerOf.ContainsKey(sheet);
-            });
-    }
-
-    private static readonly IntPtr Anchor = new(0x0A01);
-    private static readonly IntPtr Explorer = new(0x0E01);
-    private static readonly IntPtr SheetA = new(0x1001);
-    private static readonly IntPtr SheetB = new(0x2002);
-
-    [Fact]
-    public void PeelClosesASheetItsAnchorOwns()
-    {
-        var desk = new FakeDesktop();
-        desk.OwnerOf[SheetA] = Anchor;
-        Assert.Equal(0, desk.Owner().Dismiss(Anchor));
-        Assert.Equal(new[] { SheetA }, desk.Closed);
+            }
+        }
+        Assert.Empty(callers);
     }
 
     [Fact]
-    public void AReusedSheetWindowWithNoLookInBetweenIsNotClosed()
+    public void ShareKeepsNoSheetOwnershipLogic()
     {
-        var desk = new FakeDesktop();
-        var owner = desk.Owner();
-        // Peel's sheet is up in window A; nothing polls. The user dismisses it
-        // and Explorer opens its own sheet in the same window A.
-        desk.OwnerOf[SheetA] = Anchor;
-        desk.OwnerOf[SheetA] = Explorer;
-        owner.Dismiss(Anchor);
-        Assert.Empty(desk.Closed);
+        Assert.Null(typeof(ShareSheet).Assembly.GetType("Peel.Actions.ShareOwner"));
+        Assert.Null(typeof(ShareAction).GetMethod("Dismiss", BindingFlags.Static | BindingFlags.NonPublic));
     }
 
-    [Fact]
-    public void AForeignSheetThatAppearsBeforePeelsIsNotClosed()
+    /// <summary>True when the IL of <paramref name="method"/> has a call to one
+    /// of <paramref name="targets"/> (call, callvirt or ldftn).</summary>
+    private static bool CallsAny(MethodBase method, IReadOnlyCollection<MethodInfo> targets)
     {
-        var desk = new FakeDesktop();
-        // Peel raises its sheet; before any look, the user dismisses it and
-        // another app's sheet is the only new one on screen.
-        desk.OwnerOf[SheetB] = Explorer;
-        desk.Owner().Dismiss(Anchor);
-        Assert.Empty(desk.Closed);
-    }
-
-    [Fact]
-    public void ASheetWithNoOwnerIsLeftOpen()
-    {
-        // If Windows gives the sheet no owner, nothing proves it is Peel's.
-        var desk = new FakeDesktop();
-        desk.OwnerOf[SheetA] = IntPtr.Zero;
-        desk.Owner().Dismiss(Anchor);
-        Assert.Empty(desk.Closed);
-    }
-
-    [Fact]
-    public void OnlyTheProvenSheetIsClosedWhenSeveralAreUp()
-    {
-        var desk = new FakeDesktop();
-        desk.OwnerOf[SheetA] = Anchor;
-        desk.OwnerOf[SheetB] = Explorer;
-        desk.Owner().Dismiss(Anchor);
-        Assert.Equal(new[] { SheetA }, desk.Closed);
-        Assert.True(desk.OwnerOf.ContainsKey(SheetB));
-    }
-
-    [Fact]
-    public void ASheetThatChangesHandsWhileClosingIsLeftOpen()
-    {
-        var desk = new FakeDesktop();
-        desk.OwnerOf[SheetA] = Anchor;
-        desk.WhileClosing = () => desk.OwnerOf[SheetA] = Explorer;
-        desk.Owner().Dismiss(Anchor);
-        Assert.Empty(desk.Closed);
-    }
-
-    [Fact]
-    public void WithNoAnchorNothingIsClosed()
-    {
-        var desk = new FakeDesktop();
-        desk.OwnerOf[SheetA] = IntPtr.Zero;
-        desk.Owner().Dismiss(IntPtr.Zero);
-        Assert.Empty(desk.Closed);
-    }
-
-    [Fact]
-    public void ARealWindowIsNotOwnedByADeadAnchor()
-    {
-        // OwnedBy refuses an anchor that is not a live window, so a closed
-        // anchor whose handle was reused proves nothing.
-        Assert.False(ShareSheet.OwnedBy(SheetA, new IntPtr(0x7FFF0001)));
-        Assert.False(ShareSheet.OwnedBy(SheetA, IntPtr.Zero));
+        byte[]? il;
+        try
+        {
+            il = method.GetMethodBody()?.GetILAsByteArray();
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+        if (il is null)
+        {
+            return false;
+        }
+        for (var i = 0; i + 4 < il.Length; i++)
+        {
+            var isCall = il[i] is 0x28 or 0x6F || (il[i] == 0xFE && il[i + 1] == 0x06);
+            if (!isCall)
+            {
+                continue;
+            }
+            var at = il[i] == 0xFE ? i + 2 : i + 1;
+            if (at + 4 > il.Length)
+            {
+                continue;
+            }
+            try
+            {
+                var called = method.Module.ResolveMethod(BitConverter.ToInt32(il, at),
+                    method.DeclaringType?.GetGenericArguments(), method.IsGenericMethod ? method.GetGenericArguments() : null);
+                if (called is MethodInfo info && targets.Contains(info))
+                {
+                    return true;
+                }
+            }
+            catch (Exception)
+            {
+                // Not a method token at this offset.
+            }
+        }
+        return false;
     }
 }
