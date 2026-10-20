@@ -226,8 +226,9 @@ internal sealed class KeyboardController
         }
     }
 
-    private void Switch(string modifier)
+    private void Switch(string pressed)
     {
+        var modifier = Peel.Settings.SettingsStore.Current.WheelKeyFor(pressed);
         var family = _catalog.FamilyForModifier(modifier) ?? _registry?.FamilyForModifier(modifier);
         if (family is null)
         {
