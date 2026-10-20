@@ -1591,14 +1591,18 @@ def _xmp_text(value: Any) -> tuple[str, bytes, str] | None:
         return None
     import re
 
+    # A NUL or other C0 control is not allowed in XML: a reader may skip it
+    # and see a GPS name this pass cannot, so such a packet is unreadable.
+    if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", text):
+        return None
     declared = re.match(r"""\s*<\?xml[^>]*?\sencoding\s*=\s*["']([^"']*)["']""", text)
     if declared and declared.group(1).strip().lower() not in _XMP_DECLARED:
         return None
     return text, bom, codec
 
 
-# Any XMP property named GPS<something> (exif:GPSLatitude, exifEX:GPS...),
-# as an element name or as an attribute.
+# Any XMP property named GPS<something> in any letter case (exif:GPSLatitude,
+# exifEX:GPS..., drone-dji:GpsLatitude), as an element name or as an attribute.
 _XMP_GPS_NAME = r"(?:[\w.-]+:)?GPS[\w.-]*"
 _XMP_GPS_ATTRIBUTE = r"""\s[\w.-]+:GPS[\w.-]*\s*=\s*(?:"[^"]*"|'[^']*')"""
 
@@ -1613,8 +1617,8 @@ def _xmp_without_gps(text: str) -> str | None:
     """
     import re
 
-    gps_name = re.compile(_XMP_GPS_NAME)
-    gps_attribute = re.compile(_XMP_GPS_ATTRIBUTE)
+    gps_name = re.compile(_XMP_GPS_NAME, re.IGNORECASE)
+    gps_attribute = re.compile(_XMP_GPS_ATTRIBUTE, re.IGNORECASE)
     tag_name = re.compile(r"</?\s*([^\s/>]+)")
     tag_stop = re.compile(r"""[>"']""")
     kept: list[str] = []
@@ -1689,7 +1693,7 @@ def _xmp_without_location(value: Any) -> bytes | None:
         return None
     text, bom, codec = decoded
     scrubbed = _xmp_without_gps(text)
-    if scrubbed is None or "GPS" in scrubbed:
+    if scrubbed is None or "GPS" in scrubbed.upper():
         return None
     return bom + scrubbed.encode(codec)
 
@@ -1735,7 +1739,7 @@ def _location_left(target: Path) -> bool:
             # Read in the packet's own encoding: a UTF-16 "GPS" is not the
             # bytes b"GPS". A packet that cannot be read counts as a place.
             decoded = _xmp_text(packet)
-            if decoded is None or "GPS" in decoded[0]:
+            if decoded is None or "GPS" in decoded[0].upper():
                 return True
     return False
 
