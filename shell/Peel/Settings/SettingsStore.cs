@@ -87,7 +87,7 @@ internal static class SettingsStore
     /// the message the window shows. The file is replaced in one move, so a
     /// crash mid write leaves the old one.
     /// </summary>
-    internal static string? Save(PeelSettings settings)
+    internal static string? Save(PeelSettings settings, string? path = null)
     {
         var problem = settings.Problem();
         if (problem is not null)
@@ -95,7 +95,7 @@ internal static class SettingsStore
             return problem;
         }
         var normal = settings.Normalized();
-        var path = Path;
+        path ??= Path;
         try
         {
             Write(path, normal);

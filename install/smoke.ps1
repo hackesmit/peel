@@ -16,6 +16,9 @@
        lock, and puts it back running at the end.
     2. Conversion by drag: shell\tests\e2e-drag.ps1 with -App pointed at the
        installed exe (TXT to MD, plus its cancel and fall through scenarios).
+    2b. A real video tool: Compress on a 2 s ffmpeg testsrc clip through the
+       keyboard path, on default settings (only the hotkey changed), so the
+       default quality preset reaches the engine as a value it accepts.
     3. Settings window: starts Peel, starts it again (which opens the running
        Peel's settings), screenshots the window with PrintWindow and reads its
        controls back through UI Automation, then cancels.
@@ -30,7 +33,7 @@
   the engine already ships, so it stands in for "one action" here.
 
   Evidence: C:\peel-dev\smoke\ (result.json, drive.log, peel.log, settings.png,
-  drag\ for the drag driver's own result).
+  drag\ for the drag driver's own result, video\ and video-peel.log for 2b).
 #>
 param(
     [switch]$Inner,
@@ -49,10 +52,39 @@ $resultPath = Join-Path $Dir 'result.json'
 $driveLog = Join-Path $Dir 'drive.log'
 
 # --- outer: schedule the inner run in the desktop session --------------------
+function Get-InstalledPeel {
+    @(Get-Process -Name Peel -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -ieq $app })
+}
+
+# Start the installed Peel in the desktop session (this process is session 0
+# over ssh) through a one shot Interactive task, the way publish.ps1 does.
+function Start-InstalledInteractive {
+    $task = 'PeelSmokeRestore'
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
+        -Argument ('-NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath ''{0}''"' -f $app)
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Force | Out-Null
+    try {
+        Start-ScheduledTask -TaskName $task
+        $deadline = (Get-Date).AddSeconds(20)
+        do {
+            Start-Sleep -Milliseconds 500
+        } while (@(Get-InstalledPeel | Where-Object { $_.SessionId -ne 0 }).Count -eq 0 -and (Get-Date) -lt $deadline)
+    }
+    finally {
+        Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+
 if (-not $Inner) {
     if (-not (Test-Path $app)) { throw "Peel is not installed: run install\publish.ps1 first ($app)" }
     New-Item -ItemType Directory -Force $Dir | Out-Null
     Remove-Item $resultPath -ErrorAction SilentlyContinue
+    # Recorded here, outside the disposable inner run: when the task is killed
+    # (timeout, Stop-ScheduledTask) its finally never runs, so restoring
+    # Daniel's Peel is this script's job too.
+    $wasRunning = @(Get-InstalledPeel | Where-Object { $_.SessionId -ne 0 }).Count -gt 0
     $task = 'PeelSmoke'
     $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Inner -Dir "{1}" -Presses {2} -Drags {3}' -f `
         $MyInvocation.MyCommand.Path, $Dir, $Presses, $Drags
@@ -61,6 +93,7 @@ if (-not $Inner) {
     $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds $TimeoutSeconds)
     Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+    $timedOut = $false
     try {
         Start-ScheduledTask -TaskName $task
         $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -70,11 +103,27 @@ if (-not $Inner) {
         } while ($state -eq 'Running' -and (Get-Date) -lt $deadline)
         if ($state -eq 'Running') {
             Stop-ScheduledTask -TaskName $task
+            $timedOut = $true
             Write-Output "TIMEOUT after $TimeoutSeconds seconds"
         }
     }
     finally {
         Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+        # No result.json means the inner run died before its finally: any
+        # Peel.exe from the installed folder is then a test copy (on the
+        # smoke settings and log), so stop it and start Daniel's own.
+        if ($timedOut -or -not (Test-Path $resultPath)) {
+            foreach ($process in Get-InstalledPeel) {
+                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                Wait-Process -Id $process.Id -Timeout 10 -ErrorAction SilentlyContinue
+            }
+            Write-Output 'RECOVERY: the inner run did not finish; stopped its test copies'
+        }
+        if ($wasRunning -and @(Get-InstalledPeel | Where-Object { $_.SessionId -ne 0 }).Count -eq 0) {
+            Start-InstalledInteractive
+            $back = @(Get-InstalledPeel | Where-Object { $_.SessionId -ne 0 }).Count
+            Write-Output "RECOVERY: restarted the installed Peel: $back running"
+        }
     }
     if (-not (Test-Path $resultPath)) {
         Write-Output 'RESULT: no result.json, the driver did not finish'
@@ -340,6 +389,41 @@ try {
     $failed = @($drag.checks | Where-Object { -not $_.ok } | ForEach-Object { $_.name })
     Check 'conversion by drag (installed build)' $drag.ok ("{0} checks, failed: {1}" -f @($drag.checks).Count, ($failed -join '; '))
 
+    # 2b. A real video tool on default settings (review round 1 blocker): the
+    # Balanced preset must send the video tools' quality as one of their
+    # choices, not the image tools' 80, or the engine refuses the job. Only
+    # the hotkey differs from the defaults, so the keyboard driver can open it.
+    $videoDir = Join-Path $Dir 'video'
+    Remove-Item $videoDir -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force $videoDir | Out-Null
+    $clip = Join-Path $videoDir 'clip.mp4'
+    $ffmpeg = ((& $peel doctor | Out-String | ConvertFrom-Json).backends | Where-Object { $_.name -eq 'ffmpeg' }).path
+    $ErrorActionPreference = 'Continue'
+    & $ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc=duration=2:size=320x240:rate=15 -pix_fmt yuv420p $clip 2>&1 | Out-Null
+    $ErrorActionPreference = 'Stop'
+    $videoSettings = Join-Path $Dir 'video-settings.json'
+    [System.IO.File]::WriteAllText($videoSettings, '{"hotkey": "Ctrl+Alt+P"}')
+    $videoPeel = StartPeel $videoSettings
+    try {
+        WaitLog 'registry preloaded' 20000 | Out-Null
+        CloseTestExplorer
+        Start-Process explorer.exe $videoDir | Out-Null
+        Start-Sleep -Seconds 3
+        $item = FindItem 'clip.mp4'
+        if (-not $item) { throw 'clip.mp4 is not visible in Explorer' }
+        $ran = RunByKeyboard $item 'Ctrl' 'tool' 'Compress'
+        $end = WaitLog 'job end av\.video_compress ok=(\w+) outputs=(\d+)(.*)' 60000
+        $made = @(Get-ChildItem $videoDir -Filter '*.mp4' | Where-Object { $_.Name -ne 'clip.mp4' } | ForEach-Object { $_.Name })
+        $ok = $end -and $end.Groups[1].Value -eq 'True' -and $made.Count -eq 1
+        Check 'video: Compress on default settings (installed engine)' $ok ("{0}; {1}; made: {2}" -f $ran, $(if ($end) { $end.Value } else { 'no job end' }), ($made -join ','))
+    }
+    finally {
+        StopPeel $videoPeel
+        CloseTestExplorer
+        # Keep its log as evidence, and give the next Peel a clean one.
+        Move-Item $peelLog (Join-Path $Dir 'video-peel.log') -Force -ErrorAction SilentlyContinue
+    }
+
     # 2. Settings window, opened by starting Peel a second time.
     $smokePeel = StartPeel $settingsFile
     Check 'installed Peel starts' ((WaitLog 'peel shell start' 15000) -ne $null) 'peel shell start'
@@ -471,10 +555,11 @@ try {
     # first one's finalizers released. A lagging count drops, a leak stays.
     Start-Sleep -Seconds 60
     Sample $smokePeel 'idle 60 s'
-    $gcdump = Get-Command dotnet-gcdump -ErrorAction SilentlyContinue
+    # A path string either way: Get-Command gives .Source, a file .FullName.
+    $gcdump = (Get-Command dotnet-gcdump -ErrorAction SilentlyContinue | Select-Object -First 1).Source
     if (-not $gcdump) {
         $candidate = Join-Path $env:USERPROFILE '.dotnet\tools\dotnet-gcdump.exe'
-        if (Test-Path $candidate) { $gcdump = Get-Item $candidate }
+        if (Test-Path $candidate) { $gcdump = (Get-Item $candidate).FullName }
     }
     if ($gcdump) {
         foreach ($pass in 1, 2) {
@@ -482,7 +567,7 @@ try {
             # It warns on stderr, which Windows PowerShell 5.1 would turn
             # into a terminating error under Stop.
             $ErrorActionPreference = 'Continue'
-            & $gcdump.Source collect -p $smokePeel.Id -o $dump 2>&1 | Out-Null
+            & $gcdump collect -p $smokePeel.Id -o $dump 2>&1 | Out-Null
             $ErrorActionPreference = 'Stop'
             Remove-Item $dump -ErrorAction SilentlyContinue
             Start-Sleep -Seconds 3

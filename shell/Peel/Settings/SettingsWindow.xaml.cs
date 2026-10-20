@@ -181,8 +181,7 @@ public partial class SettingsWindow : Window
         {
             problem = $"The folder {settings.OutputFolder} does not exist.";
         }
-        problem ??= StartupEntry.Set(settings.StartWithWindows, Environment.ProcessPath);
-        problem ??= SettingsStore.Save(settings);
+        problem ??= SaveWithStartup(settings);
         if (problem is not null)
         {
             ProblemText.Text = problem;
@@ -191,5 +190,28 @@ public partial class SettingsWindow : Window
             return;
         }
         Close();
+    }
+
+    /// <summary>
+    /// The Run value and the settings file change together or not at all: a
+    /// save that fails puts the Run value back, so log on never disagrees
+    /// with what the window says was kept.
+    /// </summary>
+    internal static string? SaveWithStartup(
+        PeelSettings settings, string? exe = null, string runKey = StartupEntry.RunKey, string? path = null)
+    {
+        var previous = StartupEntry.Read(runKey);
+        var problem = StartupEntry.Set(settings.StartWithWindows, exe, runKey);
+        if (problem is not null)
+        {
+            return problem;
+        }
+        problem = SettingsStore.Save(settings, path);
+        if (problem is null)
+        {
+            return null;
+        }
+        var undo = StartupEntry.Restore(previous, runKey);
+        return undo is null ? problem : $"{problem} {undo}";
     }
 }

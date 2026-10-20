@@ -35,8 +35,10 @@ internal sealed class HotkeyListener : IDisposable
     internal HotkeyChord Chord => _chord;
 
     /// <summary>The message the tray shows when the chord could not be registered.</summary>
-    internal string ConflictMessage =>
-        $"Peel could not use {_chord} because another app uses it. Drag files to open the wheel, or pick another shortcut in Settings.";
+    internal string ConflictMessage => ConflictFor(_chord);
+
+    internal static string ConflictFor(HotkeyChord chord) =>
+        $"Peel could not use {chord} because another app uses it. Drag files to open the wheel, or pick another shortcut in Settings.";
 
     /// <summary>
     /// Register a chord. Returns false (and logs) when it cannot, most often
@@ -99,8 +101,9 @@ internal sealed class HotkeyListener : IDisposable
     }
 
     /// <summary>
-    /// Swap to a new chord: the old one is released first, so a failed
-    /// registration leaves no hotkey rather than the stale one.
+    /// Swap to a new chord. The old one is released first (the new chord may
+    /// share its keys); if the new one cannot be registered, the old one is
+    /// taken back so a failed change never leaves Peel with no hotkey.
     /// </summary>
     internal bool Rebind(HotkeyChord chord)
     {
@@ -108,8 +111,18 @@ internal sealed class HotkeyListener : IDisposable
         {
             return false;
         }
+        var previous = _chord;
+        var had = _registered;
         Dispose();
-        return Register(chord);
+        if (Register(chord))
+        {
+            return true;
+        }
+        if (had && Register(previous))
+        {
+            Log.Write($"kept the {previous} hotkey after {chord} failed");
+        }
+        return false;
     }
 
     /// <summary>
