@@ -1543,31 +1543,155 @@ def _edited_exif(img, params: dict[str, Any]):
         raise RunnerFailed(f"that metadata cannot be written: {exc}") from None
 
 
-# Any XMP property named GPS<something> (exif:GPSLatitude, exifEX:GPS...), as
-# an attribute or as an element with or without content.
-_XMP_GPS_ATTRIBUTE = rb"""\s[\w.-]+:GPS[\w.-]*\s*=\s*(?:"[^"]*"|'[^']*')"""
-_XMP_GPS_ELEMENT = (
-    rb"<([\w.-]+:GPS[\w.-]*)\b[^>]*/>"
-    rb"|<([\w.-]+:GPS[\w.-]*)\b[^>]*>.*?</\2\s*>"
+# XMP is Unicode text in any of UTF-8, UTF-16 or UTF-32 (XMP spec part 1,
+# 7.1), told apart by a byte order mark or, without one, by where the zero
+# bytes fall around the first "<". Longest marks first: the UTF-32LE mark
+# starts with the UTF-16LE one.
+_XMP_BOMS = (
+    (b"\x00\x00\xfe\xff", "utf-32-be"),
+    (b"\xff\xfe\x00\x00", "utf-32-le"),
+    (b"\xfe\xff", "utf-16-be"),
+    (b"\xff\xfe", "utf-16-le"),
+    (b"\xef\xbb\xbf", "utf-8"),
 )
+_XMP_UNMARKED = (
+    (b"\x00\x00\x00<", "utf-32-be"),
+    (b"<\x00\x00\x00", "utf-32-le"),
+    (b"\x00<", "utf-16-be"),
+    (b"<\x00", "utf-16-le"),
+)
+_XMP_DECLARED = ("utf-8", "utf8", "utf-16", "utf-16le", "utf-16be",
+                 "utf-32", "utf-32le", "utf-32be")
+
+
+def _xmp_text(value: Any) -> tuple[str, bytes, str] | None:
+    """The packet as text plus the mark and codec to write it back, or None.
+
+    None means the packet cannot be read safely (not bytes or text, not valid
+    in the encoding it claims, or declaring one XMP does not allow), and the
+    callers treat that as a packet that may still hold a location.
+    """
+    if isinstance(value, str):
+        return value, b"", "utf-8"
+    if not isinstance(value, bytes):
+        return None
+    bom, codec = b"", "utf-8"
+    for mark, name in _XMP_BOMS:
+        if value.startswith(mark):
+            bom, codec = mark, name
+            break
+    else:
+        for lead, name in _XMP_UNMARKED:
+            if value.startswith(lead):
+                codec = name
+                break
+    try:
+        text = value[len(bom):].decode(codec)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    import re
+
+    declared = re.match(r"""\s*<\?xml[^>]*?\sencoding\s*=\s*["']([^"']*)["']""", text)
+    if declared and declared.group(1).strip().lower() not in _XMP_DECLARED:
+        return None
+    return text, bom, codec
+
+
+# Any XMP property named GPS<something> (exif:GPSLatitude, exifEX:GPS...),
+# as an element name or as an attribute.
+_XMP_GPS_NAME = r"(?:[\w.-]+:)?GPS[\w.-]*"
+_XMP_GPS_ATTRIBUTE = r"""\s[\w.-]+:GPS[\w.-]*\s*=\s*(?:"[^"]*"|'[^']*')"""
+
+
+def _xmp_without_gps(text: str) -> str | None:
+    """The text with every GPS element and attribute cut out, None if unsure.
+
+    One pass over the markup with str.find, so the cost is linear in the
+    packet: a backtracking regex took seconds on a packet full of unclosed
+    GPS elements. Anything the pass cannot follow (an unclosed tag, comment
+    or GPS element) gives None.
+    """
+    import re
+
+    gps_name = re.compile(_XMP_GPS_NAME)
+    gps_attribute = re.compile(_XMP_GPS_ATTRIBUTE)
+    tag_name = re.compile(r"</?\s*([^\s/>]+)")
+    tag_stop = re.compile(r"""[>"']""")
+    kept: list[str] = []
+    skipping: list[str] = []  # open element names inside a GPS property being cut out
+    pos = 0
+    while True:
+        lt = text.find("<", pos)
+        if lt < 0:
+            if not skipping:
+                kept.append(text[pos:])
+            break
+        if not skipping:
+            kept.append(text[pos:lt])
+        for opener, closer in (("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")):
+            if text.startswith(opener, lt):
+                close = text.find(closer, lt + len(opener))
+                if close < 0:
+                    return None
+                end = close + len(closer)
+                if not skipping:
+                    kept.append(text[lt:end])
+                pos = end
+                break
+        else:
+            # An element tag: find its ">" outside quoted attribute values.
+            i = lt + 1
+            while True:
+                stop = tag_stop.search(text, i)
+                if stop is None:
+                    return None
+                if stop.group() == ">":
+                    end = stop.end()
+                    break
+                quote = text.find(stop.group(), stop.end())
+                if quote < 0:
+                    return None
+                i = quote + 1
+            tag = text[lt:end]
+            pos = end
+            closing = tag.startswith("</")
+            empty = tag.endswith("/>") or tag.startswith("<!")
+            name = tag_name.match(tag)
+            name = name.group(1) if name else ""
+            if skipping:
+                if closing:
+                    # A close that does not match is markup we cannot follow.
+                    if name != skipping.pop():
+                        return None
+                elif not empty:
+                    skipping.append(name)
+                continue
+            if not closing and gps_name.fullmatch(name):
+                if not empty:
+                    skipping.append(name)
+                continue
+            kept.append(gps_attribute.sub("", tag))
+    if skipping:
+        return None
+    return "".join(kept)
 
 
 def _xmp_without_location(value: Any) -> bytes | None:
     """The XMP packet with every GPS property taken out, None to drop it whole.
 
-    Scrubbing keeps the rest of the packet (an XMP orientation, a rating); when
-    the packet is not bytes or a GPS mention survives the scrub, dropping it is
-    the only answer that cannot leave the place behind.
+    Scrubbing keeps the rest of the packet (an XMP orientation, a rating) in
+    the encoding it came in; when the packet cannot be decoded, the scrub
+    cannot follow it, or a GPS mention survives, dropping it is the only
+    answer that cannot leave the place behind.
     """
-    import re
-
-    if isinstance(value, str):
-        value = value.encode("utf-8")
-    if not isinstance(value, bytes):
+    decoded = _xmp_text(value)
+    if decoded is None:
         return None
-    packet = re.sub(_XMP_GPS_ELEMENT, b"", value, flags=re.DOTALL)
-    packet = re.sub(_XMP_GPS_ATTRIBUTE, b"", packet)
-    return None if b"GPS" in packet else packet
+    text, bom, codec = decoded
+    scrubbed = _xmp_without_gps(text)
+    if scrubbed is None or "GPS" in scrubbed:
+        return None
+    return bom + scrubbed.encode(codec)
 
 
 def _drop_xmp_location(img) -> None:
@@ -1604,9 +1728,14 @@ def _location_left(target: Path) -> bool:
         if dict(exif.get_ifd(TAG_GPS_IFD)):
             return True
         for packet in (exif.get(TAG_XMP), out.info.get("xmp"), out.info.get("XML:com.adobe.xmp")):
-            if isinstance(packet, str):
-                packet = packet.encode("utf-8")
-            if isinstance(packet, bytes) and b"GPS" in packet:
+            if packet is None:
+                continue
+            if isinstance(packet, tuple) and len(packet) == 1:
+                packet = packet[0]
+            # Read in the packet's own encoding: a UTF-16 "GPS" is not the
+            # bytes b"GPS". A packet that cannot be read counts as a place.
+            decoded = _xmp_text(packet)
+            if decoded is None or "GPS" in decoded[0]:
                 return True
     return False
 
