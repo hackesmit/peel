@@ -6,7 +6,14 @@ param(
     [string]$Dir = 'C:\peel-dev\review-e2e'
 )
 $ErrorActionPreference = 'Stop'
-$app = Join-Path $Root 'shell\Peel\bin\Release\net8.0-windows\Peel.exe'
+# Match the target framework folder (it gained a Windows SDK version with the
+# Share action), rather than naming one version.
+# Pick the newest build by target framework version (e2e-hygiene.ps1), never
+# the first folder alphabetically: a dev copy that still holds an old
+# net8.0-windows build would otherwise launch that stale exe silently.
+. (Join-Path $PSScriptRoot 'e2e-hygiene.ps1')
+$app = Find-PeelApp $Root
+if (-not $app) { throw "build the shell first (dotnet build -c Release): no Peel.exe under shell\Peel\bin\Release\net8.0-windows*" }
 $driver = Join-Path $Root 'shell\tests\review-elevated-up.ps1'
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Remove-Item (Join-Path $Dir '*') -Recurse -Force -ErrorAction SilentlyContinue

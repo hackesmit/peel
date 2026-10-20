@@ -2,7 +2,12 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <!-- The Windows 10 SDK projection (net8.0-windows10.0.x) brings in
+         Windows.ApplicationModel.DataTransfer, which the Share action needs to
+         raise the system share sheet. Everything else here already worked on
+         the plain net8.0-windows target. -->
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
@@ -43,6 +48,10 @@
     <!-- The wheel maths, the drag state machine and the engine model are
          internal to the app and are what the unit tests exercise. -->
     <InternalsVisibleTo Include="Peel.Tests" />
+    <!-- The interactive action check (shell\tests\ActionProbe) drives the Alt
+         wheel actions directly in the logged on session, the same way the unit
+         tests drive their cores, so it reaches the internal action classes. -->
+    <InternalsVisibleTo Include="Peel.ActionProbe" />
   </ItemGroup>
 
 </Project>

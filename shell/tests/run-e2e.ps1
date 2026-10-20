@@ -40,8 +40,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$app = Join-Path $Root 'shell\Peel\bin\Release\net8.0-windows\Peel.exe'
-if (-not (Test-Path $app)) { throw "build the shell first (dotnet build -c Release): $app" }
+# Pick the newest build by target framework version (e2e-hygiene.ps1), never
+# the first folder alphabetically: a dev copy that still holds an old
+# net8.0-windows build would otherwise launch that stale exe silently.
+. (Join-Path $PSScriptRoot 'e2e-hygiene.ps1')
+$app = Find-PeelApp $Root
+if (-not $app) { throw "build the shell first (dotnet build -c Release): no Peel.exe under shell\Peel\bin\Release\net8.0-windows*" }
 
 if ($Test -eq 'drag') {
     $script = Join-Path $Root 'shell\tests\e2e-drag.ps1'

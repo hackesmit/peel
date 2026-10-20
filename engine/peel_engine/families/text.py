@@ -14,6 +14,8 @@ exactly the handover signal it was put there to give.
 
 from __future__ import annotations
 
+import os
+
 from ..registry import ACTION, ANY, Job, Registry
 from ..result import Result, ok
 
@@ -31,13 +33,26 @@ def register(registry: Registry) -> None:
     )
 
 
+def quote_path(path) -> str:
+    """One absolute path in double quotes, as Copy Path puts it on the clipboard."""
+    return '"' + os.path.abspath(os.fspath(path)) + '"'
+
+
 def copy_path(job: Job) -> Result:
-    """Put the full paths on the clipboard, one per line.
+    """Put the full paths on the clipboard, each quoted, one per line.
+
+    Each path is wrapped in double quotes so a path with spaces pastes as one
+    argument into a shell or a Run box, and the lines are joined with CRLF, the
+    Windows clipboard text convention (Notepad and cmd paste it as separate
+    lines). The path is made absolute but not resolved, so a mapped or subst
+    drive stays the drive the user dragged from instead of becoming the UNC or
+    real path. Windows forbids a double quote in a file name, so the quotes
+    never need escaping.
 
     Clipboard access belongs to the shell, so the engine returns the text and
     says so. The shell copies it and shows the toast.
     """
-    text = "\n".join(str(p.resolve()) for p in job.inputs)
+    text = "\r\n".join(quote_path(p) for p in job.inputs)
     count = len(job.inputs)
     noun = "path" if count == 1 else "paths"
     return ok([], f"Copied {count} {noun}", clipboard_text=text)
