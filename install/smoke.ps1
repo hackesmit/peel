@@ -546,8 +546,8 @@ try {
     # pair, then compare the path inside it.
     $clipText = $clip.Trim()
     $quoted = $clipText.Length -ge 2 -and $clipText.StartsWith('"') -and $clipText.EndsWith('"')
-    $inner = if ($quoted) { $clipText.Substring(1, $clipText.Length - 2) } else { $clipText }
-    Check 'action: Copy Path via Ctrl (remapped) fills the clipboard, in quotes' ($quoted -and ($inner -ieq $source)) "$action; quoted=$quoted; clipboard=$clip"
+    $clipPath = if ($quoted) { $clipText.Substring(1, $clipText.Length - 2) } else { $clipText }
+    Check 'action: Copy Path via Ctrl (remapped) fills the clipboard, in quotes' ($quoted -and ($clipPath -ieq $source)) "$action; quoted=$quoted; clipboard=$clip"
 
     # 4. Soak: hotkey presses.
     Sample $smokePeel 'before presses'
