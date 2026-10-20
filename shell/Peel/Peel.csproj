@@ -14,7 +14,6 @@
     <Version>0.1.0</Version>
     <!-- The tray app is long lived and must not be the reason a drag feels slow. -->
     <TieredPGO>true</TieredPGO>
-    <InvariantGlobalization>true</InvariantGlobalization>
     <!-- WFAC010 tells WinForms apps to set the DPI mode in code. Peel is a WPF
          app that borrows WinForms only for the tray icon, and WPF reads its
          per monitor awareness from the manifest, so the manifest stays. -->

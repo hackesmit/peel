@@ -2,13 +2,14 @@
 //
 // RegisterHotKey needs a window with a message loop; the UI thread has one, so
 // a message-only HwndSource owned here receives WM_HOTKEY and raises Pressed on
-// the UI thread. The default chord is Ctrl+Alt+Enter with MOD_NOREPEAT, so
-// holding it fires once, not a stream. Remapping the chord is a later bead
-// (settings); the default lives here and PEEL_HOTKEY=off lets a test machine or
-// a user turn it off entirely.
+// the UI thread. The chord comes from the settings (default Ctrl+Alt+Enter),
+// always with MOD_NOREPEAT, so holding it fires once, not a stream. A saved
+// chord is applied with Rebind; PEEL_HOTKEY=off lets a test machine or a user
+// turn it off entirely.
 using System;
 using System.Windows.Interop;
 using Peel.Hooks;
+using Peel.Settings;
 
 namespace Peel.Keyboard;
 
@@ -20,6 +21,7 @@ internal sealed class HotkeyListener : IDisposable
 
     private HwndSource? _source;
     private bool _registered;
+    private HotkeyChord _chord = HotkeyChord.Default;
 
     /// <summary>Raised on the UI thread when the chord is pressed.</summary>
     internal event Action? Pressed;
@@ -29,17 +31,21 @@ internal sealed class HotkeyListener : IDisposable
     /// <summary>PEEL_HOTKEY=off turned the hotkey off on purpose; nothing to tell the user.</summary>
     internal bool DisabledByEnvironment { get; private set; }
 
+    /// <summary>The chord registered, or asked for last.</summary>
+    internal HotkeyChord Chord => _chord;
+
     /// <summary>The message the tray shows when the chord could not be registered.</summary>
-    internal const string ConflictMessage =
-        "Peel could not use Ctrl+Alt+Enter because another app uses it. Drag files to open the wheel.";
+    internal string ConflictMessage =>
+        $"Peel could not use {_chord} because another app uses it. Drag files to open the wheel, or pick another shortcut in Settings.";
 
     /// <summary>
-    /// Register the default chord. Returns false (and logs) when it cannot,
-    /// most often because another app already owns Ctrl+Alt+Enter; Peel then
-    /// runs without the hotkey rather than failing to start.
+    /// Register a chord. Returns false (and logs) when it cannot, most often
+    /// because another app already owns it; Peel then runs without the
+    /// hotkey rather than failing to start.
     /// </summary>
-    internal bool Register()
+    internal bool Register(HotkeyChord chord)
     {
+        _chord = chord;
         if (string.Equals(Environment.GetEnvironmentVariable("PEEL_HOTKEY"), "off", StringComparison.OrdinalIgnoreCase))
         {
             Log.Write("PEEL_HOTKEY=off, the keyboard hotkey is disabled");
@@ -56,17 +62,16 @@ internal sealed class HotkeyListener : IDisposable
             _source = new HwndSource(parameters);
             _source.AddHook(WndProc);
 
-            var modifiers = KeyboardNative.MOD_CONTROL | KeyboardNative.MOD_ALT | KeyboardNative.MOD_NOREPEAT;
-            _registered = KeyboardNative.RegisterHotKey(_source.Handle, HotkeyId, modifiers, KeyboardNative.VK_RETURN);
+            _registered = KeyboardNative.RegisterHotKey(_source.Handle, HotkeyId, chord.ModifierFlags, chord.Vk);
             if (!_registered)
             {
-                Log.Write("could not register the Ctrl+Alt+Enter hotkey (another app may own it); Peel runs without it");
+                Log.Write($"could not register the {chord} hotkey (another app may own it); Peel runs without it");
                 _source.RemoveHook(WndProc);
                 _source.Dispose();
                 _source = null;
                 return false;
             }
-            Log.Write("keyboard hotkey registered: Ctrl+Alt+Enter");
+            Log.Write($"keyboard hotkey registered: {chord}");
             return true;
         }
         catch (Exception error)
@@ -91,6 +96,46 @@ internal sealed class HotkeyListener : IDisposable
             }
         }
         return IntPtr.Zero;
+    }
+
+    /// <summary>
+    /// Swap to a new chord: the old one is released first, so a failed
+    /// registration leaves no hotkey rather than the stale one.
+    /// </summary>
+    internal bool Rebind(HotkeyChord chord)
+    {
+        if (DisabledByEnvironment)
+        {
+            return false;
+        }
+        Dispose();
+        return Register(chord);
+    }
+
+    /// <summary>
+    /// Let the chord through while the settings window records a new one,
+    /// then take it back. Without this, pressing the current chord there
+    /// would open the wheel instead of being recorded.
+    /// </summary>
+    internal void Pause(bool paused)
+    {
+        if (DisabledByEnvironment || _source is null)
+        {
+            return;
+        }
+        if (paused && _registered)
+        {
+            KeyboardNative.UnregisterHotKey(_source.Handle, HotkeyId);
+            _registered = false;
+        }
+        else if (!paused && !_registered)
+        {
+            _registered = KeyboardNative.RegisterHotKey(_source.Handle, HotkeyId, _chord.ModifierFlags, _chord.Vk);
+            if (!_registered)
+            {
+                Log.Write($"could not take the {_chord} hotkey back after the settings window");
+            }
+        }
     }
 
     public void Dispose()

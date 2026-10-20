@@ -18,12 +18,12 @@ internal sealed class Tray : IDisposable
     private readonly JobRunner _jobs;
     private readonly Func<string> _status;
 
-    internal Tray(JobRunner jobs, Func<string> status, Action quit)
+    internal Tray(JobRunner jobs, Func<string> status, Action quit, Action settings)
     {
         _jobs = jobs;
         _status = status;
         var menu = new Forms.ContextMenuStrip();
-        menu.Opening += (_, _) => Build(menu, quit);
+        menu.Opening += (_, _) => Build(menu, quit, settings);
         _icon = new Forms.NotifyIcon
         {
             Icon = LoadIcon(),
@@ -44,7 +44,7 @@ internal sealed class Tray : IDisposable
     internal void Notify(string title, string message) =>
         Log.Write($"tray balloon: {title}: {message}");
 
-    private void Build(Forms.ContextMenuStrip menu, Action quit)
+    private void Build(Forms.ContextMenuStrip menu, Action quit, Action settings)
     {
         menu.Items.Clear();
         var header = new Forms.ToolStripMenuItem($"Peel {Version()}") { Enabled = false };
@@ -71,6 +71,10 @@ internal sealed class Tray : IDisposable
             }
         }
         menu.Items.Add(recent);
+
+        var preferences = new Forms.ToolStripMenuItem("Settings...");
+        preferences.Click += (_, _) => settings();
+        menu.Items.Add(preferences);
 
         var log = new Forms.ToolStripMenuItem("Open log");
         log.Click += (_, _) => OpenLog();

@@ -14,6 +14,7 @@ using Peel.Engine;
 using Peel.Hooks;
 using Peel.Jobs;
 using Peel.Keyboard;
+using Peel.Settings;
 using Peel.Wheel;
 
 namespace Peel;
@@ -33,6 +34,8 @@ public partial class App : Application
     private EngineClient? _engine;
     private DispatcherTimer? _hookReport;
     private JobRunner? _jobs;
+    private SettingsSignal? _settingsSignal;
+    private SettingsWindow? _settingsWindow;
     private readonly HookLiveness _liveness = new();
     private Native.POINT? _lastCursor;
     private double _reportedWorst;
@@ -46,10 +49,12 @@ public partial class App : Application
         _single = new Mutex(true, @"Local\PeelTrayApp", out var mine);
         if (!mine)
         {
-            Log.Write("another Peel is already running in this session, exiting");
+            var asked = SettingsSignal.Ask();
+            Log.Write($"another Peel is already running in this session, {(asked ? "asked it to show its settings" : "could not reach it")}, exiting");
             Shutdown();
             return;
         }
+        SettingsStore.Load();
 
         DispatcherUnhandledException += (_, args) =>
         {
@@ -102,17 +107,22 @@ public partial class App : Application
         _keyboardWheel = new KeyboardWheelWindow();
         _keyboard = new KeyboardController(_engine, _keyboardWheel, jobs, editors, Dispatcher);
         _hotkey = new HotkeyListener();
-        if (_hotkey.Register())
-        {
-            _keyboard.Attach(_hotkey);
-        }
-        else if (!_hotkey.DisabledByEnvironment)
+        _keyboard.Attach(_hotkey);
+        var chord = HotkeyChord.Parse(SettingsStore.Current.Hotkey) ?? HotkeyChord.Default;
+        if (!_hotkey.Register(chord) && !_hotkey.DisabledByEnvironment)
         {
             Log.Write("hotkey conflict toast shown");
-            jobs.Report(HotkeyListener.ConflictMessage);
+            jobs.Report(_hotkey.ConflictMessage);
         }
+        SettingsStore.Changed += (before, after) =>
+            Dispatcher.BeginInvoke(() => ApplySettings(before, after));
 
-        _tray = new Tray(jobs, Status, Quit);
+        _tray = new Tray(jobs, Status, Quit, ShowSettings);
+        _settingsSignal = SettingsSignal.Listen(() => Dispatcher.BeginInvoke(ShowSettings));
+        if (Array.Exists(e.Args, arg => string.Equals(arg, "--settings", StringComparison.OrdinalIgnoreCase)))
+        {
+            Dispatcher.BeginInvoke(ShowSettings, DispatcherPriority.ApplicationIdle);
+        }
 
         if (!_hooks.Installed)
         {
@@ -136,6 +146,44 @@ public partial class App : Application
         _hookReport.Start();
 
         ExitAfterIfAsked();
+    }
+
+    /// <summary>
+    /// Open the settings window, or bring it forward if it is open. Its wheel
+    /// rows come from the registry: one per modifier the engine binds.
+    /// </summary>
+    private void ShowSettings()
+    {
+        if (_settingsWindow is { } open)
+        {
+            open.Activate();
+            return;
+        }
+        var registry = _controller?.Registry;
+        var rows = new System.Collections.Generic.List<WheelRow>();
+        foreach (var key in PeelSettings.ModifierKeys)
+        {
+            var family = registry?.FamilyForModifier(key);
+            rows.Add(new WheelRow(key, family is null ? key : registry!.LabelFor(family)));
+        }
+        var window = new SettingsWindow(rows, paused => _hotkey?.Pause(paused));
+        window.Closed += (_, _) => _settingsWindow = null;
+        _settingsWindow = window;
+        window.Show();
+        window.Activate();
+    }
+
+    private void ApplySettings(PeelSettings before, PeelSettings after)
+    {
+        if (_hotkey is null || _jobs is null || before.Hotkey == after.Hotkey)
+        {
+            return;
+        }
+        var chord = HotkeyChord.Parse(after.Hotkey) ?? HotkeyChord.Default;
+        if (!_hotkey.Rebind(chord) && !_hotkey.DisabledByEnvironment)
+        {
+            _jobs.Report(_hotkey.ConflictMessage);
+        }
     }
 
     private string Status()
@@ -235,6 +283,8 @@ public partial class App : Application
         _engine?.KillAll();
         ReportHooks();
         _hookReport?.Stop();
+        _settingsSignal?.Dispose();
+        _settingsWindow?.Close();
         _hotkey?.Dispose();
         _watcher?.Dispose();
         _hooks?.Dispose();

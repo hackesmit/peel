@@ -61,7 +61,12 @@ internal sealed class JobRunner
         var count = files.Count;
         var subject = count == 1 ? System.IO.Path.GetFileName(files[0]) : $"{count} files";
         var toast = _toasts.Show(entry.Label, $"Working on {subject}", ToastKind.Running);
-        Log.Write($"job start {entry.Id} on {count} file(s)");
+        // Read the settings once per job, at the moment it starts: a save
+        // while it runs applies to the next one.
+        var settings = Peel.Settings.SettingsStore.Current;
+        parameters = Peel.Settings.QualityPresets.Apply(entry, parameters, settings.Quality);
+        var outDir = settings.OutputDirectory();
+        Log.Write($"job start {entry.Id} on {count} file(s){(outDir is null ? string.Empty : $", out dir {outDir}")}");
 
         _ = Task.Run(async () =>
         {
@@ -71,7 +76,7 @@ internal sealed class JobRunner
             {
                 await _slots.WaitAsync(_quit.Token).ConfigureAwait(false);
                 holding = true;
-                result = await _engine.RunAsync(entry.Id, files, parameters, _quit.Token).ConfigureAwait(false);
+                result = await _engine.RunAsync(entry.Id, files, parameters, _quit.Token, outDir).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (_quit.IsCancellationRequested)
             {
