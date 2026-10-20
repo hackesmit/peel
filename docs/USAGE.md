@@ -76,6 +76,7 @@ Changes apply at once, no restart. They are saved in
 | Start at sign in | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, value `Peel` |
 
 Nothing needs administrator rights. To upgrade, the HQ runs
-`install\publish.ps1` again: it stops Peel, replaces the app and starts it
-again. To remove Peel, quit it, turn off **Start up** in Settings, and delete
+`install\publish.ps1` again: it stops Peel, replaces the engine and the app
+and starts it again; if the upgrade fails it starts the build it had. The
+start at sign in entry always names the installed app, never a test build. To remove Peel, quit it, turn off **Start up** in Settings, and delete
 the `%LOCALAPPDATA%\Peel` folder.

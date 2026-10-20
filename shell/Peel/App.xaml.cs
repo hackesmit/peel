@@ -182,7 +182,7 @@ public partial class App : Application
         var chord = HotkeyChord.Parse(after.Hotkey) ?? HotkeyChord.Default;
         if (!_hotkey.Rebind(chord) && !_hotkey.DisabledByEnvironment)
         {
-            _jobs.Report(_hotkey.ConflictMessage);
+            _jobs.Report(HotkeyListener.ConflictFor(chord));
         }
     }
 

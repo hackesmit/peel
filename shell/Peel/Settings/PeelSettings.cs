@@ -164,8 +164,9 @@ internal sealed record PeelSettings
 
 /// <summary>
 /// The quality presets. Each fills in a parameter by name, and only for an
-/// entry whose registry params declare that name, so a preset can never send
-/// an engine action a parameter it does not know.
+/// entry whose registry params declare that name with a type, range or
+/// choice list that accepts the value, so a preset can never send an engine
+/// action a parameter it does not know or a value it would refuse.
 /// </summary>
 internal static class QualityPresets
 {
@@ -182,18 +183,21 @@ internal static class QualityPresets
         _ => "Balanced",
     };
 
-    // Image quality (1 to 100) and audio bitrate (kbps). Balanced is the
-    // engine's own default for both, so it changes nothing.
-    private static readonly Dictionary<string, Dictionary<string, string>> Values = new()
+    // Per parameter name, the candidate values in order: the first one the
+    // entry's own spec accepts is sent. Image quality is an int from 1 to 100,
+    // video quality a choice of low, medium, high, audio bitrate an int in
+    // kbps. Balanced is the engine's own default for each, so it changes nothing.
+    private static readonly Dictionary<string, Dictionary<string, string[]>> Values = new()
     {
-        [Smaller] = new() { ["quality"] = "60", ["bitrate"] = "96" },
-        [Balanced] = new() { ["quality"] = "80", ["bitrate"] = "128" },
-        [Better] = new() { ["quality"] = "92", ["bitrate"] = "192" },
+        [Smaller] = new() { ["quality"] = new[] { "60", "low" }, ["bitrate"] = new[] { "96" } },
+        [Balanced] = new() { ["quality"] = new[] { "80", "medium" }, ["bitrate"] = new[] { "128" } },
+        [Better] = new() { ["quality"] = new[] { "92", "high" }, ["bitrate"] = new[] { "192" } },
     };
 
     /// <summary>
     /// The parameters to run with: what the caller chose, plus the preset's
-    /// value for each parameter the entry declares and the caller left unset.
+    /// value for each parameter the entry declares, the caller left unset, and
+    /// the spec accepts.
     /// </summary>
     internal static IReadOnlyDictionary<string, string> Apply(
         ActionEntry entry, IReadOnlyDictionary<string, string> chosen, string preset)
@@ -205,12 +209,40 @@ internal static class QualityPresets
         Dictionary<string, string>? merged = null;
         foreach (var spec in entry.Params)
         {
-            if (values.TryGetValue(spec.Name, out var value) && !chosen.ContainsKey(spec.Name))
+            if (chosen.ContainsKey(spec.Name) || !values.TryGetValue(spec.Name, out var candidates))
+            {
+                continue;
+            }
+            var value = candidates.FirstOrDefault(candidate => Accepts(spec, candidate));
+            if (value is not null)
             {
                 merged ??= new Dictionary<string, string>(chosen);
                 merged[spec.Name] = value;
             }
         }
         return merged ?? chosen;
+    }
+
+    /// <summary>
+    /// True when the engine would take <paramref name="value"/> for this
+    /// param: one of its choices when it lists any, else a whole number in
+    /// range for an int. Any other type is left to the engine's default.
+    /// </summary>
+    internal static bool Accepts(ParamSpec spec, string value)
+    {
+        if (spec.Choices.Count > 0)
+        {
+            return spec.Choices.Any(choice => choice.ValueKind == System.Text.Json.JsonValueKind.String
+                ? choice.GetString() == value
+                : choice.GetRawText() == value);
+        }
+        if (spec.Type != "int"
+            || !long.TryParse(value, System.Globalization.NumberStyles.AllowLeadingSign,
+                System.Globalization.CultureInfo.InvariantCulture, out var number))
+        {
+            return false;
+        }
+        return (spec.Minimum is not { } min || number >= min)
+            && (spec.Maximum is not { } max || number <= max);
     }
 }
