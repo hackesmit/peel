@@ -1434,6 +1434,7 @@ TAG_ARTIST = 0x013B
 TAG_XP_TITLE = 0x9C9B
 TAG_XP_AUTHOR = 0x9C9D
 TAG_GPS_IFD = 0x8825
+TAG_XMP = 700
 
 
 def metadata(job: Job) -> Result:
@@ -1475,6 +1476,8 @@ def metadata(job: Job) -> Result:
                 **extra,
             )
         exif = _edited_exif(img, job.params)
+        if job.params.get("clear_location"):
+            _drop_xmp_location(img)
         target = job.output_path()
         save(
             img,
@@ -1484,6 +1487,11 @@ def metadata(job: Job) -> Result:
             exif=exif,
             icc_profile=img.info.get("icc_profile"),
         )
+        if job.params.get("clear_location") and _location_left(target):
+            target.unlink(missing_ok=True)
+            raise RunnerFailed(
+                f"the location could not be removed from {source.name}; nothing was written"
+            )
         message = f"Wrote the new metadata into {target.name}"
         return ok([target], f"{message}.{note}" if note else message, **extra)
     finally:
@@ -1509,6 +1517,14 @@ def _edited_exif(img, params: dict[str, Any]):
     exif = img.getexif()
     if clear_location and TAG_GPS_IFD in exif:
         del exif[TAG_GPS_IFD]
+    if clear_location and TAG_XMP in exif:
+        # A TIFF keeps its XMP packet in IFD0, so getexif() hands it back and
+        # it would be written out again with exif:GPSLatitude still inside.
+        packet = _xmp_without_location(exif[TAG_XMP])
+        if packet is None:
+            del exif[TAG_XMP]
+        else:
+            exif[TAG_XMP] = packet
     if title:
         exif[TAG_DESCRIPTION] = title
         exif[TAG_XP_TITLE] = title.encode("utf-16-le") + b"\x00\x00"
@@ -1525,6 +1541,74 @@ def _edited_exif(img, params: dict[str, Any]):
         return exif_bytes(exif)
     except Exception as exc:
         raise RunnerFailed(f"that metadata cannot be written: {exc}") from None
+
+
+# Any XMP property named GPS<something> (exif:GPSLatitude, exifEX:GPS...), as
+# an attribute or as an element with or without content.
+_XMP_GPS_ATTRIBUTE = rb"""\s[\w.-]+:GPS[\w.-]*\s*=\s*(?:"[^"]*"|'[^']*')"""
+_XMP_GPS_ELEMENT = (
+    rb"<([\w.-]+:GPS[\w.-]*)\b[^>]*/>"
+    rb"|<([\w.-]+:GPS[\w.-]*)\b[^>]*>.*?</\2\s*>"
+)
+
+
+def _xmp_without_location(value: Any) -> bytes | None:
+    """The XMP packet with every GPS property taken out, None to drop it whole.
+
+    Scrubbing keeps the rest of the packet (an XMP orientation, a rating); when
+    the packet is not bytes or a GPS mention survives the scrub, dropping it is
+    the only answer that cannot leave the place behind.
+    """
+    import re
+
+    if isinstance(value, str):
+        value = value.encode("utf-8")
+    if not isinstance(value, bytes):
+        return None
+    packet = re.sub(_XMP_GPS_ELEMENT, b"", value, flags=re.DOTALL)
+    packet = re.sub(_XMP_GPS_ATTRIBUTE, b"", packet)
+    return None if b"GPS" in packet else packet
+
+
+def _drop_xmp_location(img) -> None:
+    """Scrub the XMP copies pillow would write back on its own.
+
+    Pillow's TIFF writer copies tag 700 from the source's own directory
+    (``tag_v2``, which the legacy ``tag`` view shares) and other writers fall
+    back to ``info["xmp"]``, whatever EXIF blob ``save`` is handed.
+    """
+    if "xmp" in img.info:
+        packet = _xmp_without_location(img.info["xmp"])
+        if packet is None:
+            del img.info["xmp"]
+        else:
+            img.info["xmp"] = packet
+    for directory in (getattr(img, "tag_v2", None), getattr(img, "tag", None)):
+        if directory is None or TAG_XMP not in directory:
+            continue
+        value = directory[TAG_XMP]
+        if isinstance(value, tuple) and len(value) == 1:
+            value = value[0]
+        packet = _xmp_without_location(value)
+        if packet is None:
+            del directory[TAG_XMP]
+        else:
+            directory[TAG_XMP] = packet
+
+
+def _location_left(target: Path) -> bool:
+    """True when the written file still says where it was taken, anywhere."""
+    Image = pillow()
+    with Image.open(target) as out:
+        exif = out.getexif()
+        if dict(exif.get_ifd(TAG_GPS_IFD)):
+            return True
+        for packet in (exif.get(TAG_XMP), out.info.get("xmp"), out.info.get("XML:com.adobe.xmp")):
+            if isinstance(packet, str):
+                packet = packet.encode("utf-8")
+            if isinstance(packet, bytes) and b"GPS" in packet:
+                return True
+    return False
 
 
 def _dms(value: float) -> tuple[float, float, float]:
