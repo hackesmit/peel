@@ -58,9 +58,22 @@ the shell-install bead, not this script.
 
 Once `publish.ps1` has run, `app` and `venv` are junctions to
 `%LOCALAPPDATA%\Peel\versions\<stamp>\app` and `...\venv`, the pair in
-use. Re-running `setup.ps1` then writes into that pair's venv, so to fix
-missing backends run `setup.ps1` and then `publish.ps1`, which builds a fresh
-pair. Do not use `-RecreateVenv` on a junction; run `publish.ps1` instead.
+use, and `publish.ps1` owns that venv. Re-running `setup.ps1` then leaves it
+exactly as it is: no pip upgrade, no editable engine, no module installs. It
+still installs the winget backends, writes the shim and runs `peel doctor`.
+`-RecreateVenv` on a junction refuses (exit 1); run `publish.ps1` instead,
+which builds a fresh pair. A Python module backend missing from the published
+venv is not fixed by `setup.ps1` (publish copies the modules of the current
+venv) until hq-plct.28 makes publish install the pinned module list.
+
+`test-setup.ps1` checks this against a scratch root (`-InstallRoot`) whose
+venv is a junction to a stand in venv: a plain `-SkipWinget` run and a
+`-RecreateVenv` run leave every file in the target as it was, and the user
+PATH is never touched:
+
+```
+ssh george "powershell -NoProfile -ExecutionPolicy Bypass -File C:\peel-dev\<branch>\install\test-setup.ps1"
+```
 
 ## publish.ps1 and its tests
 
