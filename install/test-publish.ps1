@@ -22,7 +22,9 @@
   failed first install must leave no Run value of ours, a rollback killed
   before Peel starts again must leave the restart to the next run, and a
   rollback that cannot put a read only settings.json back must keep the
-  journal and settings.before, exit 7 and leave Peel stopped. With
+  journal and settings.before, exit 7 and leave Peel stopped, with no
+  start with Windows entry until a run can put settings.json back
+  (hq-plct.29). With
   -RealEngine (hq-plct.28) it also runs publish.ps1's real pip build once,
   with -NoStart, from a scratch venv that lacks openpyxl: the new venv must
   have every module in modules.txt and a green peel doctor. That one needs
@@ -407,10 +409,25 @@ try {
     Check 'a settings file that cannot be put back keeps settings.before' ((Test-Path $snapshot) -and (Get-Bytes $snapshot) -eq $settingsBytes)
     Check 'a settings file that cannot be put back keeps the candidate in the journal' ($null -ne (Get-Journal).candidate) (ConvertTo-Json -Compress (Get-Journal))
     Check 'a settings file that cannot be put back leaves Peel stopped' ((Get-Running).Count -eq 0) "($((Get-Running).Count) running)"
+    # Log on must not start Peel on the candidate's settings (hq-plct.29).
+    $value = Get-RunValue
+    Check 'a settings file that cannot be put back drops the start with Windows entry' ($null -eq $value) $value
+    Check 'a settings file that cannot be put back records the dropped entry' ([bool](Get-Journal).run) (ConvertTo-Json -Compress (Get-Journal))
+    # A second run that still cannot write it keeps that record, with no entry of ours left to see.
+    $settingsItem.IsReadOnly = $true
+    $code = Publish 'good1' 'fail'
+    $settingsItem.IsReadOnly = $false
+    Check 'a second run with settings still read only exits 7' ($code -eq 7) "(exit $code)"
+    $value = Get-RunValue
+    Check 'a second run with settings still read only registers no entry' ($null -eq $value) $value
+    Check 'a second run with settings still read only keeps the dropped entry record' ([bool](Get-Journal).run) (ConvertTo-Json -Compress (Get-Journal))
     $code = Publish 'good1' 'fail'
     Check 'once settings is writable, a failed engine build exits non zero' ($code -ne 0 -and $code -ne 7) "(exit $code)"
     Check 'once settings is writable, the old settings bytes are back' ((Get-Bytes $settings) -eq $settingsBytes) ([IO.File]::ReadAllText($settings))
     Check 'once settings is writable, good2 runs on engine e13' ((Get-RunningBuild) -eq 'good2' -and (Get-Engine) -eq 'e13') "$(Get-RunningBuild) $(Get-Engine)"
+    $value = Get-RunValue
+    Check 'once settings is writable, the start with Windows entry names the app in the root again' ($value -eq ('"{0}"' -f (Join-Path $app 'Peel.exe'))) $value
+    Check 'once settings is writable, the dropped entry record is gone' (-not (Get-Journal).run) (ConvertTo-Json -Compress (Get-Journal))
     Check-Clean 'once settings is writable'
 
     # 11 two runs at once: the second one must not touch the install
