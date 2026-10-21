@@ -41,12 +41,19 @@ internal sealed class TimelinePlan
     internal const double MinSpan = 0.05;
 
     private readonly List<double> _cuts = new();
+
+    // The same cuts in the order they were made, so Undo takes back the last
+    // one made rather than the latest in time.
+    private readonly List<double> _made = new();
     private readonly List<(double From, double To)> _ranges = new();
 
-    internal TimelinePlan(TimelineKind kind, double duration)
+    /// <param name="duration">Where the bar ends: the file, or for Split and Range the end of the picture (MediaInfo.LengthFor).</param>
+    /// <param name="first">Split only: where the picture starts. A cut at or before it would leave part 1 with no picture.</param>
+    internal TimelinePlan(TimelineKind kind, double duration, double first = 0)
     {
         Kind = kind;
         Duration = double.IsFinite(duration) && duration > 0 ? duration : 0;
+        First = double.IsFinite(first) ? Math.Clamp(first, 0, Duration) : 0;
         Start = 0;
         End = Duration;
     }
@@ -54,6 +61,8 @@ internal sealed class TimelinePlan
     internal TimelineKind Kind { get; }
 
     internal double Duration { get; }
+
+    internal double First { get; }
 
     /// <summary>Trim: the first moment kept. Range: where it begins.</summary>
     internal double Start { get; private set; }
@@ -119,24 +128,25 @@ internal sealed class TimelinePlan
     internal bool AddCut(double seconds)
     {
         var at = Finite(seconds);
-        if (at < MinSpan || at > Duration - MinSpan)
-        {
-            return false;
-        }
-        if (_cuts.Any(cut => Math.Abs(cut - at) < MinSpan))
+        if (!Fits(at))
         {
             return false;
         }
         _cuts.Add(at);
         _cuts.Sort();
+        _made.Add(at);
         Every = null;
         return true;
     }
+
+    private bool Fits(double at) =>
+        at >= First + MinSpan && at <= Duration - MinSpan && !_cuts.Any(cut => Math.Abs(cut - at) < MinSpan);
 
     internal void RemoveCut(int index)
     {
         if (index >= 0 && index < _cuts.Count)
         {
+            _made.RemoveAt(_made.LastIndexOf(_cuts[index]));
             _cuts.RemoveAt(index);
         }
     }
@@ -149,9 +159,14 @@ internal sealed class TimelinePlan
             return false;
         }
         var was = _cuts[index];
+        var at = Finite(seconds);
         _cuts.RemoveAt(index);
-        if (AddCut(seconds))
+        if (Fits(at))
         {
+            // A moved cut keeps its place in the order the cuts were made.
+            _made[_made.LastIndexOf(was)] = at;
+            _cuts.Add(at);
+            _cuts.Sort();
             return true;
         }
         _cuts.Add(was);
@@ -183,12 +198,13 @@ internal sealed class TimelinePlan
             Every = null;
             return true;
         }
-        if (!double.IsFinite(seconds.Value) || seconds.Value < 0.1 || seconds.Value >= Duration)
+        if (!double.IsFinite(seconds.Value) || seconds.Value < 0.1 || seconds.Value >= Duration - First)
         {
             return false;
         }
         Every = seconds;
         _cuts.Clear();
+        _made.Clear();
         return true;
     }
 
@@ -213,8 +229,9 @@ internal sealed class TimelinePlan
             case TimelineKind.Bleep when _ranges.Count > 0:
                 _ranges.RemoveAt(_ranges.Count - 1);
                 break;
-            case TimelineKind.Split when _cuts.Count > 0:
-                _cuts.RemoveAt(_cuts.Count - 1);
+            case TimelineKind.Split when _made.Count > 0:
+                _cuts.Remove(_made[^1]);
+                _made.RemoveAt(_made.Count - 1);
                 break;
         }
     }
@@ -222,6 +239,7 @@ internal sealed class TimelinePlan
     internal void Clear()
     {
         _cuts.Clear();
+        _made.Clear();
         _ranges.Clear();
         Every = null;
         Start = 0;
@@ -247,23 +265,88 @@ internal sealed class TimelinePlan
             }
             parsed.Add(at);
         }
+        if (Every is null && parsed.Count == _cuts.Count
+            && parsed.OrderBy(at => at).Zip(_cuts).All(pair => Math.Abs(pair.First - pair.Second) < 0.0005))
+        {
+            // The same cuts written back to the millisecond (the window
+            // rereads every field): keep them, and the order they were made in.
+            problem = string.Empty;
+            return true;
+        }
         var before = _cuts.ToList();
+        var made = _made.ToList();
         var every = Every;
         _cuts.Clear();
+        _made.Clear();
         foreach (var at in parsed)
         {
             if (!AddCut(at))
             {
                 _cuts.Clear();
                 _cuts.AddRange(before);
+                _made.Clear();
+                _made.AddRange(made);
                 Every = every;
                 problem = $"A cut at {Timecode.Format(at)} would leave a part shorter than {MinSpan:0.##} s "
-                    + $"or fall outside the file ({Timecode.Format(Duration)}).";
+                    + $"or fall outside the picture ({Timecode.Format(First)} to {Timecode.Format(Duration)}).";
                 return false;
             }
         }
         problem = string.Empty;
         return true;
+    }
+
+    /// <summary>
+    /// Where the bar draws the cuts: one line per whole pixel column at most,
+    /// so a list of thousands of cuts is still a bar of a few hundred lines.
+    /// </summary>
+    internal IReadOnlyList<double> CutMarks(TimeAxis axis)
+    {
+        var marks = new List<double>();
+        var column = double.NegativeInfinity;
+        foreach (var cut in _cuts)
+        {
+            var x = axis.ToX(cut);
+            if (Math.Floor(x) > column)
+            {
+                marks.Add(x);
+                column = Math.Floor(x);
+            }
+        }
+        return marks;
+    }
+
+    /// <summary>
+    /// Where the bar draws an interval's cuts, at most one per whole pixel
+    /// column. Every 0.1 s over a day is 864,000 cuts; the walk jumps to the
+    /// first cut in the next column instead of visiting each one, so it costs
+    /// the width of the bar, not the length of the file. The cuts are where
+    /// the engine puts them: from the first frame, every so often, stopping
+    /// short of the end.
+    /// </summary>
+    internal IReadOnlyList<double> EveryMarks(TimeAxis axis)
+    {
+        var marks = new List<double>();
+        if (Every is not { } every || Duration <= 0)
+        {
+            return marks;
+        }
+        var stop = Duration - MinSpan;
+        var step = 1L;
+        while (true)
+        {
+            var at = First + every * step;
+            if (at >= stop)
+            {
+                break;
+            }
+            var x = axis.ToX(at);
+            marks.Add(x);
+            // The first cut whose column is past this one.
+            var next = (Math.Floor(x) + 1) / axis.Width * axis.Duration;
+            step = Math.Max(step + 1, (long)Math.Ceiling((next - First) / every));
+        }
+        return marks;
     }
 
     /// <summary>Replace the ranges with a typed list ("0:03-0:05, 1:10-1:12").</summary>
@@ -384,7 +467,7 @@ internal sealed class TimelinePlan
             case TimelineKind.Split:
                 if (Every is { } every)
                 {
-                    var parts = (int)Math.Ceiling(Duration / every - 1e-9);
+                    var parts = (int)Math.Ceiling((Duration - First) / every - 1e-9);
                     return string.Format(CultureInfo.InvariantCulture, "Cutting every {0:0.###} s, about {1} parts",
                         every, Math.Max(1, parts));
                 }

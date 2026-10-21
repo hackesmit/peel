@@ -871,11 +871,20 @@ def _between(ranges: Sequence[tuple[float, float]]) -> str:
     return "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in ranges)
 
 
-def _crop_filter(params: dict[str, Any], width: int, height: int) -> tuple[str, int, int, int, int]:
-    """Validate a rectangle against the frame and return the crop filter."""
+def _crop_filter(
+    params: dict[str, Any], width: int, height: int, *, even: bool = True
+) -> tuple[str, int, int, int, int]:
+    """Validate a rectangle against the frame and return the crop filter.
+
+    A crop is an output frame, so its size is floored to even for the encoder.
+    A redaction passes ``even=False``: the box is only blurred and laid back
+    over the frame, so it keeps the exact size the user covered (flooring it
+    would leave the last covered column or row in the clear)."""
     x, y = int(params["x"]), int(params["y"])
-    w, h = _even(int(params["w"])), _even(int(params["h"]))
-    if w <= 0 or h <= 0:
+    w, h = int(params["w"]), int(params["h"])
+    if even:
+        w, h = _even(w), _even(h)
+    if w < 2 or h < 2:
         raise InvalidParams("the region must be at least 2 pixels wide and tall")
     if x + w > width or y + h > height:
         raise InvalidParams(
@@ -1107,6 +1116,18 @@ def _cut_points(
             position += step
     else:
         raise InvalidParams("give timestamps to cut at, or an interval in seconds")
+    if at:
+        # Typed cuts are the user's; one the video cannot honour (before its
+        # first frame, or at or after its last) is refused by name rather than
+        # dropped, so the parts written are always the parts asked for.
+        outside = [c for c in cuts if not (first + 1e-6 < c < duration and c <= limit)]
+        if outside and len(outside) < len(cuts):
+            where = f"from {first:.2f}s to {duration:.2f}s" if first else (
+                f"up to {duration:.2f}s")
+            listed = ", ".join(f"{c:g}s" for c in outside)
+            raise InvalidParams(
+                f"a cut at {listed} falls outside the video, which runs {where}"
+            )
     inside = sorted(
         {round(c, 3) for c in cuts if first + 1e-6 < c < duration and c <= limit}
     )
@@ -1320,7 +1341,7 @@ def video_redact(job: Job) -> Result:
     """Blur a rectangle, over the whole clip or only inside a time range."""
     info = probe(job.source)
     width, height = _frame_size(info, job.source)
-    crop, x, y, w, h = _crop_filter(job.params, width, height)
+    crop, x, y, w, h = _crop_filter(job.params, width, height, even=False)
     duration = _duration(info)
     ext = job.action.ext_for(job.source) or ""
     has_audio = bool(_streams(info, "audio"))
@@ -1332,10 +1353,24 @@ def video_redact(job: Job) -> Result:
         window = f":enable='between(t,{start:.3f},{end:.3f})'"
 
     target = job.output_path()
-    graph = (
-        f"[0:v]{crop},boxblur={strength}:2[blur];"
-        f"[0:v][blur]overlay={x}:{y}{window},{_EVEN}[v]"
-    )
+    if w % 2 or h % 2 or x % 2 or y % 2:
+        # On a chroma subsampled frame (yuv420p) crop and overlay snap to the
+        # 2 pixel chroma grid (overlay also works in yuv420 unless told
+        # otherwise), so an odd box (an odd frame covered edge to edge, say)
+        # would blur one column or row short. Blur and overlay on a frame with
+        # no subsampling, then hand the encoder the source's own format back.
+        streams = _streams(info, "video")
+        back = streams[0].get("pix_fmt") if streams else None
+        graph = (
+            f"[0:v]format=yuv444p,split[base][box];[box]{crop},boxblur={strength}:2[blur];"
+            f"[base][blur]overlay={x}:{y}:format=yuv444{window},{_EVEN}"
+            f"{f',format={back}' if back else ''}[v]"
+        )
+    else:
+        graph = (
+            f"[0:v]{crop},boxblur={strength}:2[blur];"
+            f"[0:v][blur]overlay={x}:{y}{window},{_EVEN}[v]"
+        )
     args = ["-i", job.source, "-filter_complex", graph, "-map", "[v]"]
     if has_audio:
         args += ["-map", "0:a", "-c:a", "copy"]

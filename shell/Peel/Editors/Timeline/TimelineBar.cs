@@ -250,16 +250,13 @@ internal sealed class TimelineBar : Canvas
                 Handle(axis.ToX(_plan.End), accent);
                 break;
             case TimelineKind.Split:
-                foreach (var cut in _plan.Cuts)
+                foreach (var x in _plan.CutMarks(axis))
                 {
-                    Line(axis.ToX(cut), warn, 2);
+                    Line(x, warn, 2);
                 }
-                if (_plan.Every is { } every)
+                foreach (var x in _plan.EveryMarks(axis))
                 {
-                    for (var at = every; at < _plan.Duration - TimelinePlan.MinSpan; at += every)
-                    {
-                        Line(axis.ToX(at), warn, 1);
-                    }
+                    Line(x, warn, 1);
                 }
                 break;
             case TimelineKind.Bleep:

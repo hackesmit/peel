@@ -35,6 +35,26 @@ internal sealed class MediaInfo
 
     internal bool HasVideo { get; init; }
 
+    /// <summary>Where the picture starts on the file's timeline (av._video_start).</summary>
+    internal double VideoStart { get; init; }
+
+    /// <summary>
+    /// Where the picture ends on the file's timeline, as av._video_window
+    /// reads it: the video track's start plus its own length (or Matroska
+    /// DURATION tag), else the container's length. 0 when unknown or no video.
+    /// A file's audio can run on past it, and a cut or a blur after it has no
+    /// picture to act on.
+    /// </summary>
+    internal double VideoEnd { get; init; }
+
+    /// <summary>
+    /// The length the timeline bar spans for one tool. Split and a redaction
+    /// act on the picture, so their bar stops where the picture does; a trim
+    /// keeps audio too, so its bar is the whole file.
+    /// </summary>
+    internal double LengthFor(TimelineKind kind) =>
+        kind is TimelineKind.Split or TimelineKind.Range && HasVideo && VideoEnd > 0 ? VideoEnd : Duration;
+
     internal bool HasAudio { get; init; }
 
     /// <summary>Tag names lower cased, file tags first, then the audio stream's, first value wins.</summary>
@@ -57,11 +77,17 @@ internal sealed class MediaInfo
             var root = document.RootElement;
             var best = 0.0;
             var hasVideo = false;
+            var videoStart = 0.0;
+            var videoLength = 0.0;
+            var container = 0.0;
+            double? containerStart = null;
             var hasAudio = false;
             var tags = new Dictionary<string, string>(StringComparer.Ordinal);
             if (root.TryGetProperty("format", out var format) && format.ValueKind == JsonValueKind.Object)
             {
-                best = Math.Max(best, Seconds(format, "duration"));
+                container = Seconds(format, "duration");
+                containerStart = Signed(format, "start_time");
+                best = Math.Max(best, container);
                 AddTags(format, tags);
             }
             if (root.TryGetProperty("streams", out var streams) && streams.ValueKind == JsonValueKind.Array)
@@ -76,6 +102,18 @@ internal sealed class MediaInfo
                         && pic.ValueKind == JsonValueKind.Number && pic.GetInt32() == 1;
                     if (type == "video" && !attached)
                     {
+                        if (!hasVideo)
+                        {
+                            // On the file's timeline, as -ss counts it: from the container's start.
+                            videoStart = Signed(stream, "start_time") is { } at
+                                ? Math.Max(0, at - (containerStart ?? 0))
+                                : 0;
+                            videoLength = Seconds(stream, "duration");
+                            if (videoLength <= 0)
+                            {
+                                videoLength = DurationTag(stream);
+                            }
+                        }
                         hasVideo = true;
                     }
                     else if (type == "audio")
@@ -101,12 +139,59 @@ internal sealed class MediaInfo
                     }
                 }
             }
-            return new MediaInfo { Duration = best, HasVideo = hasVideo, HasAudio = hasAudio, Tags = tags };
+            var videoEnd = !hasVideo ? 0
+                : videoLength > 0 ? videoStart + videoLength
+                : container > videoStart ? container
+                : 0;
+            return new MediaInfo
+            {
+                Duration = best,
+                HasVideo = hasVideo,
+                HasAudio = hasAudio,
+                VideoStart = hasVideo ? videoStart : 0,
+                VideoEnd = videoEnd,
+                Tags = tags,
+            };
         }
         catch (JsonException)
         {
             return new MediaInfo();
         }
+    }
+
+    private static double DurationTag(JsonElement stream)
+    {
+        if (stream.TryGetProperty("tags", out var tags) && tags.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var tag in tags.EnumerateObject())
+            {
+                if (string.Equals(tag.Name, "DURATION", StringComparison.OrdinalIgnoreCase)
+                    && tag.Value.ValueKind == JsonValueKind.String
+                    && Timecode.TryParse(tag.Value.GetString(), out var tagged))
+                {
+                    return tagged;
+                }
+            }
+        }
+        return 0;
+    }
+
+    private static double? Signed(JsonElement owner, string name)
+    {
+        if (!owner.TryGetProperty(name, out var value))
+        {
+            return null;
+        }
+        var text = value.ValueKind switch
+        {
+            JsonValueKind.String => value.GetString(),
+            JsonValueKind.Number => value.GetRawText(),
+            _ => null,
+        };
+        return double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var seconds)
+            && double.IsFinite(seconds)
+            ? seconds
+            : null;
     }
 
     private static double Seconds(JsonElement owner, string name)
