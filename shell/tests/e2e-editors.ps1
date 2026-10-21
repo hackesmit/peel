@@ -49,7 +49,10 @@ param(
     # at the same one through PEEL_CLI, so the shell and the checks never
     # disagree about which engine they are talking about.
     [string]$Peel = "$env:LOCALAPPDATA\Peel\venv\Scripts\peel.exe",
-    [string]$Check = 'C:\peel-dev\peel-6f29\shell\tests\e2e-editors-check.py'
+    [string]$Check = 'C:\peel-dev\peel-6f29\shell\tests\e2e-editors-check.py',
+    # gui-guard.ps1: user idle to wait for before driving, and how long to wait.
+    [int]$IdleSeconds = 300,
+    [int]$IdleTimeout = 1800
 )
 $Python = Join-Path (Split-Path -Parent $Peel) 'python.exe'
 
@@ -59,6 +62,7 @@ $driveLog = Join-Path $Dir 'drive.log'
 $peelLog = Join-Path $Dir 'peel.log'
 $resultPath = Join-Path $Dir 'result.json'
 $checks = [System.Collections.ArrayList]::new()
+$script:GuiAbort = $null
 $shots = [System.Collections.ArrayList]::new()
 $script:cursor = @(0, 0)
 
@@ -86,6 +90,7 @@ function WaitLog($pattern, $timeoutMs, $atLeast = 1) {
     while ((Get-Date) -lt $deadline) {
         $found = [regex]::Matches((PeelLog), $pattern)
         if ($found.Count -ge $atLeast) { return $found[$found.Count - 1] }
+        Assert-NoUserInput
         Start-Sleep -Milliseconds 100
     }
     return $null
@@ -115,6 +120,8 @@ public static class InEd {
 }
 '@
 [void][InEd]::SetProcessDPIAware()
+# Idle wait, real input abort, and the teardown that ends any drag.
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
 
 $VkCtrl = [byte]0xA2
 $VkEsc = [byte]0x1B
@@ -122,6 +129,7 @@ $UIA = [System.Windows.Automation.AutomationElement]
 $Tree = [System.Windows.Automation.TreeScope]
 
 function MoveTo($x, $y) {
+    Assert-NoUserInput
     [InEd]::Move([int]$x, [int]$y)
     $script:cursor = @([int]$x, [int]$y)
 }
@@ -377,6 +385,9 @@ try {
     Check 'the engine offers the five image editors' ($offered.Count -eq 5) `
         "needs_editor tools for a PNG from $Peel : $($offered -join ',')"
     if ($offered.Count -ne 5) { throw "this engine has no image editors to test: $Peel" }
+
+    Start-GuiGuard -Dir $Dir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    $originalCursor = [System.Windows.Forms.Cursor]::Position
 
     $env:PEEL_LOG = $peelLog
     $env:PEEL_EXIT_AFTER = '900'
@@ -648,15 +659,17 @@ try {
         "$(CountLog ': editor open') editor windows opened"
 }
 catch {
-    Check 'driver completed' $false "$_"
+    $script:GuiAbort = Get-GuiAbort $_
+    if ($script:GuiAbort) { L "ABORTED: $_" } else { Check 'driver completed' $false "$_" }
 }
 finally {
+    # First: end any drag and let go of every button and key (gui-guard.ps1).
+    try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
     [System.Windows.Forms.Cursor]::Position = $originalCursor
-    try { [InEd]::Up() } catch { }
     if ($peelProcess) { Stop-Process -Id $peelProcess.Id -ErrorAction SilentlyContinue }
     CloseTestExplorer
     $failed = @($checks | Where-Object { -not $_.ok })
-    [pscustomobject]@{ ok = ($failed.Count -eq 0); checks = $checks; shots = $shots; log = $peelLog } |
+    [pscustomobject]@{ ok = ($failed.Count -eq 0 -and -not $script:GuiAbort); aborted = $script:GuiAbort; checks = $checks; shots = $shots; log = $peelLog } |
         ConvertTo-Json -Depth 4 | Set-Content $resultPath -Encoding UTF8
     L ("done, {0} of {1} checks passed" -f ($checks.Count - $failed.Count), $checks.Count)
     if ($failed.Count -gt 0) { exit 1 }
