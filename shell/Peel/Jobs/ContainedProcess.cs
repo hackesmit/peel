@@ -3,10 +3,13 @@
 // Process.Start cannot do this: the process is already running when it
 // returns, so anything the engine starts before AssignProcessToJobObject is
 // outside the job and survives Peel (lucy round 2). Here CreateProcessW starts
-// it with CREATE_SUSPENDED, the process is put in the job, and only then is
-// its first thread resumed. If the job cannot take it, the process is ended
-// while still suspended and the caller gets an error: nothing ever runs
-// outside a job (fail closed).
+// it with CREATE_SUSPENDED and PROC_THREAD_ATTRIBUTE_JOB_LIST, so it is born
+// in the job: a Peel crash at any point after creation closes the job handle
+// and Windows ends the suspended process (lucy, hq-plct.17; assigning it after
+// creation left a window where a crash orphaned it). Only then is its first
+// thread resumed. If Windows refuses the attribute (before Windows 10 1607) or
+// the process is somehow not in the job, it is ended while still suspended
+// and the caller gets an error: nothing ever runs outside a job (fail closed).
 //
 // Its standard handles are three anonymous pipes. Only those three handles are
 // inherited (PROC_THREAD_ATTRIBUTE_HANDLE_LIST), so an engine started at the
@@ -49,10 +52,10 @@ internal sealed class ContainedProcess : IDisposable
     internal Stream StandardError => _stderr;
 
     /// <summary>
-    /// Create the process suspended, put it in <paramref name="job"/>, run
-    /// <paramref name="beforeResume"/> (which may refuse by throwing), then
-    /// resume it. Throws Win32Exception or the refusal; in every failure the
-    /// process has been ended without running.
+    /// Create the process suspended inside <paramref name="job"/>, run
+    /// <paramref name="beforeResume"/> (which may refuse by throwing, as a
+    /// cancelled call does), then resume it. Throws Win32Exception or the
+    /// refusal; in every failure the process has been ended without running.
     /// </summary>
     internal static ContainedProcess Start(
         string fileName,
@@ -72,16 +75,25 @@ internal sealed class ContainedProcess : IDisposable
             stderr.ClientSafePipeHandle.DangerousGetHandle(),
         };
         var pinned = GCHandle.Alloc(handles, GCHandleType.Pinned);
+        // UpdateProcThreadAttribute keeps a pointer to the value, not a copy,
+        // so the job handle lives in pinned memory until the list is deleted.
+        var jobs = new[] { job.Handle };
+        var pinnedJobs = GCHandle.Alloc(jobs, GCHandleType.Pinned);
         var attributes = IntPtr.Zero;
         var environmentBlock = IntPtr.Zero;
         var info = default(Native.PROCESS_INFORMATION);
         var created = false;
         try
         {
+            if (jobs[0] == IntPtr.Zero)
+            {
+                throw new InvalidOperationException(
+                    "The job that ends the engine with Peel is already closed, so Peel did not run the engine.");
+            }
             var size = IntPtr.Zero;
-            Native.InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+            Native.InitializeProcThreadAttributeList(IntPtr.Zero, 2, 0, ref size);
             attributes = Marshal.AllocHGlobal(size);
-            if (!Native.InitializeProcThreadAttributeList(attributes, 1, 0, ref size))
+            if (!Native.InitializeProcThreadAttributeList(attributes, 2, 0, ref size))
             {
                 Marshal.FreeHGlobal(attributes);
                 attributes = IntPtr.Zero;
@@ -91,6 +103,14 @@ internal sealed class ContainedProcess : IDisposable
                     pinned.AddrOfPinnedObject(), new IntPtr(IntPtr.Size * handles.Length), IntPtr.Zero, IntPtr.Zero))
             {
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "cannot limit the handles the engine inherits");
+            }
+            if (!Native.UpdateProcThreadAttribute(attributes, 0, Native.PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                    pinnedJobs.AddrOfPinnedObject(), new IntPtr(IntPtr.Size), IntPtr.Zero, IntPtr.Zero))
+            {
+                // Older than Windows 10 1607: the engine could not be born in
+                // its job, so it is not started at all.
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    "Windows cannot start the engine inside the job that ends it with Peel, so Peel did not run it");
             }
 
             var startup = new Native.STARTUPINFOEX();
@@ -111,12 +131,13 @@ internal sealed class ContainedProcess : IDisposable
             }
             created = true;
 
-            afterCreate?.Invoke(info.dwProcessId);
-            if (!job.Assign(info.hProcess, info.dwProcessId))
+            if (!job.Contains(info.hProcess))
             {
+                Log.Write($"engine pid {info.dwProcessId} was created outside its job");
                 throw new InvalidOperationException(
-                    "Windows would not put the engine in a job that ends it with Peel, so Peel did not run it.");
+                    "Windows did not put the engine in the job that ends it with Peel, so Peel did not run it.");
             }
+            afterCreate?.Invoke(info.dwProcessId);
             beforeResume?.Invoke();
             if (Native.ResumeThread(info.hThread) == uint.MaxValue)
             {
@@ -157,6 +178,7 @@ internal sealed class ContainedProcess : IDisposable
                 Marshal.FreeHGlobal(environmentBlock);
             }
             pinned.Free();
+            pinnedJobs.Free();
         }
     }
 
