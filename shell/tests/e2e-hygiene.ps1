@@ -10,7 +10,8 @@ Register-ShareSheets
                   screen. They are not this run's, so nothing here closes them.
 Close-ShareSheets dismiss the share sheets this run opened (any not noted by
                   Register-ShareSheets), and only while no person has touched
-                  George. It must run in the interactive session (a scheduled
+                  George, checked again before each sheet is closed or brought
+                  to the front. It must run in the interactive session (a scheduled
                   task with an Interactive principal, as the e2e drivers do). A
                   share sheet left on screen sits over the test window and
                   swallows the next OLE drag, which is how every drag e2e on
@@ -18,6 +19,10 @@ Close-ShareSheets dismiss the share sheets this run opened (any not noted by
 Clear-ClipboardIfOurs <paths>
                   empties the clipboard only when it still holds exactly the
                   file list this run put there (no paths: never touched).
+Clear-ClipboardTextIfOurs <text>
+                  the same for text the run put there (install/smoke.ps1's
+                  Copy Path). Both check and empty under one OpenClipboard, so
+                  nothing copied in between is ever emptied.
 
 On Windows 11 the share sheet is a top level ApplicationFrameWindow owned by
 explorer.exe whose child is a Windows.UI.Core.CoreWindow titled "Share" from
@@ -89,13 +94,100 @@ public static class PeelShareSheet {
         return found;
     }
 
-    /// <summary>Ask each of these sheets to close with WM_CLOSE.</summary>
-    public static void PostClose(IntPtr[] sheets) {
-        foreach (var h in sheets) PostMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero);
-        if (sheets.Length > 0) System.Threading.Thread.Sleep(800);
-    }
+    /// <summary>Ask this sheet to close with WM_CLOSE.</summary>
+    public static void PostClose(IntPtr h) { PostMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero); }
 
     public static void Front(IntPtr h) { SetForegroundWindow(h); System.Threading.Thread.Sleep(150); }
+}
+"@
+}
+
+if (-not ('PeelClipboard' -as [type])) {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+public static class PeelClipboard {
+    [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr h);
+    [DllImport("user32.dll")] static extern bool CloseClipboard();
+    [DllImport("user32.dll")] static extern bool EmptyClipboard();
+    [DllImport("user32.dll")] static extern bool IsClipboardFormatAvailable(uint f);
+    [DllImport("user32.dll")] static extern IntPtr GetClipboardData(uint f);
+    [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+    [DllImport("kernel32.dll")] static extern IntPtr GlobalLock(IntPtr h);
+    [DllImport("kernel32.dll")] static extern bool GlobalUnlock(IntPtr h);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] static extern uint DragQueryFile(IntPtr h, uint i, StringBuilder s, uint n);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr CreateWindowEx(uint ex, string cls, string name, uint style,
+        int x, int y, int w, int h, IntPtr parent, IntPtr menu, IntPtr inst, IntPtr param);
+    [DllImport("user32.dll")] static extern bool DestroyWindow(IntPtr h);
+    const uint CF_UNICODETEXT = 13, CF_HDROP = 15;
+
+    /// <summary>Test seam: runs with the clipboard open, after the check and before the empty.</summary>
+    public static Action AfterCheck;
+
+    /// <summary>1 emptied, 0 not the run's (left alone), -1 could not open it (left alone).</summary>
+    public static int ClearIfFiles(string[] paths) { return ClearIf(() => SameFiles(Files(), paths)); }
+    public static int ClearIfText(string text) { return ClearIf(() => Text() == text); }
+
+    // Opened for a window of ours (message only): an open for no window is
+    // not exclusive, another open for no window gets in and can close it.
+    static int ClearIf(Func<bool> ours) {
+        IntPtr window = CreateWindowEx(0, "STATIC", "", 0, 0, 0, 0, 0, new IntPtr(-3), IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        if (window == IntPtr.Zero) return -1;
+        try {
+            bool open = false;
+            for (int i = 0; i < 10 && !(open = OpenClipboard(window)); i++) Thread.Sleep(100);
+            if (!open) return -1;
+            try {
+                if (!ours()) return 0;
+                if (AfterCheck != null) AfterCheck();
+                return EmptyClipboard() ? 1 : -1;
+            }
+            finally { CloseClipboard(); }
+        }
+        finally { DestroyWindow(window); }
+    }
+
+    static string[] Files() {
+        if (!IsClipboardFormatAvailable(CF_HDROP)) return new string[0];
+        IntPtr h = GetClipboardData(CF_HDROP);
+        if (h == IntPtr.Zero) return new string[0];
+        uint n = DragQueryFile(h, 0xFFFFFFFF, null, 0);
+        var files = new string[n];
+        for (uint i = 0; i < n; i++) {
+            var s = new StringBuilder((int)DragQueryFile(h, i, null, 0) + 1);
+            DragQueryFile(h, i, s, (uint)s.Capacity);
+            files[i] = s.ToString();
+        }
+        return files;
+    }
+
+    static string Text() {
+        if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return null;
+        IntPtr h = GetClipboardData(CF_UNICODETEXT);
+        if (h == IntPtr.Zero) return null;
+        IntPtr p = GlobalLock(h);
+        if (p == IntPtr.Zero) return null;
+        try { return Marshal.PtrToStringUni(p); } finally { GlobalUnlock(h); }
+    }
+
+    static bool SameFiles(string[] now, string[] mine) {
+        if (now.Length != mine.Length) return false;
+        var a = new string[now.Length]; var b = new string[mine.Length];
+        for (int i = 0; i < a.Length; i++) { a[i] = now[i].ToLowerInvariant(); b[i] = mine[i].ToLowerInvariant(); }
+        Array.Sort(a, StringComparer.Ordinal); Array.Sort(b, StringComparer.Ordinal);
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        return true;
+    }
+
+    /// <summary>Test helper: whether another thread can open the clipboard right now.</summary>
+    public static bool OtherThreadCanOpen() {
+        bool opened = false;
+        var t = new Thread(() => { opened = OpenClipboard(IntPtr.Zero); if (opened) CloseClipboard(); });
+        t.Start(); t.Join();
+        return opened;
+    }
 }
 "@
 }
@@ -103,6 +195,11 @@ public static class PeelShareSheet {
 $script:ShareSheetsBefore = $null
 
 function Get-ShareSheetHandles { @([PeelShareSheet]::Find() | ForEach-Object { $_.ToInt64() }) }
+# One call each, so a test can stand in for the windows (test-gui-guard.ps1).
+function Send-ShareSheetClose([long]$Handle) { [PeelShareSheet]::PostClose([IntPtr]$Handle) }
+function Show-ShareSheet([long]$Handle) { [PeelShareSheet]::Front([IntPtr]$Handle) }
+# A person has touched George since the guard's watcher started.
+function Test-PersonTouched { [bool](('PeelGuard' -as [type]) -and [PeelGuard]::Touched) }
 
 # The run's own sheets: those on screen now that were not there at the start.
 function Select-OwnShareSheets([long[]]$Now, [long[]]$Before) {
@@ -121,26 +218,36 @@ function Register-ShareSheets {
 # (Left 0 means clean). A sheet that stays after WM_CLOSE gets Escape through
 # the GUI guard's cleanup path (gui-guard.ps1). Nothing is touched when the
 # run never drove, when a person touched George (a sheet may be theirs now),
-# or when the sheets on screen at the start were never noted.
+# or when the sheets on screen at the start were never noted. A person is
+# looked for again before each close and each bring to front, and the first
+# sign of one stops the rest.
 function Close-ShareSheets {
     $untouched = { param($why) [pscustomobject]@{ Found = 0; Left = 0; Text = "share sheets not touched: $why" } }
     if ('PeelGuard' -as [type]) {
         if ([PeelGuard]::RunDir -and -not [PeelGuard]::Drove) { return (& $untouched 'this run did not drive') }
-        if ([PeelGuard]::Touched) { return (& $untouched 'a person touched George during the run') }
+        if (Test-PersonTouched) { return (& $untouched 'a person touched George during the run') }
     }
     if ($null -eq $script:ShareSheetsBefore) { return (& $untouched 'the sheets on screen at the start were not noted (Register-ShareSheets)') }
+    $stopped = ''
     $mine = Select-OwnShareSheets (Get-ShareSheetHandles) $script:ShareSheetsBefore
-    [PeelShareSheet]::PostClose([IntPtr[]]@($mine | ForEach-Object { [IntPtr]$_ }))
-    $stayed = Select-OwnShareSheets (Get-ShareSheetHandles) $script:ShareSheetsBefore
-    if ($stayed.Count -gt 0 -and ('PeelGuard' -as [type])) {
-        foreach ($h in $stayed) {
-            [PeelShareSheet]::Front([IntPtr]$h)
-            [void][PeelGuard]::CleanupTap([byte]0x1B)
+    foreach ($h in $mine) {
+        if (Test-PersonTouched) { $stopped = '; stopped: a person touched George'; break }
+        Send-ShareSheetClose $h
+    }
+    if ($mine.Count -gt 0) { Start-Sleep -Milliseconds 800 }
+    if (-not $stopped) {
+        $stayed = Select-OwnShareSheets (Get-ShareSheetHandles) $script:ShareSheetsBefore
+        if ($stayed.Count -gt 0 -and ('PeelGuard' -as [type])) {
+            foreach ($h in $stayed) {
+                if (Test-PersonTouched) { $stopped = '; stopped: a person touched George'; break }
+                Show-ShareSheet $h
+                [void][PeelGuard]::CleanupTap([byte]0x1B)
+            }
+            Start-Sleep -Milliseconds 800
         }
-        Start-Sleep -Milliseconds 800
     }
     $left = (Select-OwnShareSheets (Get-ShareSheetHandles) $script:ShareSheetsBefore).Count
-    return [pscustomobject]@{ Found = $mine.Count; Left = $left; Text = "share sheets of this run found $($mine.Count), left $left; not this run's: $($script:ShareSheetsBefore.Count)" }
+    return [pscustomobject]@{ Found = $mine.Count; Left = $left; Text = "share sheets of this run found $($mine.Count), left $left; not this run's: $($script:ShareSheetsBefore.Count)$stopped" }
 }
 
 # The Copy action's clipboard: emptied only when it still holds exactly the
@@ -148,11 +255,19 @@ function Close-ShareSheets {
 # never got that far) means the clipboard is not touched at all.
 function Clear-ClipboardIfOurs([string[]]$Paths) {
     if (-not $Paths -or $Paths.Count -eq 0) { return 'clipboard not touched: this run put nothing on it' }
-    Add-Type -AssemblyName System.Windows.Forms
-    $now = @()
-    if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) { $now = @([System.Windows.Forms.Clipboard]::GetFileDropList()) }
-    $same = $now.Count -eq $Paths.Count -and -not (Compare-Object @($now | ForEach-Object { $_.ToLowerInvariant() }) @($Paths | ForEach-Object { $_.ToLowerInvariant() }))
-    if (-not $same) { return 'clipboard not touched: it no longer holds this run''s files' }
-    [System.Windows.Forms.Clipboard]::Clear()
-    return 'clipboard cleared: it still held this run''s files'
+    switch ([PeelClipboard]::ClearIfFiles($Paths)) {
+        1 { return 'clipboard cleared: it still held this run''s files' }
+        0 { return 'clipboard not touched: it no longer holds this run''s files' }
+        default { return 'clipboard not touched: it could not be opened' }
+    }
+}
+
+# The same for text this run put there. $Text empty: never touched.
+function Clear-ClipboardTextIfOurs([string]$Text) {
+    if (-not $Text) { return 'clipboard not touched: this run put nothing on it' }
+    switch ([PeelClipboard]::ClearIfText($Text)) {
+        1 { return 'clipboard cleared: it still held this run''s text' }
+        0 { return 'clipboard not touched: it no longer holds this run''s text' }
+        default { return 'clipboard not touched: it could not be opened' }
+    }
 }
