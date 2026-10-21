@@ -2,12 +2,18 @@
 // finding of the round 3 reviews: a named stream added to a source folder just
 // before it is deleted, a copied folder that is missing or replaced, and a
 // share sheet Peel cannot prove its own. The FAT32/exFAT fix is checked by
-// Review3ActionsTests with PEEL_REVIEW_FAT set.
+// Review3ActionsTests with PEEL_REVIEW_FAT set. Section 5 (hq-plct.21): the
+// delete handles never ask for FILE_WRITE_ATTRIBUTES.
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using Microsoft.Win32.SafeHandles;
 using Peel.Actions;
 using Xunit;
 
@@ -310,6 +316,251 @@ public class ActionFixRound4Tests
                 File.SetAttributes(dir, FileAttributes.Directory);
             }
             Wipe(root);
+        }
+    }
+
+    // --- 5. An ACL denying FILE_WRITE_ATTRIBUTES (hq-plct.21) -----------------
+    // The delete handles ask only for DELETE and read access, so a source the
+    // user may delete but whose attributes they may not change still moves
+    // cleanly. A FAT volume has no ACL, so this runs on NTFS only; the FAT
+    // read-only path is checked below and by the tests in section 4.
+
+    private static readonly SecurityIdentifier Me = WindowsIdentity.GetCurrent().User!;
+
+    /// <summary>
+    /// Run <paramref name="body"/> as this user without the backup and restore
+    /// privileges. An elevated ssh session on George holds both enabled, and
+    /// with them SetFileAttributes and every backup-semantics open (all folder
+    /// handles) pass a deny ACE; Daniel's desktop session has neither.
+    /// </summary>
+    private static void WithoutBackupPrivileges(Action body)
+    {
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, out var process))
+        {
+            throw new Win32Exception();
+        }
+        using (process)
+        {
+            if (!DuplicateTokenEx(process, TOKEN_ALL_ACCESS, IntPtr.Zero, SecurityImpersonation, TokenImpersonation, out var token))
+            {
+                throw new Win32Exception();
+            }
+            using (token)
+            {
+                foreach (var name in new[] { "SeBackupPrivilege", "SeRestorePrivilege" })
+                {
+                    if (!LookupPrivilegeValueW(null, name, out var luid))
+                    {
+                        throw new Win32Exception();
+                    }
+                    var removed = new TOKEN_PRIVILEGES { PrivilegeCount = 1, Luid = luid, Attributes = SE_PRIVILEGE_REMOVED };
+                    // ERROR_NOT_ALL_ASSIGNED (a token without it) is fine.
+                    if (!AdjustTokenPrivileges(token, false, ref removed, 0, IntPtr.Zero, IntPtr.Zero))
+                    {
+                        throw new Win32Exception();
+                    }
+                }
+                WindowsIdentity.RunImpersonated(token, body);
+            }
+        }
+    }
+
+    private const uint TOKEN_DUPLICATE = 0x0002;
+    private const uint TOKEN_QUERY = 0x0008;
+    private const uint TOKEN_ALL_ACCESS = 0xF01FF;
+    private const int SecurityImpersonation = 2;
+    private const int TokenImpersonation = 2;
+    private const uint SE_PRIVILEGE_REMOVED = 0x4;
+
+    // One LUID_AND_ATTRIBUTES; a LUID is two DWORDs, so 4-byte packing.
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    private struct TOKEN_PRIVILEGES
+    {
+        public uint PrivilegeCount;
+        public long Luid;
+        public uint Attributes;
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(IntPtr process, uint access, out SafeAccessTokenHandle token);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool DuplicateTokenEx(SafeAccessTokenHandle token, uint access, IntPtr attributes,
+        int level, int type, out SafeAccessTokenHandle duplicate);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool LookupPrivilegeValueW(string? system, string name, out long luid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool AdjustTokenPrivileges(SafeAccessTokenHandle token, bool disableAll,
+        ref TOKEN_PRIVILEGES state, int length, IntPtr previous, IntPtr returned);
+
+    private static FileSystemAccessRule DenyWriteAttributes() => new(
+        Me, FileSystemRights.WriteAttributes, InheritanceFlags.None, PropagationFlags.None, AccessControlType.Deny);
+
+    private static void Deny(string path, bool isDirectory)
+    {
+        if (isDirectory)
+        {
+            var dir = new DirectoryInfo(path);
+            var acl = dir.GetAccessControl();
+            acl.AddAccessRule(DenyWriteAttributes());
+            dir.SetAccessControl(acl);
+        }
+        else
+        {
+            var file = new FileInfo(path);
+            var acl = file.GetAccessControl();
+            acl.AddAccessRule(DenyWriteAttributes());
+            file.SetAccessControl(acl);
+        }
+    }
+
+    private static void Allow(string path)
+    {
+        if (Directory.Exists(path))
+        {
+            var dir = new DirectoryInfo(path);
+            var acl = dir.GetAccessControl();
+            acl.RemoveAccessRuleSpecific(DenyWriteAttributes());
+            dir.SetAccessControl(acl);
+            File.SetAttributes(path, FileAttributes.Directory);
+        }
+        else if (File.Exists(path))
+        {
+            var file = new FileInfo(path);
+            var acl = file.GetAccessControl();
+            acl.RemoveAccessRuleSpecific(DenyWriteAttributes());
+            file.SetAccessControl(acl);
+            File.SetAttributes(path, FileAttributes.Normal);
+        }
+    }
+
+    /// <summary>Clear read-only flags under <paramref name="root"/> so Wipe
+    /// can remove a copy that kept them.</summary>
+    private static void Unlock(string root)
+    {
+        if (!Directory.Exists(root))
+        {
+            return;
+        }
+        foreach (var entry in Directory.EnumerateFileSystemEntries(root, "*", SearchOption.AllDirectories))
+        {
+            File.SetAttributes(entry, Directory.Exists(entry) ? FileAttributes.Directory : FileAttributes.Normal);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void ASourceThatDeniesWriteAttributesMovesCleanly(bool readOnly)
+    {
+        var root = NewRoot();
+        var album = Path.Combine(root, "album");
+        var sub = Path.Combine(album, "sub");
+        var file = Path.Combine(album, "a.txt");
+        try
+        {
+            Directory.CreateDirectory(sub);
+            File.WriteAllText(file, "alpha");
+            File.WriteAllText(file + ":note", "stream");
+            if (readOnly)
+            {
+                File.SetAttributes(file, FileAttributes.ReadOnly);
+                File.SetAttributes(sub, FileAttributes.Directory | FileAttributes.ReadOnly);
+            }
+            Deny(file, isDirectory: false);
+            Deny(sub, isDirectory: true);
+            Deny(album, isDirectory: true);
+            var target = Path.Combine(root, "copy");
+            CrossVolumeResult? result = null;
+            WithoutBackupPrivileges(() =>
+            {
+                // The ACL really bites: these attributes cannot be changed now.
+                Assert.Throws<UnauthorizedAccessException>(() => File.SetAttributes(file, FileAttributes.Hidden));
+                Assert.Throws<UnauthorizedAccessException>(() => File.SetAttributes(sub, FileAttributes.Hidden));
+                result = CrossVolumeMove.Move(album, target);
+            });
+
+            Assert.Empty(result!.Remaining);
+            Assert.False(Directory.Exists(album));
+            Assert.Equal("alpha", File.ReadAllText(Path.Combine(target, "a.txt")));
+            Assert.Equal("stream", File.ReadAllText(Path.Combine(target, "a.txt") + ":note"));
+            Assert.True(Directory.Exists(Path.Combine(target, "sub")));
+        }
+        finally
+        {
+            Allow(file);
+            Allow(sub);
+            Allow(album);
+            Unlock(root);
+            Wipe(root);
+        }
+    }
+
+    [Fact]
+    public void AReadOnlyFileIsDeletedThroughItsHandle()
+    {
+        // On FAT the read-only flag is cleared through a second, attributes
+        // only handle while the delete handle keeps writers out.
+        var root = FatOrNtfsRoot();
+        var target = NewRoot();
+        try
+        {
+            var album = Path.Combine(root, "album");
+            Directory.CreateDirectory(album);
+            var file = Path.Combine(album, "a.txt");
+            File.WriteAllText(file, "alpha");
+            File.SetAttributes(file, FileAttributes.ReadOnly | FileAttributes.Hidden);
+            File.SetAttributes(album, FileAttributes.Directory | FileAttributes.ReadOnly);
+            var result = CrossVolumeMove.Move(album, Path.Combine(target, "album"));
+            Assert.Empty(result.Remaining);
+            Assert.False(Directory.Exists(album));
+            Assert.Equal("alpha", File.ReadAllText(Path.Combine(target, "album", "a.txt")));
+        }
+        finally
+        {
+            Unlock(root);
+            Unlock(target);
+            Wipe(root);
+            Wipe(target);
+        }
+    }
+
+    [Fact]
+    public void AReadOnlyFileThatChangedKeepsItsAttributes()
+    {
+        // The delete check fails after the copy, so nothing is cleared.
+        var root = FatOrNtfsRoot();
+        var target = NewRoot();
+        var file = Path.Combine(root, "album", "a.txt");
+        try
+        {
+            var album = Path.Combine(root, "album");
+            Directory.CreateDirectory(album);
+            File.WriteAllText(file, "alpha");
+            File.SetAttributes(file, FileAttributes.ReadOnly | FileAttributes.Hidden);
+            var result = CrossVolumeMove.Move(album, Path.Combine(target, "album"), whileProtected: _ =>
+            {
+                File.SetAttributes(file, FileAttributes.Normal);
+                File.WriteAllText(file, "changed!");
+                File.SetAttributes(file, FileAttributes.ReadOnly | FileAttributes.Hidden);
+            });
+            Assert.Equal(new[] { "a.txt" }, result.Remaining);
+            Assert.Equal("changed!", File.ReadAllText(file));
+            var attributes = File.GetAttributes(file);
+            Assert.True(attributes.HasFlag(FileAttributes.ReadOnly), attributes.ToString());
+            Assert.True(attributes.HasFlag(FileAttributes.Hidden), attributes.ToString());
+        }
+        finally
+        {
+            Unlock(root);
+            Unlock(target);
+            Wipe(root);
+            Wipe(target);
         }
     }
 
