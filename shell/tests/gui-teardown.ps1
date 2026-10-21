@@ -38,6 +38,16 @@ if ($claim) {
     [PeelGuard]::Adopt($RunDir, $claim.Path, [bool]$claim.State.drove, [int[]]@($claim.State.owned | Where-Object { $null -ne $_ }), [int]$claim.State.injections)
     $result = Invoke-GuiTeardown
     [PeelGuard]::Finish()
+    # A killed driver never closed the Explorer windows it opened on its own
+    # scratch folder (inside the run folder); close those, and no other.
+    $prefix = ([uri]((Resolve-Path $RunDir).Path.TrimEnd('\') + '\')).AbsoluteUri
+    $closed = 0
+    try {
+        foreach ($w in @((New-Object -ComObject Shell.Application).Windows())) {
+            try { if ("$($w.LocationURL)/" -like "$prefix*") { $w.Quit(); $closed++ } } catch { }
+        }
+    } catch { }
+    if ($closed -gt 0) { $result.Actions += ", closed $closed Explorer window(s) on the run folder"; $result.Text += "; closed $closed Explorer window(s) on the run folder" }
 }
 else {
     $result = [pscustomobject]@{
