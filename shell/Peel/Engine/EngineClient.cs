@@ -14,9 +14,13 @@
 // (Jobs/ProcessJob.cs). It is created suspended inside the job and resumed
 // only once it is registered for KillAll (Jobs/ContainedProcess.cs); if either
 // fails, the engine is not run and the call returns an error. A call that is
-// cancelled, or a Peel that is quitting, is checked twice: before the process
-// is created and again just before it would resume, so a cancelled action
-// never runs a line of the engine. The timeout
+// cancelled, or a Peel that is quitting, is checked before the process is
+// created and again just before it would resume. Those checks alone left a
+// window (lucy, hq-plct.17): a cancel landing after the last check and before
+// ResumeThread let the engine start. So both cancellations are also registered
+// on a ResumeGate before anything is created, and the gate serializes them
+// against the resume itself: a cancelled action never runs a line of the
+// engine, and a cancel after the resume reaches the kill path below. The timeout
 // covers the process exit and the draining of both pipes, because a backend
 // the engine started can inherit the pipes and keep them open after the
 // engine has exited; on expiry the whole job is terminated, which closes the
@@ -97,6 +101,12 @@ internal sealed class EngineClient
 
     /// <summary>Called on the thread that prepares the call, before anything else. Tests only.</summary>
     internal Action? BeforeLaunch { get; init; }
+
+    /// <summary>
+    /// Called after the last cancellation check, just before the resume
+    /// decision, while the process is still suspended. Tests only.
+    /// </summary>
+    internal Action? BeforeResume { get; init; }
 
     internal static string ListFolder => Path.Combine(Path.GetTempPath(), "Peel");
 
@@ -574,6 +584,12 @@ internal sealed class EngineClient
         };
 
         var watch = Stopwatch.StartNew();
+        // Registered before the launch, so a cancel at any later moment
+        // reaches the gate; once the engine is resumed, Cancel is a no-op
+        // and the linked token below ends it instead.
+        var gate = new ResumeGate();
+        using var cancelled = token.Register(() => gate.Cancel());
+        using var quitting = _shutdown.Token.Register(() => gate.Cancel());
         if (_closed || token.IsCancellationRequested)
         {
             // Nothing created yet, so nothing to end.
@@ -603,7 +619,8 @@ internal sealed class EngineClient
                 // Cancelled while suspended: end it here instead of resuming
                 // it only to kill it.
                 token.ThrowIfCancellationRequested();
-            });
+                BeforeResume?.Invoke();
+            }, gate);
         }
         catch (Exception error)
         {
@@ -612,7 +629,7 @@ internal sealed class EngineClient
             if (error is OperationCanceledException)
             {
                 Log.Write($"engine {what} not resumed: {(_closed ? "Peel is quitting" : "cancelled")}");
-                return (string.Empty, _closed ? "Peel is quitting." : "The Peel engine was cancelled.", null);
+                return (string.Empty, _closed ? "Peel is quitting." : "The Peel engine was cancelled before it started.", null);
             }
             Log.Write($"cannot start the engine at {location.FileName}", error);
             return (string.Empty, $"Cannot start the Peel engine ({location.Description}): {error.Message}", null);
