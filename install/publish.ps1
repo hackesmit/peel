@@ -524,10 +524,11 @@ try {
         $global:LASTEXITCODE = 0
         if (-not (Test-Path (Join-Path $venv 'Scripts\python.exe'))) {
             # First install: setup.ps1 installs the backends and makes a venv
-            # (it only ever writes %LOCALAPPDATA%\Peel). That venv is the
-            # template for the versioned one and moves aside at the switch.
+            # in this install root (only the default root touches the user
+            # PATH). That venv is the template for the versioned one and
+            # moves aside at the switch.
             Write-Step 'no engine venv yet: running setup.ps1'
-            & (Join-Path $here 'setup.ps1') -EnginePath $versionSrc
+            & (Join-Path $here 'setup.ps1') -EnginePath $versionSrc -InstallRoot $peelHome
             if ($LASTEXITCODE -ne 0) { throw "setup.ps1 failed (exit $LASTEXITCODE)" }
         }
         Build-EngineVenv $versionVenv $versionSrc $venv
