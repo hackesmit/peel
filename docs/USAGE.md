@@ -71,8 +71,8 @@ Changes apply at once, no restart. They are saved in
 
 | What | Where |
 | --- | --- |
-| The app | `%LOCALAPPDATA%\Peel\app` |
-| The engine and its Python | `%LOCALAPPDATA%\Peel\engines`; `%LOCALAPPDATA%\Peel\venv` points to the one in use |
+| The app | `%LOCALAPPDATA%\Peel\app`, which points to the build in use under `%LOCALAPPDATA%\Peel\versions` |
+| The engine and its Python | `%LOCALAPPDATA%\Peel\venv`, which points to the engine that goes with that build |
 | Settings | `%APPDATA%\Peel\settings.json` |
 | Log | `%LOCALAPPDATA%\Peel\logs\peel.log` |
 | Start at sign in | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, value `Peel` |
@@ -80,7 +80,7 @@ Changes apply at once, no restart. They are saved in
 Nothing needs administrator rights. To upgrade, the HQ runs
 `install\publish.ps1` again: it builds the new app and engine while Peel
 runs, then stops Peel, switches to the new pair and starts it. If the new
-build does not stay up for 10 seconds, it goes back to the app and engine it
-had and starts them again. The
+build does not stay up for 10 seconds, it goes back to the app, engine and
+settings it had and starts them again. The
 start at sign in entry always names the installed app, never a test build. To remove Peel, quit it, turn off **Start up** in Settings, and delete
 the `%LOCALAPPDATA%\Peel` folder.
