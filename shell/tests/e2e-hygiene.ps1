@@ -5,12 +5,19 @@ Find-PeelApp      the Peel.exe of the newest build folder, chosen by the
                   target framework version in the folder name, never the first
                   folder alphabetically (an old net8.0-windows build left in a
                   dev copy would otherwise shadow net8.0-windows10.0.x).
-Close-ShareSheets dismiss every Windows share sheet on the desktop. It must run
-                  in the interactive session (a scheduled task with an
-                  Interactive principal, as the e2e drivers do). A share sheet
-                  left on screen sits over the test window and swallows the next
-                  OLE drag, which is how every drag e2e on George failed after
-                  an earlier Share run.
+Register-ShareSheets
+                  right after Start-GuiGuard: notes the share sheets already on
+                  screen. They are not this run's, so nothing here closes them.
+Close-ShareSheets dismiss the share sheets this run opened (any not noted by
+                  Register-ShareSheets), and only while no person has touched
+                  George. It must run in the interactive session (a scheduled
+                  task with an Interactive principal, as the e2e drivers do). A
+                  share sheet left on screen sits over the test window and
+                  swallows the next OLE drag, which is how every drag e2e on
+                  George failed after an earlier Share run.
+Clear-ClipboardIfOurs <paths>
+                  empties the clipboard only when it still holds exactly the
+                  file list this run put there (no paths: never touched).
 
 On Windows 11 the share sheet is a top level ApplicationFrameWindow owned by
 explorer.exe whose child is a Windows.UI.Core.CoreWindow titled "Share" from
@@ -82,12 +89,10 @@ public static class PeelShareSheet {
         return found;
     }
 
-    /// <summary>Ask each sheet to close with WM_CLOSE. Returns how many there were.</summary>
-    public static int PostClose() {
-        var sheets = Find();
+    /// <summary>Ask each of these sheets to close with WM_CLOSE.</summary>
+    public static void PostClose(IntPtr[] sheets) {
         foreach (var h in sheets) PostMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero);
-        System.Threading.Thread.Sleep(800);
-        return sheets.Count;
+        if (sheets.Length > 0) System.Threading.Thread.Sleep(800);
     }
 
     public static void Front(IntPtr h) { SetForegroundWindow(h); System.Threading.Thread.Sleep(150); }
@@ -95,25 +100,59 @@ public static class PeelShareSheet {
 "@
 }
 
-# Returns a one-line description for the caller's log: how many sheets were
-# found, and how many are still on screen afterwards (0 means clean).
-# A sheet that stays after WM_CLOSE gets Escape, through the GUI guard's
-# cleanup path (gui-guard.ps1): only in a run that drove and that no person
-# touched. A run that never drove does not touch the desktop at all, since a
-# sheet on screen then can be Daniel's own.
+$script:ShareSheetsBefore = $null
+
+function Get-ShareSheetHandles { @([PeelShareSheet]::Find() | ForEach-Object { $_.ToInt64() }) }
+
+# The run's own sheets: those on screen now that were not there at the start.
+function Select-OwnShareSheets([long[]]$Now, [long[]]$Before) {
+    @($Now | Where-Object { $Before -notcontains $_ })
+}
+
+function Register-ShareSheets {
+    $script:ShareSheetsBefore = [long[]]@(Get-ShareSheetHandles)
+    $n = $script:ShareSheetsBefore.Count
+    $text = if ($n -gt 0) { "share sheets on screen before the run $n, left alone (not this run's)" } else { 'no share sheet on screen before the run' }
+    return [pscustomobject]@{ Found = $n; Text = $text }
+}
+
+# Returns a one-line description for the caller's log: how many of the run's
+# own sheets were found, and how many of them are still on screen afterwards
+# (Left 0 means clean). A sheet that stays after WM_CLOSE gets Escape through
+# the GUI guard's cleanup path (gui-guard.ps1). Nothing is touched when the
+# run never drove, when a person touched George (a sheet may be theirs now),
+# or when the sheets on screen at the start were never noted.
 function Close-ShareSheets {
-    if (('PeelGuard' -as [type]) -and [PeelGuard]::RunDir -and -not [PeelGuard]::Drove) {
-        return [pscustomobject]@{ Found = 0; Left = 0; Text = 'share sheets not touched: this run did not drive' }
+    $untouched = { param($why) [pscustomobject]@{ Found = 0; Left = 0; Text = "share sheets not touched: $why" } }
+    if ('PeelGuard' -as [type]) {
+        if ([PeelGuard]::RunDir -and -not [PeelGuard]::Drove) { return (& $untouched 'this run did not drive') }
+        if ([PeelGuard]::Touched) { return (& $untouched 'a person touched George during the run') }
     }
-    $found = [PeelShareSheet]::PostClose()
-    $stayed = @([PeelShareSheet]::Find())
+    if ($null -eq $script:ShareSheetsBefore) { return (& $untouched 'the sheets on screen at the start were not noted (Register-ShareSheets)') }
+    $mine = Select-OwnShareSheets (Get-ShareSheetHandles) $script:ShareSheetsBefore
+    [PeelShareSheet]::PostClose([IntPtr[]]@($mine | ForEach-Object { [IntPtr]$_ }))
+    $stayed = Select-OwnShareSheets (Get-ShareSheetHandles) $script:ShareSheetsBefore
     if ($stayed.Count -gt 0 -and ('PeelGuard' -as [type])) {
         foreach ($h in $stayed) {
-            [PeelShareSheet]::Front($h)
+            [PeelShareSheet]::Front([IntPtr]$h)
             [void][PeelGuard]::CleanupTap([byte]0x1B)
         }
         Start-Sleep -Milliseconds 800
     }
-    $left = ([PeelShareSheet]::Find()).Count
-    return [pscustomobject]@{ Found = $found; Left = $left; Text = "share sheets found $found, left $left" }
+    $left = (Select-OwnShareSheets (Get-ShareSheetHandles) $script:ShareSheetsBefore).Count
+    return [pscustomobject]@{ Found = $mine.Count; Left = $left; Text = "share sheets of this run found $($mine.Count), left $left; not this run's: $($script:ShareSheetsBefore.Count)" }
+}
+
+# The Copy action's clipboard: emptied only when it still holds exactly the
+# files this run put there. $Paths empty (a run that aborted before Copy, or
+# never got that far) means the clipboard is not touched at all.
+function Clear-ClipboardIfOurs([string[]]$Paths) {
+    if (-not $Paths -or $Paths.Count -eq 0) { return 'clipboard not touched: this run put nothing on it' }
+    Add-Type -AssemblyName System.Windows.Forms
+    $now = @()
+    if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) { $now = @([System.Windows.Forms.Clipboard]::GetFileDropList()) }
+    $same = $now.Count -eq $Paths.Count -and -not (Compare-Object @($now | ForEach-Object { $_.ToLowerInvariant() }) @($Paths | ForEach-Object { $_.ToLowerInvariant() }))
+    if (-not $same) { return 'clipboard not touched: it no longer holds this run''s files' }
+    [System.Windows.Forms.Clipboard]::Clear()
+    return 'clipboard cleared: it still held this run''s files'
 }

@@ -50,7 +50,15 @@ function Highlight() { $m = [regex]::Matches((PeelLog), 'keyboard highlight (.+)
 function AimAt($t) { for ($i=0; $i -lt 30; $i++) { if ((Highlight) -eq $t) { return $true }; $s = CountLog 'keyboard highlight '; [PeelGuard]::TapEx(0x27,$true); WaitLog 'keyboard highlight ' 3000 ($s+1) | Out-Null }; $false }
 function ShellWins() { @((New-Object -ComObject Shell.Application).Windows()) }
 function DumpWins($tag) { foreach ($w in ShellWins) { try { L ("  $tag win hwnd={0} url={1} sel={2}" -f $w.HWND, $w.LocationURL, (@($w.Document.SelectedItems()) | ForEach-Object { $_.Name }) -join ';') } catch { } } }
-function CloseMine() { foreach ($w in ShellWins) { try { if ($w.LocationURL -like '*review-5f8a-gui*') { $w.Quit() } } catch { } } }
+# The scratch folders live under this run's own folder (gui-guard.ps1), so a
+# run never deletes another run's folders, and gui-teardown.ps1 closes the
+# Explorer windows on them if this driver is killed. No run folder yet: no window is ours.
+$script:Work = $null
+function CloseMine() {
+    if (-not $script:Work) { return }
+    $prefix = ([uri]($script:Work.TrimEnd('\') + '\')).AbsoluteUri
+    foreach ($w in ShellWins) { try { if ("$($w.LocationURL)/" -like "$prefix*") { $w.Quit() } } catch { } }
+}
 function FindItem($name) {
     $root = [System.Windows.Automation.AutomationElement]::RootElement
     $stem = [System.IO.Path]::GetFileNameWithoutExtension($name)
@@ -82,9 +90,10 @@ $script:GuiAbort = $null
 try {
     Start-GuiGuard -Dir $Dir -RunDir $GuardDir -PauseInstalledFor $App -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
     L ("screens: " + ((@([System.Windows.Forms.Screen]::AllScreens) | ForEach-Object { "$($_.DeviceName) $($_.Bounds)" }) -join ' | '))
-    foreach ($n in 'A','B','C') { $d = Join-Path $Dir $n; Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force $d | Out-Null
+    $script:Work = Join-Path ([PeelGuard]::RunDir) 'scratch'
+    foreach ($n in 'A','B','C') { $d = Join-Path $script:Work $n; Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force $d | Out-Null
         Set-Content -Path (Join-Path $d ("{0}.txt" -f $n.ToLower())) -Value "review $n`r`nline two`r`n" -Encoding UTF8 }
-    $A = Join-Path $Dir 'A'; $B = Join-Path $Dir 'B'; $C = Join-Path $Dir 'C'
+    $A = Join-Path $script:Work 'A'; $B = Join-Path $script:Work 'B'; $C = Join-Path $script:Work 'C'
 
     # ---- T: two tabs in one Explorer window ----
     $peel = StartPeel (Join-Path $Dir 'peel-T.log')
@@ -95,7 +104,7 @@ try {
     L ("T fg after click a.txt: " + [In]::Fg())
     [PeelGuard]::CtrlT(); Wait-Gui 2000
     $hw = [In]::GetForegroundWindow().ToInt64()
-    $tab = ShellWins | Where-Object { $_.HWND -eq $hw -and $_.LocationURL -notlike '*review-5f8a-gui/A*' } | Select-Object -First 1
+    $tab = ShellWins | Where-Object { $_.HWND -eq $hw -and $_.LocationURL -ne ([uri]$A).AbsoluteUri } | Select-Object -First 1
     if (-not $tab) { throw 'no second tab found' }
     $tab.Navigate2($B); Wait-Gui 3000
     ClickItem 'b.txt'

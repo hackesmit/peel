@@ -99,10 +99,12 @@ public static class PeelGuard {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 
     // Test seams, read once at load. They can only make George look busier,
-    // never idler: PEEL_GUARD_FAKE_IDLE_MS caps the idle time, and
-    // PEEL_GUARD_FAKE_DOWN (vk list, "0x01,0xA0") reports keys as held.
+    // never idler: PEEL_GUARD_FAKE_IDLE_MS caps the idle time,
+    // PEEL_GUARD_FAKE_DOWN (vk list, "0x01,0xA0") reports keys as held, and
+    // PEEL_GUARD_FAKE_REAL=1 reports a person as having touched George.
     static readonly long fakeIdle = ParseLong(Environment.GetEnvironmentVariable("PEEL_GUARD_FAKE_IDLE_MS"));
     static readonly HashSet<int> fakeDown = ParseVks(Environment.GetEnvironmentVariable("PEEL_GUARD_FAKE_DOWN"));
+    static readonly bool fakeReal = Environment.GetEnvironmentVariable("PEEL_GUARD_FAKE_REAL") == "1";
     static long ParseLong(string s) { long v; return long.TryParse(s, out v) && v >= 0 ? v : -1; }
     static HashSet<int> ParseVks(string s) {
         var set = new HashSet<int>();
@@ -208,11 +210,12 @@ public static class PeelGuard {
     public static void EndDrive() { driving = false; Save(); }
     public static void Finish() { lock (stateGate) { driving = false; done = true; } Save(); }
 
-    static void Save() {
+    // False when the state could not be written (the disk, a locked file).
+    static bool Save() {
         string path, json;
         lock (stateGate) {
             path = statePath;
-            if (path == "") return;
+            if (path == "") return true;
             var keys = new List<string>();
             foreach (var k in Owned()) keys.Add(k.ToString());
             json = "{\"pid\":" + System.Diagnostics.Process.GetCurrentProcess().Id
@@ -227,7 +230,8 @@ public static class PeelGuard {
             var tmp = path + ".tmp";
             File.WriteAllText(tmp, json);
             if (File.Exists(path)) File.Replace(tmp, path, null); else File.Move(tmp, path);
-        } catch (Exception) { }
+            return true;
+        } catch (Exception) { return false; }
     }
 
     static void Log(string what) {
@@ -242,12 +246,35 @@ public static class PeelGuard {
         if (changed) Save();
     }
 
-    // Every driving injection passes here, and nothing else injects.
-    static void Drive(string what) {
+    // A press is on disk before it happens: a driver killed right after the
+    // down event leaves a state that names it, so its teardown lets it go.
+    // When the state cannot be written, nothing is pressed.
+    static void OwnBefore(string what, int vk) {
+        bool added;
+        lock (stateGate) { added = owned.Add(vk); }
+        if (!added || Save()) return;
+        lock (stateGate) { owned.Remove(vk); }
+        throw new InvalidOperationException("PEEL_GUARD refused " + what + ": guard-state.json could not be written, so the press would not be on record");
+    }
+
+    static void Refuse(string what) {
         if (!driving) throw new InvalidOperationException("PEEL_GUARD refused " + what + ": the run is not driving (before Start-GuiGuard opened the drive, or after its teardown)");
-        if (real > 0) throw new InvalidOperationException("PEEL_ABORT user input: " + FirstReal);
+        if (Touched) throw new InvalidOperationException("PEEL_ABORT user input: " + FirstReal);
+    }
+
+    static void Count(string what) {
         Interlocked.Increment(ref injections);
         Log("drive " + what);
+    }
+
+    // Every driving injection passes here, and nothing else injects.
+    static void Drive(string what) { Refuse(what); Count(what); }
+
+    // A press or a release: a press is recorded first (OwnBefore), a release after.
+    static void Press(string what, int vk, bool down) {
+        Refuse(what);
+        if (down) OwnBefore(what, vk);
+        Count(what);
     }
 
     // Teardown input: only after this run drove. Counted apart.
@@ -271,18 +298,18 @@ public static class PeelGuard {
     public static void Move(int x, int y) { Drive("move " + x + "," + y); RawMove(x, y); }
     public static void Place(int x, int y) { Drive("place " + x + "," + y); SetCursorPos(x, y); }
     public static void Button(int vk, bool down) {
-        Drive("button 0x" + vk.ToString("x2") + (down ? " down" : " up"));
+        Press("button 0x" + vk.ToString("x2") + (down ? " down" : " up"), vk, down);
         mouse_event(down ? DownFlag(vk) : UpFlag(vk), 0, 0, 0, UIntPtr.Zero);
-        Own(vk, down);
+        if (!down) Own(vk, false);
     }
     public static void Down() { Button(0x01, true); }
     public static void Up() { Button(0x01, false); }
     public static void Click() { Down(); Thread.Sleep(60); Up(); }
     public static void Click(int x, int y) { Place(x, y); Thread.Sleep(120); Click(); }
     public static void KeyEx(byte vk, bool down, bool ext) {
-        Drive("key 0x" + vk.ToString("x2") + (down ? " down" : " up"));
+        Press("key 0x" + vk.ToString("x2") + (down ? " down" : " up"), vk, down);
         RawKey(vk, down, ext);
-        Own(vk, down);
+        if (!down) Own(vk, false);
     }
     public static void Key(byte vk, bool down) { KeyEx(vk, down, false); }
     public static void TapEx(byte vk, bool ext) { KeyEx(vk, true, ext); Thread.Sleep(45); KeyEx(vk, false, ext); }
@@ -332,13 +359,13 @@ public static class PeelGuard {
     }
     /// <summary>Escape for a share sheet in the run's own cleanup: not once a person touched George.</summary>
     public static bool CleanupTap(byte vk) {
-        if (real > 0 || !Cleanup("tap 0x" + vk.ToString("x2"))) return false;
+        if (Touched || !Cleanup("tap 0x" + vk.ToString("x2"))) return false;
         RawKey(vk, true, false); Thread.Sleep(60); RawKey(vk, false, false);
         return true;
     }
     /// <summary>Put the cursor back, only when the run drove and no person moved it since.</summary>
     public static bool RestoreCursor(int x, int y) {
-        if (real > 0 || !Cleanup("restore cursor " + x + "," + y)) return false;
+        if (Touched || !Cleanup("restore cursor " + x + "," + y)) return false;
         SetCursorPos(x, y);
         return true;
     }
@@ -352,8 +379,10 @@ public static class PeelGuard {
     static string firstReal = "";
     static readonly object gate = new object();
 
-    public static int RealInput { get { return real; } }
-    public static string FirstReal { get { lock (gate) return firstReal; } }
+    public static int RealInput { get { return fakeReal && real == 0 ? 1 : real; } }
+    /// <summary>A person has touched George since the watcher started (or the seam says so).</summary>
+    public static bool Touched { get { return real > 0 || fakeReal; } }
+    public static string FirstReal { get { lock (gate) return firstReal != "" ? firstReal : fakeReal ? "PEEL_GUARD_FAKE_REAL" : ""; } }
     public static bool Watching { get { return watcher != null; } }
 
     static void Real(string what) {
@@ -411,6 +440,9 @@ $script:GuiGuardLog = { param($m) }
 $script:GuiGuardWatchdog = $null
 $script:GuiGuardPaused = $null
 $script:GuiGuardPausedFor = $null
+# Arguments for the restart of Daniel's Peel: none. test-gui-guard.ps1 points
+# GuiGuardPaused at a probe and passes it what to write.
+$script:GuiGuardRestartArgs = ''
 $script:GuiLock = $null
 $script:GuiLockPath = 'C:\peel-dev\gui.lock'
 $script:InstalledPeel = Join-Path $env:LOCALAPPDATA 'Peel\app\Peel.exe'
@@ -441,6 +473,21 @@ function Wait-UserIdle([int]$Seconds, [int]$Timeout) {
 
 # The installed Peel holds the single instance mutex, so a test of another
 # Peel.exe pauses it once the drive starts (never during the idle wait).
+# Starts an exe with this process's environment minus every PEEL_* variable.
+# A driver sets PEEL_CLI (a fake engine), PEEL_EXIT_AFTER and PEEL_LOG for the
+# copy under test; Daniel's Peel, started again from the driver, must not get them.
+function Start-CleanProcess([string]$FilePath, [string]$Arguments = '') {
+    $info = New-Object System.Diagnostics.ProcessStartInfo
+    $info.FileName = $FilePath
+    $info.Arguments = $Arguments
+    $info.UseShellExecute = $false
+    $info.WorkingDirectory = Split-Path -Parent $FilePath
+    foreach ($name in @($info.EnvironmentVariables.Keys)) {
+        if ($name -like 'PEEL_*') { $info.EnvironmentVariables.Remove($name) }
+    }
+    return [System.Diagnostics.Process]::Start($info)
+}
+
 function Get-InstalledPeel {
     @(Get-Process -Name Peel -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -ieq $script:InstalledPeel })
 }
@@ -634,8 +681,8 @@ function Stop-GuiGuard {
             Wait-Process -Id $process.Id -Timeout 10 -ErrorAction SilentlyContinue
         }
         if ((Get-InstalledPeel).Count -eq 0) {
-            Start-Process -FilePath $script:GuiGuardPaused
-            $result.Text += '; restarted the installed Peel'
+            $restarted = Start-CleanProcess -FilePath $script:GuiGuardPaused -Arguments $script:GuiGuardRestartArgs
+            $result.Text += "; restarted the installed Peel (pid $($restarted.Id), no PEEL_* variables)"
         }
         Remove-Item (Join-Path ([PeelGuard]::RunDir) 'installed-paused.txt') -ErrorAction SilentlyContinue
         $script:GuiGuardPaused = $null
@@ -676,9 +723,11 @@ function Restore-GuiCursor($position) {
 
 # Takes C:\peel-dev\gui.lock for this runner: created exclusively, held open
 # (others can read it, nobody can delete it), and deleted by Exit-GuiLock. Its
-# text names the holder's pid, so a lock left by a killed runner whose pid is
-# gone is taken over. Waits up to $Timeout seconds for a live holder, then
-# throws (nothing was driven).
+# text names the holder's pid and, one RUN line each, the run folders it gave
+# a driver (Add-GuiLockRun). A lock left by a killed runner whose pid is gone
+# is taken over, but only after Reset-DeadGuiRun has stopped that runner's
+# driver and torn its run down. Waits up to $Timeout seconds for a live
+# holder, then throws (nothing was driven).
 function Enter-GuiLock([int]$Timeout = 1800) {
     if ($script:GuiLock) { return }
     $deadline = (Get-Date).AddSeconds($Timeout)
@@ -697,7 +746,13 @@ function Enter-GuiLock([int]$Timeout = 1800) {
             $holder = try { Get-Content $script:GuiLockPath -Raw -ErrorAction Stop } catch { '' }
             if ($holder -match 'LOCKED by .* pid (\d+) at' -and -not (Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue)) {
                 # A killed runner's lock: its pid is gone, and nobody holds the file open.
-                try { Remove-Item -LiteralPath $script:GuiLockPath -ErrorAction Stop; Write-Host "gui.lock of dead pid $($Matches[1]) removed"; continue } catch { }
+                $deadPid = $Matches[1]
+                try {
+                    Reset-DeadGuiRun $holder
+                    Remove-Item -LiteralPath $script:GuiLockPath -ErrorAction Stop
+                    Write-Host "gui.lock of dead pid $deadPid removed"
+                    continue
+                } catch { Write-Host "gui.lock of dead pid ${deadPid}: not taken over ($($_.Exception.Message))" }
             }
             if ((Get-Date) -gt $deadline) {
                 throw "PEEL_ABORT user busy: $($script:GuiLockPath) is held ($(if ($holder) { $holder.Trim() } else { 'unknown holder' })) for over $Timeout s, so nothing was driven"
@@ -705,6 +760,50 @@ function Enter-GuiLock([int]$Timeout = 1800) {
             if (((Get-Date) - $beat).TotalSeconds -ge 60) { $beat = Get-Date; Write-Host "waiting for gui.lock: $holder" }
             Start-Sleep -Seconds ([Math]::Min(5, [Math]::Max(1, $Timeout)))
         }
+    }
+}
+
+# Notes a run folder in the held lock, so a runner that takes the lock over
+# after this one was killed can find the driver it left (Reset-DeadGuiRun).
+function Add-GuiLockRun([string]$RunDir) {
+    if (-not $script:GuiLock) { return }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes("`r`nRUN $RunDir")
+    $script:GuiLock.Write($bytes, 0, $bytes.Length); $script:GuiLock.Flush()
+}
+
+# Before a dead runner's lock is taken over: for each run folder it names,
+# kill a driver still alive (a powershell started after the lock was taken,
+# so a reused pid is never hit), give its watchdog time to report, then the
+# runner's teardown (Complete-GuiRun: it acts only on a state nobody
+# finished), and start Daniel's Peel again if that run paused it.
+function Reset-DeadGuiRun([string]$Holder) {
+    $since = [datetime]::MinValue
+    if ($Holder -match ' at (\S+)') { try { $since = [datetime]::Parse($Matches[1]) } catch { } }
+    foreach ($line in @($Holder -split "`r?`n" | Where-Object { $_ -match '^RUN (.+)$' })) {
+        $runDir = ($line -replace '^RUN ', '').Trim()
+        if (-not (Test-Path $runDir)) { continue }
+        $pidPath = Join-Path $runDir 'driver.pid'
+        $killed = $false
+        if (Test-Path $pidPath) {
+            $driver = Get-Process -Id ([int](Get-Content $pidPath -Raw)) -ErrorAction SilentlyContinue
+            if ($driver -and $driver.ProcessName -eq 'powershell' -and $driver.StartTime -ge $since) {
+                Stop-Process -Id $driver.Id -Force -ErrorAction SilentlyContinue
+                Wait-Process -Id $driver.Id -Timeout 10 -ErrorAction SilentlyContinue
+                $killed = $true
+                Write-Host "dead runner's driver pid $($driver.Id) killed ($runDir)"
+            }
+        }
+        if ($killed) {
+            $wait = (Get-Date).AddSeconds(15)
+            while (-not (Test-Path (Join-Path $runDir 'teardown-watchdog.json')) -and (Get-Date) -lt $wait) { Start-Sleep -Milliseconds 500 }
+        }
+        [void](Complete-GuiRun -RunDir $runDir -DriverDied $true)
+        $paused = Join-Path $runDir 'installed-paused.txt'
+        if ((Test-Path $paused) -and @(Get-InstalledPeel | Where-Object { $_.SessionId -ne 0 }).Count -eq 0) {
+            Start-InstalledPeelInteractive
+            Write-Host "dead runner's run had paused the installed Peel: started it again"
+        }
+        Remove-Item $paused -ErrorAction SilentlyContinue
     }
 }
 
@@ -839,6 +938,7 @@ function Invoke-GuiTask {
     Remove-Item $ResultPath -ErrorAction SilentlyContinue
     $runDir = Join-Path $Dir ('runs\{0:yyyyMMdd-HHmmss}-{1}' -f (Get-Date), [guid]::NewGuid().ToString('N').Substring(0, 6))
     New-Item -ItemType Directory -Force $runDir | Out-Null
+    Add-GuiLockRun $runDir
     $drivingPath = Join-Path $runDir 'driving.txt'
     $pidPath = Join-Path $runDir 'driver.pid'
     $task = '{0}-{1}' -f $Name, ([guid]::NewGuid().ToString('N').Substring(0, 8))
