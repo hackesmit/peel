@@ -2,7 +2,9 @@
 
 A tar member named ``a/a/.../l`` thousands of folders deep costs memory with
 the square of its depth in the logical tree, so such names are refused before
-they are resolved or registered. On Linux 7-Zip writes a stored folder link
+they are resolved or registered. Names under that cap can still repeat
+long prefixes across many members, so the tree's own size is charged too.
+On Linux 7-Zip writes a stored folder link
 as a real symlink; dropping empty folder links must never follow it and
 remove the real folder it points at.
 """
@@ -97,6 +99,80 @@ def test_safe_target_counts_depth_after_dropping_dots(tmp_path):
 def test_overlong_name_is_refused(tmp_path):
     with pytest.raises(RunnerFailed, match="longer than"):
         archive._safe_target(tmp_path, "n" * (archive.MAX_NAME_CHARS + 1))
+
+
+# --- logical tree size -------------------------------------------------------
+
+
+def _wide_tar(path: Path, members: int) -> Path:
+    """``members`` links, each 256 folders deep with 120-char folder names.
+
+    Every name is under both name caps, but no two share a top folder, so a
+    tree that keeps every prefix holds about 7.8 MB per member.
+    """
+    import gzip
+
+    middle = "/".join(["c" * 120] * (archive.MAX_NAME_DEPTH - 2))
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        for i in range(members):
+            info = tarfile.TarInfo(f"{i}/{middle}/l")
+            info.type = tarfile.SYMTYPE
+            info.linkname = "x"
+            tf.addfile(info)
+    path.write_bytes(gzip.compress(buf.getvalue(), 9))
+    return path
+
+
+def test_many_long_names_are_refused_in_bounded_memory(real, tmp_path):
+    src = _wide_tar(tmp_path / "wide.tar.gz", 50)  # about 6 KB packed
+    tracemalloc.start()
+    try:
+        result = real.run("archive.extract", [src])
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    # Before the tree was charged this archive peaked near 400 MB.
+    assert peak < 128 * (1 << 20), peak
+    assert not result.ok
+    assert result.code == "archive_too_large"
+    assert "too long and too many to index" in result.message
+    assert "Traceback" not in result.message
+
+
+def test_a_few_long_names_still_extract(real, tmp_path):
+    src = _wide_tar(tmp_path / "few.tar.gz", 3)
+    result = real.run("archive.extract", [src])
+    assert result.ok, result.message
+    assert "link to a missing file" in result.message
+
+
+def test_tree_allowance_grows_with_member_count(monkeypatch):
+    monkeypatch.setattr(archive, "TREE_SLACK", 1 << 20)
+    tree = archive._TarTree()
+    skipped: list[str] = []
+    for i in range(50_000):
+        tree.add(f"src/module_{i // 100}/file_{i}.py", "file", skipped)
+    assert tree.size > 4 * archive.TREE_SLACK  # an ordinary index outgrows the slack
+    assert len(tree.children[""]) == 1 and len(tree.children["src"]) == 500
+
+
+def test_tree_registers_each_prefix_once():
+    tree = archive._TarTree()
+    tree.add("a/b/c/f", "file", [])
+    tree.add("a/b/g", "file", [])
+    tree.add_link("a/x/l", "sym", "a/b/g", [])
+    assert tree.children == {"": {"a"}, "a": {"b", "x"}, "a/b": {"c", "g"}, "a/b/c": {"f"}, "a/x": {"l"}}
+    assert tree.kind("a/b") == "dir" and tree.kind("a/x/l") == "sym"
+
+
+def test_tree_refuses_once_past_its_allowance():
+    tree = archive._TarTree()
+    comp = "c" * 120
+    with pytest.raises(archive._TarMetaRefused, match="too many to index"):
+        for i in range(1000):
+            tree.add_link(f"{i}/" + "/".join([comp] * 254) + "/l", "sym", "x", [])
+    assert tree.size <= archive.TREE_SLACK + archive.TREE_PER_MEMBER * tree.members + 2 * archive.MAX_NAME_CHARS + archive.TREE_ENTRY_COST
 
 
 # --- 7-Zip folder links -------------------------------------------------------
