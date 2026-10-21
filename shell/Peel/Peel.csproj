@@ -52,6 +52,9 @@
          wheel actions directly in the logged on session, the same way the unit
          tests drive their cores, so it reaches the internal action classes. -->
     <InternalsVisibleTo Include="Peel.ActionProbe" />
+    <!-- shell\tests\JobLauncher starts an engine the way EngineClient does and
+         is killed mid launch by the unit tests. -->
+    <InternalsVisibleTo Include="Peel.JobLauncher" />
   </ItemGroup>
 
 </Project>

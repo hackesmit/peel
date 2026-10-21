@@ -22,6 +22,7 @@
     <!-- Built alongside so the engine client tests have a real process to
          drive; not referenced as an assembly. -->
     <ProjectReference Include="..\tests\FakeEngine\FakeEngine.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\tests\JobLauncher\JobLauncher.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

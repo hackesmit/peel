@@ -174,8 +174,8 @@ public sealed class ReviewRound3FixTests : IDisposable
         var created = 0;
         var engine = new EngineClient
         {
-            // A job whose handle is already closed: AssignProcessToJobObject
-            // cannot take the process.
+            // A job whose handle is already closed: no process can be born
+            // in it, so none is created (hq-plct.17).
             CreateJob = () =>
             {
                 var job = ProcessJob.Create();
@@ -188,8 +188,7 @@ public sealed class ReviewRound3FixTests : IDisposable
         var result = await engine.RunAsync("x.y", new[] { @"C:\a.txt" });
         Assert.False(result.Ok);
         Assert.Contains("job", result.Message);
-        Assert.NotEqual(0, created);
-        Assert.True(await AllExited(new[] { created }), "the refused engine is still alive");
+        Assert.Equal(0, created);
         Assert.Empty(Pids());
     }
 

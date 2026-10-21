@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Stands in for Peel crashing mid launch: it starts one engine through
+       ContainedProcess and stops for good between CreateProcessW and the
+       resume, so ContainedProcessJobListTests can kill it in that window. It
+       is a test tool and is never installed. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>Peel.JobLauncher</AssemblyName>
+    <RootNamespace>Peel.JobLauncher</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\Peel\Peel.csproj" />
+  </ItemGroup>
+
+</Project>
