@@ -68,7 +68,7 @@ internal partial class TimelineEditor : EditorWindowBase
     private TextBox? _w;
     private TextBox? _h;
     private string _quality = string.Empty;
-    private string? _fieldProblem;
+    private IReadOnlyDictionary<string, string> _problems = new Dictionary<string, string>();
     private bool _writing;
     private bool _playable;
     private bool _playing;
@@ -86,7 +86,7 @@ internal partial class TimelineEditor : EditorWindowBase
         _engine = engine;
         _video = info.HasVideo;
         var kind = KindOf(entry.Id);
-        _plan = new TimelinePlan(kind, info.Duration);
+        _plan = new TimelinePlan(kind, info.LengthFor(kind), kind == TimelineKind.Split ? info.VideoStart : 0);
         if (frame is not null && (entry.Id == "av.video_redact" || entry.Id == "av.video_crop"))
         {
             _region = new RegionPlan(frame.PixelWidth, frame.PixelHeight, covers: entry.Id == "av.video_redact");
@@ -111,6 +111,7 @@ internal partial class TimelineEditor : EditorWindowBase
         _bar.Changed += () =>
         {
             WriteFields();
+            Recheck();
             Describe();
         };
         BuildMarks();
@@ -143,12 +144,12 @@ internal partial class TimelineEditor : EditorWindowBase
 
     protected override IReadOnlyDictionary<string, string>? Collect()
     {
-        if (_fieldProblem is not null)
-        {
-            Hint.Text = _fieldProblem;
-            return null;
-        }
-        var problem = _plan.Problem() ?? _region?.Problem();
+        // Every field again, from what it says now: a field refused earlier
+        // must not leave its last good value to be sent.
+        _problems = TimelineFields.Read(_plan, _region, Texts(), typing: false);
+        _bar.Render();
+        RedrawRegion();
+        var problem = _problems.Values.FirstOrDefault() ?? _plan.Problem() ?? _region?.Problem();
         if (problem is not null)
         {
             Hint.Text = problem;
@@ -436,9 +437,9 @@ internal partial class TimelineEditor : EditorWindowBase
         button.Click += (_, _) =>
         {
             act();
-            _fieldProblem = null;
-            _bar.Render();
             WriteFields();
+            Recheck();
+            _bar.Render();
             Describe();
         };
         MarkPanel.Children.Add(button);
@@ -532,17 +533,16 @@ internal partial class TimelineEditor : EditorWindowBase
         {
             return;
         }
-        _fieldProblem = ReadField((TextBox)sender);
-        _bar.Render();
-        // The other fields follow the plan; the one being typed in does not.
+        // Cuts and an interval are one or the other: typing in one empties
+        // the other.
         _writing = true;
         try
         {
-            if (sender == _cuts && _every is not null && _plan.Every is null)
+            if (sender == _cuts && _every is not null && _cuts.Text.Trim().Length > 0)
             {
                 _every.Text = string.Empty;
             }
-            else if (sender == _every && _cuts is not null && _plan.Every is not null)
+            else if (sender == _every && _cuts is not null && _every.Text.Trim().Length > 0)
             {
                 _cuts.Text = string.Empty;
             }
@@ -551,74 +551,32 @@ internal partial class TimelineEditor : EditorWindowBase
         {
             _writing = false;
         }
+        Recheck();
+        _bar.Render();
         Describe();
     }
 
-    /// <summary>One typed field into the plan. Returns why it was refused, or null.</summary>
-    private string? ReadField(TextBox field)
+    /// <summary>Every field into the plans, as the user is typing.</summary>
+    private void Recheck() => _problems = TimelineFields.Read(_plan, _region, Texts(), typing: true);
+
+    private FieldTexts Texts() => new()
     {
-        var text = field.Text.Trim();
-        if (field == _start || field == _end)
-        {
-            var isStart = field == _start;
-            if (text.Length == 0)
-            {
-                if (_plan.Kind == TimelineKind.Range && (_start!.Text.Trim().Length == 0 && _end!.Text.Trim().Length == 0))
-                {
-                    _plan.ClearRange();
-                    return null;
-                }
-                if (isStart)
-                {
-                    _plan.SetStart(0);
-                }
-                else
-                {
-                    _plan.SetEnd(_plan.Duration);
-                }
-                return null;
-            }
-            if (!Timecode.TryParse(text, out var seconds))
-            {
-                return $"\"{text}\" is not a time. Write 0:03.5 or 3.5.";
-            }
-            if (seconds > _plan.Duration + 0.0005)
-            {
-                return $"{Timecode.Format(seconds)} is past the end of the file ({Timecode.Format(_plan.Duration)}).";
-            }
-            if (isStart)
-            {
-                _plan.SetStart(seconds);
-            }
-            else
-            {
-                _plan.SetEnd(seconds);
-            }
-            return null;
-        }
-        if (field == _every)
-        {
-            if (text.Length == 0)
-            {
-                _plan.SetEvery(null);
-                return null;
-            }
-            if (!Timecode.TryParse(text, out var every) || !_plan.SetEvery(every))
-            {
-                return $"Every has to be a number of seconds from 0.1 to less than {Timecode.Format(_plan.Duration)}.";
-            }
-            return null;
-        }
-        string problem;
-        var ok = field == _cuts ? _plan.TrySetCuts(text, out problem) : _plan.TrySetRanges(text, out problem);
-        return ok ? null : problem;
-    }
+        Start = _start?.Text,
+        End = _end?.Text,
+        Cuts = _cuts?.Text,
+        Every = _every?.Text,
+        Ranges = _ranges?.Text,
+        X = _x?.Text,
+        Y = _y?.Text,
+        W = _w?.Text,
+        H = _h?.Text,
+    };
 
     private void Describe()
     {
-        if (_fieldProblem is not null)
+        if (_problems.Values.FirstOrDefault() is { } problem)
         {
-            Hint.Text = _fieldProblem;
+            Hint.Text = problem;
             return;
         }
         var parts = new List<string>();
@@ -690,8 +648,8 @@ internal partial class TimelineEditor : EditorWindowBase
         if (dragged.Width >= 2 && dragged.Height >= 2)
         {
             _region.Set(Box(_from, to));
-            _fieldProblem = null;
             WriteRegionFields();
+            Recheck();
         }
         RedrawRegion();
         Describe();
@@ -732,12 +690,9 @@ internal partial class TimelineEditor : EditorWindowBase
         {
             return;
         }
-        if (new[] { _x!, _y!, _w!, _h! }.Any(field => field.Text.Trim().Length == 0))
-        {
-            // Half typed: say nothing until all four are there.
-            return;
-        }
-        _fieldProblem = _region.TrySet(_x!.Text, _y!.Text, _w!.Text, _h!.Text, out var problem) ? null : problem;
+        // Half typed is not a mistake yet (TimelineFields says nothing until
+        // all four are there); applying with one missing is.
+        Recheck();
         RedrawRegion();
         Describe();
     }
