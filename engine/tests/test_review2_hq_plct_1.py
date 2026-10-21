@@ -37,7 +37,10 @@ def _action(runner: str = "m:f", mode: str = "each") -> Action:
                   inputs=("txt",), output_ext="txt", runner=runner, mode=mode)
 
 
-def _claim_in_child(src: str, q) -> None:
+def _claim_in_child(src: str, q, barrier) -> None:
+    # Spawned children start at very different times; release all of them
+    # together so the claim race is real instead of mostly serial.
+    barrier.wait(timeout=60)
     path = Job(action=_action(), inputs=[Path(src)]).output_path()
     path.write_text(str(os.getpid()), encoding="utf-8")
     q.put(str(path))
@@ -51,7 +54,9 @@ def test_r2_real_processes_never_share_a_name(tmp_path):
     # module, which works because the child target is a module-level function.
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
-    procs = [ctx.Process(target=_claim_in_child, args=(str(src), q)) for _ in range(16)]
+    barrier = ctx.Barrier(16)
+    procs = [ctx.Process(target=_claim_in_child, args=(str(src), q, barrier))
+             for _ in range(16)]
     for p in procs:
         p.start()
     for p in procs:
