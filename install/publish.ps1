@@ -32,15 +32,19 @@
      settings.json as it was before that run, before anything is deleted.
      Peel starts again if it was running or that run meant to start it.
      If settings.json cannot be put back, the rollback is not finished: the
-     journal and settings.before stay, Peel stays stopped, exit 7, no build.
+     journal and settings.before stay, Peel stays stopped, exit 7, no build,
+     and the start with Windows entry of ours goes (the journal says so) so
+     a log on does not start Peel on the wrong settings; the run that puts
+     settings.json back puts the entry back too.
      A rollback killed before Peel ran again left restart in the journal;
      Peel starts first, and the flag goes only once it runs. With no
      verified pair the candidate stays, still a candidate. Then it drops the
      versions\* that neither pair nor the Run entry uses.
   2. While the installed Peel keeps running: copies the engine source to
      versions\<stamp>\src, builds a new venv at versions\<stamp>\venv (the
-     same pinned modules the current venv has, plus this engine, not
-     editable), checks it with `peel doctor`, and publishes the shell
+     modules the current venv has, then the pinned list in modules.txt,
+     which setup.ps1 installs too, then this engine, not editable), checks
+     it with `peel doctor`, and publishes the shell
      self-contained to versions\<stamp>\app. Nothing the running Peel uses is
      touched yet, so a failure here leaves it as it was. With no venv at all
      (first install) it runs setup.ps1 first for the backends.
@@ -136,8 +140,10 @@ if (-not $StartTask) { $StartTask = if ($peelHome -eq $defaultRoot) { 'PeelStart
 
 $project = Join-Path $Source 'shell\Peel\Peel.csproj'
 $engineSource = Join-Path $Source 'engine'
+$modulesList = Join-Path $here 'modules.txt'
 if (-not $PrebuiltApp -and -not (Test-Path $project)) { throw "no shell project at $project" }
 if (-not $EngineBuilder -and -not (Test-Path (Join-Path $engineSource 'pyproject.toml'))) { throw "no engine at $engineSource" }
+if (-not $EngineBuilder -and -not (Test-Path $modulesList)) { throw "no pinned module list at $modulesList" }
 New-Item -ItemType Directory -Force -Path $peelHome, $versions | Out-Null
 
 # --- one publish at a time ---------------------------------------------------
@@ -206,10 +212,12 @@ function New-Pair([string]$app, [string]$venv) {
 # start: the run that put the candidate in meant to start Peel (not
 # -NoStart). settings: 'saved' (the bytes are in settings.before), 'absent'
 # (there was no settings.json) or $null (nothing to put back). restart: a
-# rollback stopped Peel and it has not been seen running again since.
+# rollback stopped Peel and it has not been seen running again since. run:
+# a rollback that could not put settings.json back dropped the start with
+# Windows entry of ours, so the rollback that finishes puts one back.
 function Read-Journal {
     if (-not (Test-Path $journalPath)) {
-        return [pscustomobject]@{ verified = $null; candidate = $null; start = $false; settings = $null; restart = $false }
+        return [pscustomobject]@{ verified = $null; candidate = $null; start = $false; settings = $null; restart = $false; run = $false }
     }
     return (Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json)
 }
@@ -223,8 +231,8 @@ function Write-Whole([string]$path, [byte[]]$bytes) {
     else { [IO.File]::Move($temp, $path) }
 }
 
-function Write-Journal($verified, $candidate, [bool]$start = $false, $settings = $null, [bool]$restart = $false) {
-    $text = ConvertTo-Json -Depth 3 ([pscustomobject]@{ verified = $verified; candidate = $candidate; start = $start; settings = $settings; restart = $restart })
+function Write-Journal($verified, $candidate, [bool]$start = $false, $settings = $null, [bool]$restart = $false, [bool]$run = $false) {
+    $text = ConvertTo-Json -Depth 3 ([pscustomobject]@{ verified = $verified; candidate = $candidate; start = $start; settings = $settings; restart = $restart; run = $run })
     Write-Whole $journalPath ((New-Object Text.UTF8Encoding $false).GetBytes($text))
 }
 
@@ -283,8 +291,10 @@ function Get-Missing([string]$peelExe) {
     return @(($json | ConvertFrom-Json).missing)
 }
 
-# The new venv gets exactly the modules the current one has (pip freeze,
-# without the engine itself), from the same base Python, then this engine.
+# The new venv gets the modules the current one has (pip freeze, without the
+# engine itself), from the same base Python, then the pinned list in
+# modules.txt (so a module missing from the current venv, or a new pin,
+# arrives now; a pin wins over a frozen version), then this engine.
 function Build-EngineVenv([string]$target, [string]$src, [string]$from) {
     $currentPy = Join-Path $from 'Scripts\python.exe'
     $homeLine = Get-Content (Join-Path $from 'pyvenv.cfg') | Where-Object { $_ -match '^\s*home\s*=' } | Select-Object -First 1
@@ -302,12 +312,15 @@ function Build-EngineVenv([string]$target, [string]$src, [string]$from) {
         Set-Content -LiteralPath $requirements -Encoding Ascii
     Invoke-Native { & $newPy -m pip install --quiet --disable-pip-version-check -r $requirements }
     if ($LASTEXITCODE -ne 0) { throw 'installing the modules into the new venv failed' }
+    Write-Step "installing the pinned modules from $modulesList"
+    Invoke-Native { & $newPy -m pip install --quiet --disable-pip-version-check -r $modulesList }
+    if ($LASTEXITCODE -ne 0) { throw "installing the pinned modules from $modulesList failed" }
     Invoke-Native { & $newPy -m pip install --quiet --disable-pip-version-check --no-deps $src }
     if ($LASTEXITCODE -ne 0) { throw 'installing the engine into the new venv failed' }
 
     $missing = Get-Missing (Join-Path $target 'Scripts\peel.exe')
     if ($missing.Count -gt 0) {
-        throw ("peel doctor on the new engine is not green (" + ($missing -join ', ') + "): run install\setup.ps1, then publish again")
+        throw ("peel doctor on the new engine is not green (" + ($missing -join ', ') + "): run install\setup.ps1 for the external backends, or pin a missing module in install\modules.txt, then publish again")
     }
     Write-Step 'peel doctor: all backends found'
 }
@@ -424,12 +437,14 @@ function Get-RunApp {
 
 # The start with Windows entry names $target, unless Settings turned it off.
 # A settings file it cannot read leaves the entry on or off as it is, and
-# only moves an entry of ours to $target.
-function Set-RunEntry([string]$target) {
+# only moves an entry of ours to $target. $wasOn: an unfinished rollback
+# dropped an entry of ours, which counts as on.
+function Set-RunEntry([string]$target, [bool]$wasOn = $false) {
     $command = '"{0}"' -f $target
     $startWithWindows = Get-StartWithWindows
     if ($null -eq $startWithWindows) {
-        if (Get-RunApp) {
+        if ((Get-RunApp) -or $wasOn) {
+            if (-not (Test-Path $RunKey)) { New-Item -Path $RunKey -Force | Out-Null }
             Set-ItemProperty -Path $RunKey -Name 'Peel' -Value $command
             Write-Step "cannot read startWithWindows from ${SettingsPath}: the start with Windows entry stays on, now $command"
         }
@@ -498,7 +513,7 @@ function Resume-Verified {
         return
     }
     $journal = Read-Journal
-    Write-Journal $journal.verified $journal.candidate $journal.start $journal.settings $false
+    Write-Journal $journal.verified $journal.candidate $journal.start $journal.settings $false ([bool]$journal.run)
 }
 
 # Back to the verified pair: Peel stopped, settings.json as it was before
@@ -508,7 +523,9 @@ function Resume-Verified {
 # is safe to run again, so a run killed in here is finished by the next.
 # settings.json that cannot be put back is a rollback not finished: the
 # journal and settings.before stay, the app does not start (it would run on
-# the candidate's settings), and it returns $false.
+# the candidate's settings), and it returns $false. Log on would start it
+# on them too, so an entry of ours goes (run in the journal) until the
+# rollback finishes and puts it back.
 function Restore-Verified($journal, [bool]$restart) {
     [void](Stop-Installed)
     $settingsBack = $true
@@ -519,11 +536,20 @@ function Restore-Verified($journal, [bool]$restart) {
     }
     Use-Pair $journal.verified
     if (-not $settingsBack) {
-        Write-Journal $journal.verified $journal.candidate $journal.start $journal.settings ($restart -or [bool]$journal.restart)
+        $dropped = [bool]$journal.run
+        if (Get-RunApp) {
+            try {
+                Remove-ItemProperty -Path $RunKey -Name 'Peel'
+                $dropped = $true
+                Write-Step 'no start with Windows entry until the rollback finishes'
+            }
+            catch { Write-Step "cannot drop the start with Windows entry ($($_.Exception.Message))" }
+        }
+        Write-Journal $journal.verified $journal.candidate $journal.start $journal.settings ($restart -or [bool]$journal.restart) $dropped
         Write-Step 'the rollback is not finished, so Peel stays stopped: make settings.json writable and run publish.ps1 again'
         return $false
     }
-    try { Set-RunEntry $exe }
+    try { Set-RunEntry $exe ([bool]$journal.run) }
     catch { Write-Step "cannot move the start with Windows entry back to $exe ($($_.Exception.Message))" }
     Write-Journal $journal.verified $null $false $null $restart
     if ($journal.settings -eq 'saved') { Remove-Quietly $settingsSnapshot }
