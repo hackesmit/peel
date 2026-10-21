@@ -5,7 +5,7 @@
 //
 // The shell still knows no formats. Remapping a wheel is a permutation of the
 // three modifier keys over the engine's own default_modifier names, and a
-// quality preset only fills in a parameter an entry already declares.
+// quality preset only fills in a parameter a Compress entry already declares.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -163,10 +163,12 @@ internal sealed record PeelSettings
 }
 
 /// <summary>
-/// The quality presets. Each fills in a parameter by name, and only for an
-/// entry whose registry params declare that name with a type, range or
-/// choice list that accepts the value, so a preset can never send an engine
-/// action a parameter it does not know or a value it would refuse.
+/// The quality presets. Each fills in a parameter by name, and only for a
+/// Compress entry whose registry params declare that name with a type, range
+/// or choice list that accepts the value, so a preset can never send an engine
+/// action a parameter it does not know or a value it would refuse. Other tools
+/// that happen to declare a quality (video Trim, Crop, Join) keep the engine's
+/// default: the setting is called Compress quality.
 /// </summary>
 internal static class QualityPresets
 {
@@ -202,7 +204,7 @@ internal static class QualityPresets
     internal static IReadOnlyDictionary<string, string> Apply(
         ActionEntry entry, IReadOnlyDictionary<string, string> chosen, string preset)
     {
-        if (!Values.TryGetValue(preset, out var values))
+        if (!IsCompress(entry) || !Values.TryGetValue(preset, out var values))
         {
             return chosen;
         }
@@ -221,6 +223,18 @@ internal static class QualityPresets
             }
         }
         return merged ?? chosen;
+    }
+
+    /// <summary>
+    /// True for a Compress tool: the action part of the registry id (after the
+    /// family's dot) is "compress" or ends in "_compress", as in image.compress,
+    /// av.video_compress and av.audio_compress. The id is the stable key; the
+    /// label is display text.
+    /// </summary>
+    internal static bool IsCompress(ActionEntry entry)
+    {
+        var action = entry.Id[(entry.Id.LastIndexOf('.') + 1)..];
+        return action == "compress" || action.EndsWith("_compress", StringComparison.Ordinal);
     }
 
     /// <summary>
