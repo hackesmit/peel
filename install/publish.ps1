@@ -22,15 +22,21 @@
   While a candidate is unverified, the start with Windows entry names the
   verified pair's own Peel.exe (versions\<stamp>\app\Peel.exe), so a log on
   before the next run starts the verified app, not the candidate. It names
-  app\Peel.exe again once a build is verified or rolled back.
+  app\Peel.exe again once a build is verified or rolled back. With no
+  verified pair at all (a first install not seen to run yet) there is no
+  entry of ours until one is.
 
   1. Recovers first: a candidate left by an earlier run (killed in the middle
      of the switch or in the watch window, -NoStart, or nobody signed in)
      goes back to the verified pair, both junctions together, with
      settings.json as it was before that run, before anything is deleted.
      Peel starts again if it was running or that run meant to start it.
-     With no verified pair the candidate stays, still a candidate. Then it
-     drops the versions\* that neither pair nor the Run entry uses.
+     If settings.json cannot be put back, the rollback is not finished: the
+     journal and settings.before stay, Peel stays stopped, exit 7, no build.
+     A rollback killed before Peel ran again left restart in the journal;
+     Peel starts first, and the flag goes only once it runs. With no
+     verified pair the candidate stays, still a candidate. Then it drops the
+     versions\* that neither pair nor the Run entry uses.
   2. While the installed Peel keeps running: copies the engine source to
      versions\<stamp>\src, builds a new venv at versions\<stamp>\venv (the
      same pinned modules the current venv has, plus this engine, not
@@ -50,7 +56,8 @@
      -StaySeconds (10). Up the whole time: the candidate becomes the verified
      pair and the older versions go. Quit, never showed up, or the start
      itself failed: it stops the new build, puts settings.json back as it
-     was, points app and venv at the verified pair, starts it and exits 6. If
+     was, points app and venv at the verified pair, starts it and exits 6
+     (exit 7, Peel stopped, if settings.json cannot be put back). If
      nobody is signed in it cannot tell, so it exits 3 and the next run goes
      back to the verified pair before it installs.
 
@@ -64,8 +71,9 @@
   Exit codes: 0 installed and running (or -NoStart); 3 installed, not
   verified (nobody signed in); 4 the new build did not stay up and there was
   no previous build to go back to; 5 another publish runs on this install
-  root; 6 the new build did not stay up and the previous one is back;
-  anything else (an error before the switch) leaves the installed Peel as it
+  root; 6 the new build did not stay up and the previous one is back; 7 a
+  rollback could not put settings.json back, so Peel stays stopped until a
+  run can; anything else (an error before the switch) leaves the installed Peel as it
   was.
 
 .PARAMETER Source
@@ -86,7 +94,8 @@
   of the pip build and doctor check. StartTask names the scheduled task that
   starts Peel from session 0. The environment variable
   PEEL_PUBLISH_TEST_DIE=mid-switch kills the run after app is switched and
-  before venv is, as a crash there would.
+  before venv is, as a crash there would; =before-restart kills it after a
+  rollback and before Peel starts again.
 #>
 [CmdletBinding()]
 param(
@@ -196,10 +205,11 @@ function New-Pair([string]$app, [string]$venv) {
 
 # start: the run that put the candidate in meant to start Peel (not
 # -NoStart). settings: 'saved' (the bytes are in settings.before), 'absent'
-# (there was no settings.json) or $null (nothing to put back).
+# (there was no settings.json) or $null (nothing to put back). restart: a
+# rollback stopped Peel and it has not been seen running again since.
 function Read-Journal {
     if (-not (Test-Path $journalPath)) {
-        return [pscustomobject]@{ verified = $null; candidate = $null; start = $false; settings = $null }
+        return [pscustomobject]@{ verified = $null; candidate = $null; start = $false; settings = $null; restart = $false }
     }
     return (Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json)
 }
@@ -213,8 +223,8 @@ function Write-Whole([string]$path, [byte[]]$bytes) {
     else { [IO.File]::Move($temp, $path) }
 }
 
-function Write-Journal($verified, $candidate, [bool]$start = $false, $settings = $null) {
-    $text = ConvertTo-Json -Depth 3 ([pscustomobject]@{ verified = $verified; candidate = $candidate; start = $start; settings = $settings })
+function Write-Journal($verified, $candidate, [bool]$start = $false, $settings = $null, [bool]$restart = $false) {
+    $text = ConvertTo-Json -Depth 3 ([pscustomobject]@{ verified = $verified; candidate = $candidate; start = $start; settings = $settings; restart = $restart })
     Write-Whole $journalPath ((New-Object Text.UTF8Encoding $false).GetBytes($text))
 }
 
@@ -436,6 +446,15 @@ function Set-RunEntry([string]$target) {
     }
 }
 
+# With no verified pair there is nothing log on should start: an entry of
+# ours goes until a build is verified (someone else's entry stays).
+function Remove-RunEntry {
+    if (Get-RunApp) {
+        Remove-ItemProperty -Path $RunKey -Name 'Peel'
+        Write-Step 'no build verified yet: no start with Windows entry until one is'
+    }
+}
+
 # The new build may rewrite settings.json as it starts; a rollback puts the
 # bytes back, or removes a file that was not there. The bytes go to disk
 # before the switch so the next run has them if this one is killed.
@@ -468,21 +487,50 @@ function Invoke-Start {
     }
 }
 
+# Starts the verified pair a rollback stopped. The journal's restart flag
+# goes only once it runs, so a run killed before that, or a start that
+# fails, leaves it for the next run.
+function Resume-Verified {
+    if ($env:PEEL_PUBLISH_TEST_DIE -eq 'before-restart') { [Environment]::Exit(9) }
+    $result = if ((Get-Installed).Count -gt 0) { 0 } else { Invoke-Start }
+    if ($result -ne 0) {
+        Write-Step 'the verified Peel is not running yet; the next run starts it'
+        return
+    }
+    $journal = Read-Journal
+    Write-Journal $journal.verified $journal.candidate $journal.start $journal.settings $false
+}
+
 # Back to the verified pair: Peel stopped, settings.json as it was before
 # the candidate, both junctions on the verified pair, the Run entry on
-# app\Peel.exe, the journal says so, then the candidate goes if it can. Each
-# step is safe to run again, so a run killed in here is finished by the next.
-function Restore-Verified($journal) {
+# app\Peel.exe, the journal says so (with restart if Peel is to run again),
+# then the candidate goes if it can, then Peel starts if $restart. Each step
+# is safe to run again, so a run killed in here is finished by the next.
+# settings.json that cannot be put back is a rollback not finished: the
+# journal and settings.before stay, the app does not start (it would run on
+# the candidate's settings), and it returns $false.
+function Restore-Verified($journal, [bool]$restart) {
     [void](Stop-Installed)
+    $settingsBack = $true
     try { Restore-Settings $journal.settings }
-    catch { Write-Step "cannot put settings.json back ($($_.Exception.Message)); the saved copy stays at $settingsSnapshot" }
+    catch {
+        Write-Step "cannot put settings.json back ($($_.Exception.Message)); the saved copy stays at $settingsSnapshot"
+        $settingsBack = $false
+    }
     Use-Pair $journal.verified
+    if (-not $settingsBack) {
+        Write-Journal $journal.verified $journal.candidate $journal.start $journal.settings ($restart -or [bool]$journal.restart)
+        Write-Step 'the rollback is not finished, so Peel stays stopped: make settings.json writable and run publish.ps1 again'
+        return $false
+    }
     try { Set-RunEntry $exe }
     catch { Write-Step "cannot move the start with Windows entry back to $exe ($($_.Exception.Message))" }
-    Write-Journal $journal.verified $null
+    Write-Journal $journal.verified $null $false $null $restart
     if ($journal.settings -eq 'saved') { Remove-Quietly $settingsSnapshot }
     if ($journal.candidate) { Remove-Quietly (Split-Path -Parent $journal.candidate.app) }
     Write-Step "the verified app and engine are back ($($journal.verified.app))"
+    if ($restart) { Resume-Verified }
+    return $true
 }
 
 # --- recover -----------------------------------------------------------------
@@ -490,20 +538,26 @@ function Restore-Verified($journal) {
 # the switch (app and venv may be from different pairs) or in the watch
 # window, ran with -NoStart, or found nobody signed in. Go back to the
 # verified pair, both junctions together, before anything is deleted, and
-# start it if Peel runs now or that run meant to start it (a run killed after
-# it stopped Peel). With no verified pair the candidate is all there is: its
-# junctions go together, and it stays a candidate, since nothing saw it run.
+# start it if Peel runs now, that run meant to start it (a run killed after
+# it stopped Peel) or a restart is pending. With no verified pair the
+# candidate is all there is: its junctions go together, and it stays a
+# candidate, since nothing saw it run. A rollback that cannot put
+# settings.json back stops here (exit 7) before any build. A restart left
+# pending by a rollback (killed before Peel ran again) happens first too.
 $journal = Read-Journal
 if ($journal.candidate) {
     if ($journal.verified) {
         Write-Step 'an earlier run left a build that was never verified: going back to the verified pair first'
         $wasUp = (Get-Installed).Count -gt 0
-        Restore-Verified $journal
-        if ($wasUp -or $journal.start) { [void](Invoke-Start) }
+        if (-not (Restore-Verified $journal ($wasUp -or $journal.start -or $journal.restart))) { exit 7 }
     }
     else {
         Use-Pair $journal.candidate
     }
+}
+elseif ($journal.restart) {
+    Write-Step 'an earlier rollback stopped Peel and did not start it again: starting it first'
+    Resume-Verified
 }
 Remove-Unused
 
@@ -578,12 +632,13 @@ if ($others.Count -gt 0) {
 $candidate = New-Pair $versionApp $versionVenv
 $verified = $null
 try {
-    $verified = (Read-Journal).verified
+    $before = Read-Journal
+    $verified = $before.verified
     if (-not $verified -and -not (Test-Path $journalPath)) {
         $verified = Get-CurrentPair (Join-Path $versions "$(Split-Path -Leaf $version)-previous")
     }
     $settingsSaved = Save-Settings
-    Write-Journal $verified $candidate (-not $NoStart) $settingsSaved
+    Write-Journal $verified $candidate (-not $NoStart) $settingsSaved ([bool]$before.restart)
 }
 catch {
     # Nothing has switched: the installed pair is as it was, so it starts again.
@@ -596,8 +651,9 @@ catch {
 $switched = $false
 try {
     if ($verified) { Use-Pair $verified }
-    # Log on starts the verified build until this one is seen to stay up.
-    Set-RunEntry $(if ($verified) { Join-Path $verified.app 'Peel.exe' } else { $exe })
+    # Log on starts the verified build until this one is seen to stay up, and
+    # nothing at all while no build has been.
+    if ($verified) { Set-RunEntry (Join-Path $verified.app 'Peel.exe') } else { Remove-RunEntry }
     # First install: the venv setup.ps1 made was only the template.
     if ((Test-Path $venv) -and -not (Test-Link $venv)) { Move-WithRetry $venv (Join-Path $version 'template-venv') }
     Set-Link $app $versionApp
@@ -625,8 +681,7 @@ if ($result -ne 0) {
         exit 4
     }
     Write-Step 'the new build did not stay up: going back to the verified pair'
-    Restore-Verified (Read-Journal)
-    if ($wasRunning -or $switched) { [void](Invoke-Start) }
+    if (-not (Restore-Verified (Read-Journal) ($wasRunning -or $switched))) { exit 7 }
     exit 6
 }
 
