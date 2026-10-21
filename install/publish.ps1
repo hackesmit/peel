@@ -32,7 +32,10 @@
      settings.json as it was before that run, before anything is deleted.
      Peel starts again if it was running or that run meant to start it.
      If settings.json cannot be put back, the rollback is not finished: the
-     journal and settings.before stay, Peel stays stopped, exit 7, no build.
+     journal and settings.before stay, Peel stays stopped, exit 7, no build,
+     and the start with Windows entry of ours goes (the journal says so) so
+     a log on does not start Peel on the wrong settings; the run that puts
+     settings.json back puts the entry back too.
      A rollback killed before Peel ran again left restart in the journal;
      Peel starts first, and the flag goes only once it runs. With no
      verified pair the candidate stays, still a candidate. Then it drops the
@@ -209,10 +212,12 @@ function New-Pair([string]$app, [string]$venv) {
 # start: the run that put the candidate in meant to start Peel (not
 # -NoStart). settings: 'saved' (the bytes are in settings.before), 'absent'
 # (there was no settings.json) or $null (nothing to put back). restart: a
-# rollback stopped Peel and it has not been seen running again since.
+# rollback stopped Peel and it has not been seen running again since. run:
+# a rollback that could not put settings.json back dropped the start with
+# Windows entry of ours, so the rollback that finishes puts one back.
 function Read-Journal {
     if (-not (Test-Path $journalPath)) {
-        return [pscustomobject]@{ verified = $null; candidate = $null; start = $false; settings = $null; restart = $false }
+        return [pscustomobject]@{ verified = $null; candidate = $null; start = $false; settings = $null; restart = $false; run = $false }
     }
     return (Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json)
 }
@@ -226,8 +231,8 @@ function Write-Whole([string]$path, [byte[]]$bytes) {
     else { [IO.File]::Move($temp, $path) }
 }
 
-function Write-Journal($verified, $candidate, [bool]$start = $false, $settings = $null, [bool]$restart = $false) {
-    $text = ConvertTo-Json -Depth 3 ([pscustomobject]@{ verified = $verified; candidate = $candidate; start = $start; settings = $settings; restart = $restart })
+function Write-Journal($verified, $candidate, [bool]$start = $false, $settings = $null, [bool]$restart = $false, [bool]$run = $false) {
+    $text = ConvertTo-Json -Depth 3 ([pscustomobject]@{ verified = $verified; candidate = $candidate; start = $start; settings = $settings; restart = $restart; run = $run })
     Write-Whole $journalPath ((New-Object Text.UTF8Encoding $false).GetBytes($text))
 }
 
@@ -432,12 +437,14 @@ function Get-RunApp {
 
 # The start with Windows entry names $target, unless Settings turned it off.
 # A settings file it cannot read leaves the entry on or off as it is, and
-# only moves an entry of ours to $target.
-function Set-RunEntry([string]$target) {
+# only moves an entry of ours to $target. $wasOn: an unfinished rollback
+# dropped an entry of ours, which counts as on.
+function Set-RunEntry([string]$target, [bool]$wasOn = $false) {
     $command = '"{0}"' -f $target
     $startWithWindows = Get-StartWithWindows
     if ($null -eq $startWithWindows) {
-        if (Get-RunApp) {
+        if ((Get-RunApp) -or $wasOn) {
+            if (-not (Test-Path $RunKey)) { New-Item -Path $RunKey -Force | Out-Null }
             Set-ItemProperty -Path $RunKey -Name 'Peel' -Value $command
             Write-Step "cannot read startWithWindows from ${SettingsPath}: the start with Windows entry stays on, now $command"
         }
@@ -506,7 +513,7 @@ function Resume-Verified {
         return
     }
     $journal = Read-Journal
-    Write-Journal $journal.verified $journal.candidate $journal.start $journal.settings $false
+    Write-Journal $journal.verified $journal.candidate $journal.start $journal.settings $false ([bool]$journal.run)
 }
 
 # Back to the verified pair: Peel stopped, settings.json as it was before
@@ -516,7 +523,9 @@ function Resume-Verified {
 # is safe to run again, so a run killed in here is finished by the next.
 # settings.json that cannot be put back is a rollback not finished: the
 # journal and settings.before stay, the app does not start (it would run on
-# the candidate's settings), and it returns $false.
+# the candidate's settings), and it returns $false. Log on would start it
+# on them too, so an entry of ours goes (run in the journal) until the
+# rollback finishes and puts it back.
 function Restore-Verified($journal, [bool]$restart) {
     [void](Stop-Installed)
     $settingsBack = $true
@@ -527,11 +536,20 @@ function Restore-Verified($journal, [bool]$restart) {
     }
     Use-Pair $journal.verified
     if (-not $settingsBack) {
-        Write-Journal $journal.verified $journal.candidate $journal.start $journal.settings ($restart -or [bool]$journal.restart)
+        $dropped = [bool]$journal.run
+        if (Get-RunApp) {
+            try {
+                Remove-ItemProperty -Path $RunKey -Name 'Peel'
+                $dropped = $true
+                Write-Step 'no start with Windows entry until the rollback finishes'
+            }
+            catch { Write-Step "cannot drop the start with Windows entry ($($_.Exception.Message))" }
+        }
+        Write-Journal $journal.verified $journal.candidate $journal.start $journal.settings ($restart -or [bool]$journal.restart) $dropped
         Write-Step 'the rollback is not finished, so Peel stays stopped: make settings.json writable and run publish.ps1 again'
         return $false
     }
-    try { Set-RunEntry $exe }
+    try { Set-RunEntry $exe ([bool]$journal.run) }
     catch { Write-Step "cannot move the start with Windows entry back to $exe ($($_.Exception.Message))" }
     Write-Journal $journal.verified $null $false $null $restart
     if ($journal.settings -eq 'saved') { Remove-Quietly $settingsSnapshot }
