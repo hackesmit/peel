@@ -9,8 +9,8 @@
 // False means "not now", not "failed": see IEditorHost.
 //
 // An entry this host does not recognise keeps the old behaviour (a toast
-// saying the editor is not built), which is what the video, audio and PDF
-// editors still get until their own bead lands.
+// saying the editor is not built). The video, audio and PDF windows register
+// through MediaEditors and PageEditors, which say which ids they handle.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -18,6 +18,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Threading;
 using Peel.Editors.Image;
+using Peel.Editors.Pages;
+using Peel.Editors.Timeline;
 using Peel.Engine;
 using Peel.Jobs;
 
@@ -44,7 +46,8 @@ internal sealed class EditorHost : IEditorHost
 
     /// <summary>The entries this host has a window for.</summary>
     internal static bool Knows(string id) => id is
-        "image.crop" or "image.edit" or "image.annotate" or "image.redact" or "image.metadata";
+        "image.crop" or "image.edit" or "image.annotate" or "image.redact" or "image.metadata"
+        || MediaEditors.Handles(id) || PageEditors.Handles(id);
 
     public bool TryCollectParams(ActionEntry entry, IReadOnlyList<string> files, out Dictionary<string, string> parameters)
     {
@@ -89,8 +92,21 @@ internal sealed class EditorHost : IEditorHost
             };
             waiting.Start();
             PreviewSource? preview = null;
+            FileStamp? stamp = null;
             EditorWindowBase? window;
-            if (entry.Id == "image.metadata")
+            if (MediaEditors.Handles(entry.Id) || PageEditors.Handles(entry.Id))
+            {
+                stamp = FileStamp.Of(files[0]);
+                (window, var problem) = MediaEditors.Handles(entry.Id)
+                    ? await MediaEditors.OpenAsync(entry, files[0], schema, _engine).ConfigureAwait(true)
+                    : await PageEditors.OpenAsync(entry, files[0], schema, _engine).ConfigureAwait(true);
+                if (window is null)
+                {
+                    Log.Write($"{entry.Id}: no editor for {files[0]}: {problem}");
+                    _jobs.Report(problem);
+                }
+            }
+            else if (entry.Id == "image.metadata")
             {
                 window = await MetadataWindowAsync(entry, files, schema).ConfigureAwait(true);
             }
@@ -118,6 +134,12 @@ internal sealed class EditorHost : IEditorHost
                 {
                     Log.Write($"{entry.Id}: refused, {files[0]} changed since its preview was decoded");
                     _jobs.Report(problem);
+                    return;
+                }
+                if (stamp is not null && !stamp.StillMatches(files[0], out var changed))
+                {
+                    Log.Write($"{entry.Id}: refused, {files[0]} changed since the editor opened");
+                    _jobs.Report(changed);
                     return;
                 }
                 _jobs.Start(entry, files, collected);
