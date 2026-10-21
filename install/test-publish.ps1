@@ -22,14 +22,19 @@
   failed first install must leave no Run value of ours, a rollback killed
   before Peel starts again must leave the restart to the next run, and a
   rollback that cannot put a read only settings.json back must keep the
-  journal and settings.before, exit 7 and leave Peel stopped. Nothing moves the mouse or the
+  journal and settings.before, exit 7 and leave Peel stopped. With
+  -RealEngine (hq-plct.28) it also runs publish.ps1's real pip build once,
+  with -NoStart, from a scratch venv that lacks openpyxl: the new venv must
+  have every module in modules.txt and a green peel doctor. That one needs
+  the backends setup.ps1 installs and pip's network or cache, and takes a
+  few minutes. Nothing moves the mouse or the
   keyboard; the stand in starts in the signed in session through a scheduled
   task, so someone has to be signed in at George.
 
-  ssh george "powershell -NoProfile -ExecutionPolicy Bypass -File C:\peel-dev\<branch>\install\test-publish.ps1"
+  ssh george "powershell -NoProfile -ExecutionPolicy Bypass -File C:\peel-dev\<branch>\install\test-publish.ps1 [-RealEngine]"
 #>
 [CmdletBinding()]
-param()
+param([switch]$RealEngine)
 
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -471,6 +476,42 @@ try {
     Check 'start with Windows off exits 0' ($code -eq 0) "(exit $code)"
     $value = (Get-ItemProperty -Path $runKey -Name Peel -ErrorAction SilentlyContinue).Peel
     Check 'start with Windows off removes the Run value' ($null -eq $value) $value
+
+    # 14 the real pip build: a current venv that lacks a pinned module gets
+    # it in the new venv (hq-plct.28). Its own root, so the cases above keep
+    # theirs; -NoStart, since the stand in app has no engine to talk to.
+    if ($RealEngine) {
+        $realRoot = Join-Path $scratch 'real'
+        $realVenv = Join-Path $realRoot 'venv'
+        $realPy = Join-Path $realVenv 'Scripts\python.exe'
+        $ErrorActionPreference = 'Continue'
+        & py -3 -m venv $realVenv *> (Join-Path $scratch 'real-venv.log')
+        $lacking = Join-Path $scratch 'modules-without-openpyxl.txt'
+        Get-Content (Join-Path $here 'modules.txt') | Where-Object { $_ -notmatch '^\s*openpyxl\b' } | Set-Content -LiteralPath $lacking -Encoding Ascii
+        & $realPy -m pip install --quiet --disable-pip-version-check -r $lacking *> (Join-Path $scratch 'real-pip.log')
+        & $realPy -m pip install --quiet --disable-pip-version-check (Join-Path (Split-Path -Parent $here) 'engine') *>> (Join-Path $scratch 'real-pip.log')
+        $templateMissing = @((& (Join-Path $realVenv 'Scripts\peel.exe') doctor | Out-String | ConvertFrom-Json).missing)
+        Check 'the real template venv lacks openpyxl' ($templateMissing -contains 'openpyxl') ($templateMissing -join ', ')
+
+        $log = Join-Path $scratch 'publish-real.log'
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'publish.ps1') -InstallRoot $realRoot `
+            -SettingsPath $settings -RunKey $runKey -PrebuiltApp (Join-Path $builds 'good1') -NoStart *> $log
+        $code = $LASTEXITCODE
+        Get-Content $log | Where-Object { $_ -match 'peel-publish' } | ForEach-Object { Write-Host "     $_" }
+        Check 'the real publish exits 0' ($code -eq 0) "(exit $code)"
+        Check 'the real publish switches venv to a junction' (Test-IsLink $realVenv)
+        $newPy = Join-Path $realVenv 'Scripts\python.exe'
+        $frozen = @(& $newPy -m pip freeze --disable-pip-version-check 2> $null)
+        $pins = @(Get-Content (Join-Path $here 'modules.txt') | Where-Object { $_ -match '^[A-Za-z]' } | ForEach-Object { $_.Trim().ToLowerInvariant() -replace '_', '-' })
+        $have = @($frozen | ForEach-Object { $_.Trim().ToLowerInvariant() -replace '_', '-' })
+        $absent = @($pins | Where-Object { $have -notcontains $_ })
+        Check 'the real publish installs every pinned module at its pin' ($absent.Count -eq 0) ($absent -join ', ')
+        $newMissing = @((& (Join-Path $realVenv 'Scripts\peel.exe') doctor | Out-String | ConvertFrom-Json).missing)
+        Check 'the real publish leaves peel doctor green' ($newMissing.Count -eq 0) ($newMissing -join ', ')
+        $ErrorActionPreference = 'Stop'
+        if (Test-IsLink $realVenv) { [IO.Directory]::Delete($realVenv, $false) }
+        if (Test-IsLink (Join-Path $realRoot 'app')) { [IO.Directory]::Delete((Join-Path $realRoot 'app'), $false) }
+    }
 }
 finally {
     Stop-Scratch 'Peel'

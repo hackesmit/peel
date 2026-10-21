@@ -39,8 +39,9 @@
      versions\* that neither pair nor the Run entry uses.
   2. While the installed Peel keeps running: copies the engine source to
      versions\<stamp>\src, builds a new venv at versions\<stamp>\venv (the
-     same pinned modules the current venv has, plus this engine, not
-     editable), checks it with `peel doctor`, and publishes the shell
+     modules the current venv has, then the pinned list in modules.txt,
+     which setup.ps1 installs too, then this engine, not editable), checks
+     it with `peel doctor`, and publishes the shell
      self-contained to versions\<stamp>\app. Nothing the running Peel uses is
      touched yet, so a failure here leaves it as it was. With no venv at all
      (first install) it runs setup.ps1 first for the backends.
@@ -136,8 +137,10 @@ if (-not $StartTask) { $StartTask = if ($peelHome -eq $defaultRoot) { 'PeelStart
 
 $project = Join-Path $Source 'shell\Peel\Peel.csproj'
 $engineSource = Join-Path $Source 'engine'
+$modulesList = Join-Path $here 'modules.txt'
 if (-not $PrebuiltApp -and -not (Test-Path $project)) { throw "no shell project at $project" }
 if (-not $EngineBuilder -and -not (Test-Path (Join-Path $engineSource 'pyproject.toml'))) { throw "no engine at $engineSource" }
+if (-not $EngineBuilder -and -not (Test-Path $modulesList)) { throw "no pinned module list at $modulesList" }
 New-Item -ItemType Directory -Force -Path $peelHome, $versions | Out-Null
 
 # --- one publish at a time ---------------------------------------------------
@@ -283,8 +286,10 @@ function Get-Missing([string]$peelExe) {
     return @(($json | ConvertFrom-Json).missing)
 }
 
-# The new venv gets exactly the modules the current one has (pip freeze,
-# without the engine itself), from the same base Python, then this engine.
+# The new venv gets the modules the current one has (pip freeze, without the
+# engine itself), from the same base Python, then the pinned list in
+# modules.txt (so a module missing from the current venv, or a new pin,
+# arrives now; a pin wins over a frozen version), then this engine.
 function Build-EngineVenv([string]$target, [string]$src, [string]$from) {
     $currentPy = Join-Path $from 'Scripts\python.exe'
     $homeLine = Get-Content (Join-Path $from 'pyvenv.cfg') | Where-Object { $_ -match '^\s*home\s*=' } | Select-Object -First 1
@@ -302,12 +307,15 @@ function Build-EngineVenv([string]$target, [string]$src, [string]$from) {
         Set-Content -LiteralPath $requirements -Encoding Ascii
     Invoke-Native { & $newPy -m pip install --quiet --disable-pip-version-check -r $requirements }
     if ($LASTEXITCODE -ne 0) { throw 'installing the modules into the new venv failed' }
+    Write-Step "installing the pinned modules from $modulesList"
+    Invoke-Native { & $newPy -m pip install --quiet --disable-pip-version-check -r $modulesList }
+    if ($LASTEXITCODE -ne 0) { throw "installing the pinned modules from $modulesList failed" }
     Invoke-Native { & $newPy -m pip install --quiet --disable-pip-version-check --no-deps $src }
     if ($LASTEXITCODE -ne 0) { throw 'installing the engine into the new venv failed' }
 
     $missing = Get-Missing (Join-Path $target 'Scripts\peel.exe')
     if ($missing.Count -gt 0) {
-        throw ("peel doctor on the new engine is not green (" + ($missing -join ', ') + "): run install\setup.ps1, then publish again")
+        throw ("peel doctor on the new engine is not green (" + ($missing -join ', ') + "): run install\setup.ps1 for the external backends, or pin a missing module in install\modules.txt, then publish again")
     }
     Write-Step 'peel doctor: all backends found'
 }

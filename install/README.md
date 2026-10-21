@@ -38,8 +38,9 @@ without a prompt.
 | .NET 8 SDK | `Microsoft.DotNet.SDK.8` | builds the WPF shell (shell bead) |
 
 Python module backends (`pillow`, `pillow-heif`, `pymupdf` 1.26.x, `pdf2docx`,
-`openpyxl`, `python-pptx`, `python-docx`, all pinned in setup.ps1) and
-`pytest` are installed into the venv with pip, not winget.
+`openpyxl`, `python-pptx`, `python-docx`) and `pytest` are installed into
+the venv with pip, not winget. They are pinned in `modules.txt`, which
+setup.ps1 and publish.ps1 both read.
 
 libvips ships as a winget portable package. winget normally exposes `vips` via
 `%LOCALAPPDATA%\Microsoft\WinGet\Links`; only when that link is missing does
@@ -63,8 +64,9 @@ exactly as it is: no pip upgrade, no editable engine, no module installs. It
 still installs the winget backends, writes the shim and runs `peel doctor`.
 `-RecreateVenv` on a junction refuses (exit 1); run `publish.ps1` instead,
 which builds a fresh pair. A Python module backend missing from the published
-venv is not fixed by `setup.ps1` (publish copies the modules of the current
-venv) until hq-plct.28 makes publish install the pinned module list.
+venv comes back with the next `publish.ps1`: it installs the modules of the
+current venv and then everything in `modules.txt` (a pin wins over the
+frozen version).
 
 `test-setup.ps1` checks this against a scratch root (`-InstallRoot`) whose
 venv is a junction to a stand in venv: a plain `-SkipWinget` run and a
@@ -88,10 +90,12 @@ second exits 5. See its header for the steps and exit codes.
 `test-publish.ps1` runs it against a scratch root in %TEMP% with a stand in
 Peel.exe and checks each case, plus the loose JSON reader in `LooseJson.ps1`.
 It needs someone signed in at George, and it never touches the installed
-Peel:
+Peel. `-RealEngine` adds one run of the real pip build (`-NoStart`) from a
+scratch venv without openpyxl, and checks that the new venv has every pin in
+`modules.txt` and a green `peel doctor`; it takes a few minutes:
 
 ```
-ssh george "powershell -NoProfile -ExecutionPolicy Bypass -File C:\peel-dev\<branch>\install\test-publish.ps1"
+ssh george "powershell -NoProfile -ExecutionPolicy Bypass -File C:\peel-dev\<branch>\install\test-publish.ps1 -RealEngine"
 ```
 
 ## Python version
