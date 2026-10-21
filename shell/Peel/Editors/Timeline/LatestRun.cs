@@ -6,6 +6,10 @@
 // decoding frames nobody would see. Run cancels the ask before it (the engine
 // client kills that engine), waits for it to end, and only then starts; an ask
 // overtaken while it waits never starts at all.
+//
+// "Latest" is the order the asks came in, read under the lock, not whether a
+// run has been cancelled yet: a newer ask publishes itself first and cancels
+// the older one a moment later, and in that gap the older run can end.
 using System;
 using System.Threading;
 using System.Threading.Tasks;
@@ -25,6 +29,12 @@ internal sealed class LatestRun
 
     /// <summary>The most runs that were ever going at once.</summary>
     internal int Peak => Volatile.Read(ref _peak);
+
+    /// <summary>
+    /// Test seam: called on the asking thread after an ask is published as the
+    /// latest and before it cancels the one before it.
+    /// </summary>
+    internal Action? Published { get; set; }
 
     /// <summary>
     /// Cancel the run before this one, wait for it to end, then run
@@ -48,6 +58,7 @@ internal sealed class LatestRun
         }
         try
         {
+            Published?.Invoke();
             // Outside the lock: a cancelled run may end inline, right here.
             overtaken?.Cancel();
             // Each run completes its own task in finally, so this never throws.
@@ -55,12 +66,17 @@ internal sealed class LatestRun
             // The overtaken run has ended, and only this ask still holds its
             // source (it left _current under the lock above).
             overtaken?.Dispose();
-            if (mine.IsCancellationRequested)
+            lock (_gate)
             {
-                return (false, false, default);
+                // A newer ask may be published and not have cancelled this
+                // one yet: it is still overtaken, so it never starts.
+                if (!IsLatest(mine))
+                {
+                    return (false, false, default);
+                }
+                var now = Interlocked.Increment(ref _active);
+                InterlockedMax(ref _peak, now);
             }
-            var now = Interlocked.Increment(ref _active);
-            InterlockedMax(ref _peak, now);
             T value;
             try
             {
@@ -70,7 +86,12 @@ internal sealed class LatestRun
             {
                 Interlocked.Decrement(ref _active);
             }
-            return (true, !mine.IsCancellationRequested, value);
+            bool latest;
+            lock (_gate)
+            {
+                latest = IsLatest(mine);
+            }
+            return (true, latest, value);
         }
         finally
         {
@@ -88,6 +109,10 @@ internal sealed class LatestRun
             done.SetResult();
         }
     }
+
+    // Call under _gate.
+    private bool IsLatest(CancellationTokenSource mine) =>
+        ReferenceEquals(_current, mine) && !mine.IsCancellationRequested;
 
     private static void InterlockedMax(ref int target, int value)
     {
