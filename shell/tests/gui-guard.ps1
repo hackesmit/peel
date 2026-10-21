@@ -209,9 +209,14 @@ function Wait-UserIdle([int]$Seconds, [int]$Timeout) {
     $started = Get-Date
     $deadline = $started.AddSeconds($Timeout)
     Write-GuiGuardLog ("waiting for $Seconds s of user idle (idle now {0:0} s)" -f ([PeelGuard]::IdleMs() / 1000))
+    $beat = $started
     while ([PeelGuard]::IdleMs() -lt ($Seconds * 1000)) {
         if ((Get-Date) -gt $deadline) {
             throw "PEEL_ABORT user busy: no $Seconds s of user idle within $Timeout s, so nothing was driven"
+        }
+        if (((Get-Date) - $beat).TotalSeconds -ge 60) {
+            $beat = Get-Date
+            Write-GuiGuardLog ("still waiting: idle {0:0} s" -f ([PeelGuard]::IdleMs() / 1000))
         }
         Start-Sleep -Seconds 5
     }
@@ -388,7 +393,9 @@ function Invoke-GuiTask {
     $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
     $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel $RunLevel
     $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds ($IdleTimeout + $TimeoutSeconds + 300))
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $Arguments
+    # Hidden: a console window on Daniel's desktop gets closed (which kills
+    # the driver mid drag) and can sit over the windows the driver aims at.
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-WindowStyle Hidden ' + $Arguments)
     $timedOut = $false
     $vanished = $false
     $teardown = $null
@@ -397,23 +404,42 @@ function Invoke-GuiTask {
         Start-ScheduledTask -TaskName $task
         $deadline = (Get-Date).AddSeconds($IdleTimeout + 120)
         $driving = $false
+        $driver = 0
+        $missing = 0
         do {
             Start-Sleep -Seconds 3
             if (-not $driving -and (Test-Path $drivingPath)) {
                 $driving = $true
                 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
             }
-            $found = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
-            $state = if ($found) { [string]$found.State } else { 'Missing' }
+            if (-not $driver -and (Test-Path $pidPath)) { $driver = [int](Get-Content $pidPath -Raw) }
+            # Once the driver has told us its pid, its process is the truth:
+            # a task can be deleted by someone else, and Get-ScheduledTask can
+            # fail for a moment, while the driver is still driving.
+            if ($driver) {
+                $state = if (Get-Process -Id $driver -ErrorAction SilentlyContinue) { 'Running' } else { 'Ended' }
+            }
+            else {
+                $found = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+                $state = if ($found) { [string]$found.State } else { 'Missing' }
+                if ($state -eq 'Missing' -and ++$missing -lt 3) { $state = 'Running' }
+                if ($state -eq 'Queued') { $state = 'Running' }
+            }
         } while ($state -eq 'Running' -and (Get-Date) -lt $deadline)
         if ($state -eq 'Running') {
             Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+            if ($driver) { Stop-Process -Id $driver -Force -ErrorAction SilentlyContinue }
             $timedOut = $true
             Write-Host "TIMEOUT after $TimeoutSeconds seconds of driving"
         }
         elseif ($state -eq 'Missing') {
             $vanished = $true
-            Write-Host "the scheduled task $task disappeared while it ran"
+            Write-Host "the scheduled task $task disappeared before its driver started"
+        }
+        elseif (-not (Test-Path $ResultPath)) {
+            $info = Get-ScheduledTaskInfo -TaskName $task -ErrorAction SilentlyContinue
+            $last = if ($info) { '0x{0:x8}' -f [uint32]$info.LastTaskResult } else { 'unknown (the task is gone)' }
+            Write-Host "the driver (pid $driver) ended with no result: task $task last result $last"
         }
     }
     finally {
