@@ -11,9 +11,12 @@
 //      mangles (or fails on) non ASCII file names.
 //
 // Every engine process runs in a kill on close job object of its own
-// (Jobs/ProcessJob.cs). It is created suspended and resumed only once it is in
-// the job and registered for KillAll (Jobs/ContainedProcess.cs); if either
-// fails, the engine is not run and the call returns an error. The timeout
+// (Jobs/ProcessJob.cs). It is created suspended inside the job and resumed
+// only once it is registered for KillAll (Jobs/ContainedProcess.cs); if either
+// fails, the engine is not run and the call returns an error. A call that is
+// cancelled, or a Peel that is quitting, is checked twice: before the process
+// is created and again just before it would resume, so a cancelled action
+// never runs a line of the engine. The timeout
 // covers the process exit and the draining of both pipes, because a backend
 // the engine started can inherit the pipes and keep them open after the
 // engine has exited; on expiry the whole job is terminated, which closes the
@@ -571,6 +574,11 @@ internal sealed class EngineClient
         };
 
         var watch = Stopwatch.StartNew();
+        if (_closed || token.IsCancellationRequested)
+        {
+            // Nothing created yet, so nothing to end.
+            return (string.Empty, _closed ? "Peel is quitting." : "The Peel engine was cancelled.", null);
+        }
         var job = CreateJob();
         if (job is null)
         {
@@ -588,10 +596,13 @@ internal sealed class EngineClient
             {
                 // Owned before it runs: from here KillAll reaches it.
                 _live[job] = 0;
-                if (_closed)
+                if (_closed || _shutdown.IsCancellationRequested)
                 {
                     throw new OperationCanceledException("Peel is quitting.");
                 }
+                // Cancelled while suspended: end it here instead of resuming
+                // it only to kill it.
+                token.ThrowIfCancellationRequested();
             });
         }
         catch (Exception error)
@@ -600,7 +611,8 @@ internal sealed class EngineClient
             job.Dispose();
             if (error is OperationCanceledException)
             {
-                return (string.Empty, "Peel is quitting.", null);
+                Log.Write($"engine {what} not resumed: {(_closed ? "Peel is quitting" : "cancelled")}");
+                return (string.Empty, _closed ? "Peel is quitting." : "The Peel engine was cancelled.", null);
             }
             Log.Write($"cannot start the engine at {location.FileName}", error);
             return (string.Empty, $"Cannot start the Peel engine ({location.Description}): {error.Message}", null);

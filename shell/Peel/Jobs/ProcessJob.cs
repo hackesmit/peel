@@ -9,9 +9,10 @@
 //   * Peel is killed or crashes: Windows closes the handle and the kill on
 //     close limit ends the tree.
 //
-// The process is created suspended and assigned before its first thread runs
-// (ContainedProcess), so every child it ever starts is in the job too. If
-// Windows refuses the job or the assignment, the engine is not run at all.
+// The process is created inside the job (PROC_THREAD_ATTRIBUTE_JOB_LIST) and
+// suspended (ContainedProcess), so there is no moment it exists outside the
+// job and every child it ever starts is in the job too. If Windows refuses the
+// job or the attribute, the engine is not run at all.
 using System;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -46,20 +47,26 @@ internal sealed class ProcessJob : IDisposable
         return new ProcessJob(handle);
     }
 
-    /// <summary>Put a (suspended) process in the job. False if Windows refused.</summary>
-    internal bool Assign(IntPtr process, int processId)
+    /// <summary>
+    /// The job handle, for PROC_THREAD_ATTRIBUTE_JOB_LIST; IntPtr.Zero once
+    /// disposed. Only valid until Dispose, which the caller orders after the
+    /// process creation that uses it.
+    /// </summary>
+    internal IntPtr Handle => _handle;
+
+    /// <summary>True if <paramref name="process"/> is in this job; false if not, or if Windows cannot say.</summary>
+    internal bool Contains(IntPtr process)
     {
         var handle = _handle;
         if (handle == IntPtr.Zero)
         {
-            Log.Write($"cannot put engine pid {processId} in its job: the job is closed");
             return false;
         }
-        if (Native.AssignProcessToJobObject(handle, process))
+        if (Native.IsProcessInJob(process, handle, out var inJob))
         {
-            return true;
+            return inJob;
         }
-        Log.Write($"cannot put engine pid {processId} in its job, error {Marshal.GetLastWin32Error()}");
+        Log.Write($"cannot ask whether a process is in its job, error {Marshal.GetLastWin32Error()}");
         return false;
     }
 
