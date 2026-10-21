@@ -10,6 +10,8 @@ session (session 1) and puts Daniel's installed Peel back if this run dies.
 Before the first input it waits until George has had no user input for
 -IdleSeconds (default 300, GetLastInputInfo), so it never moves the mouse
 under someone who is using the machine, and gives up after -IdleTimeout.
+Once it drives, a person's input aborts the run as 'user input', and its
+finally (or its watchdog, or run-timeline.ps1) ends any drag: gui-guard.ps1.
 Then it pauses the installed Peel (its single instance mutex would make the
 test copy exit at once) and starts it again at the end, without this run's
 PEEL_* variables.
@@ -60,6 +62,7 @@ $resultPath = Join-Path $Dir 'result.json'
 $pausedMarker = Join-Path $Dir 'installed-paused.txt'
 $installedApp = Join-Path $env:LOCALAPPDATA 'Peel\app\Peel.exe'
 $checks = [System.Collections.ArrayList]::new()
+$script:GuiAbort = $null
 $shots = [System.Collections.ArrayList]::new()
 $script:cursor = @(0, 0)
 
@@ -87,6 +90,7 @@ function WaitLog($pattern, $timeoutMs, $atLeast = 1) {
     while ((Get-Date) -lt $deadline) {
         $found = [regex]::Matches((PeelLog), $pattern)
         if ($found.Count -ge $atLeast) { return $found[$found.Count - 1] }
+        Assert-NoUserInput
         Start-Sleep -Milliseconds 100
     }
     return $null
@@ -96,19 +100,12 @@ Add-Type -AssemblyName System.Drawing, System.Windows.Forms, UIAutomationClient,
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class InTl {
-  [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
-  [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
   [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint f, UIntPtr e);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
   [DllImport("user32.dll")] public static extern uint GetDoubleClickTime();
-  public static uint IdleMs() {
-    var info = new LASTINPUTINFO(); info.cbSize = 8;
-    GetLastInputInfo(ref info);
-    return (uint)Environment.TickCount - info.dwTime;
-  }
   // SetCursorPos does not reach a low level hook. Absolute SendInput moves do.
   public static void Move(int x, int y) {
     int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77), vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
@@ -124,6 +121,8 @@ public static class InTl {
 }
 '@
 [void][InTl]::SetProcessDPIAware()
+# Idle wait, real input abort, and the teardown that ends any drag.
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
 
 $VkCtrl = [byte]0xA2
 $VkEsc = [byte]0x1B
@@ -131,6 +130,7 @@ $UIA = [System.Windows.Automation.AutomationElement]
 $Tree = [System.Windows.Automation.TreeScope]
 
 function MoveTo($x, $y) {
+    Assert-NoUserInput
     [InTl]::Move([int]$x, [int]$y)
     $script:cursor = @([int]$x, [int]$y)
 }
@@ -393,18 +393,6 @@ function WaitJob($id, $before, $seconds = 90) {
     return (WaitLog "job end $([regex]::Escape($id)) ok=True" ($seconds * 1000) ($before + 1))
 }
 
-function WaitForIdle() {
-    $deadline = (Get-Date).AddSeconds($IdleTimeout)
-    $started = Get-Date
-    while ([InTl]::IdleMs() -lt ($IdleSeconds * 1000)) {
-        if ((Get-Date) -gt $deadline) {
-            throw "George was in use: no $IdleSeconds s of user idle within $IdleTimeout s, so nothing was driven"
-        }
-        Start-Sleep -Seconds 10
-    }
-    L ("George idle for {0:0} s after waiting {1:0} s" -f ([InTl]::IdleMs() / 1000), ((Get-Date) - $started).TotalSeconds)
-}
-
 $peelProcess = $null
 $paused = $false
 $originalCursor = [System.Windows.Forms.Cursor]::Position
@@ -422,7 +410,7 @@ try {
         Check "the engine offers the $($pair[0]) editors" ($offered.Count -eq $pair[1]) ($offered -join ',')
     }
 
-    WaitForIdle
+    Start-GuiGuard -Dir $Dir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
     $originalCursor = [System.Windows.Forms.Cursor]::Position
 
     # Daniel's Peel holds the single instance mutex; pause it for the run.
@@ -736,10 +724,12 @@ try {
     Check 'every editor opened from the wheel' ((CountLog ': editor open') -ge 10) "$(CountLog ': editor open') editor windows opened"
 }
 catch {
-    Check 'driver completed' $false "$_"
+    $script:GuiAbort = Get-GuiAbort $_
+    if ($script:GuiAbort) { L "ABORTED: $_" } else { Check 'driver completed' $false "$_" }
 }
 finally {
-    try { [InTl]::Up() } catch { }
+    # First: end any drag and let go of every button and key (gui-guard.ps1).
+    try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
     [System.Windows.Forms.Cursor]::Position = $originalCursor
     if ($peelProcess) {
         # Its editor windows go with it.
@@ -756,7 +746,7 @@ finally {
         Remove-Item $pausedMarker -ErrorAction SilentlyContinue
     }
     $failed = @($checks | Where-Object { -not $_.ok })
-    [pscustomobject]@{ ok = ($failed.Count -eq 0); checks = $checks; shots = $shots; log = $peelLog } |
+    [pscustomobject]@{ ok = ($failed.Count -eq 0 -and -not $script:GuiAbort); aborted = $script:GuiAbort; checks = $checks; shots = $shots; log = $peelLog } |
         ConvertTo-Json -Depth 4 | Set-Content $resultPath -Encoding UTF8
     L ("done, {0} of {1} checks passed" -f ($checks.Count - $failed.Count), $checks.Count)
     if ($failed.Count -gt 0) { exit 1 }

@@ -27,7 +27,11 @@ param(
     [string]$Peel = "$env:LOCALAPPDATA\Peel\venv\Scripts\peel.exe",
     [string]$Source = 'sample.txt',
     [string]$Segment = 'MD',
-    [string]$Expect = 'sample.md'
+    [string]$Expect = 'sample.md',
+    # gui-guard.ps1: wait for this much user idle before driving (0 when a
+    # caller that already waited and drove runs this, as smoke.ps1 does).
+    [int]$IdleSeconds = 300,
+    [int]$IdleTimeout = 1800
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,6 +42,7 @@ $shot = Join-Path $Dir 'shot-wheel.png'
 $resultPath = Join-Path $Dir 'result.json'
 $checks = [System.Collections.ArrayList]::new()
 $script:cursor = @(0, 0)
+$script:GuiAbort = $null
 
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Remove-Item $driveLog, $peelLog, $shot, $resultPath -ErrorAction SilentlyContinue
@@ -67,6 +72,7 @@ function WaitLog($pattern, $timeoutMs, $atLeast = 1) {
     while ((Get-Date) -lt $deadline) {
         $found = [regex]::Matches((PeelLog), $pattern)
         if ($found.Count -ge $atLeast) { return $found[$found.Count - 1] }
+        Assert-NoUserInput
         Start-Sleep -Milliseconds 100
     }
     return $null
@@ -98,11 +104,14 @@ public static class In {
 }
 '@
 [void][In]::SetProcessDPIAware()
+# Idle wait, real input abort, and the teardown that ends any drag.
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
 
 $modifierKeys = @{ 'Shift' = [byte]0xA0; 'Ctrl' = [byte]0xA2; 'Alt' = [byte]0xA4 }
 $VkEsc = [byte]0x1B
 
 function MoveTo($x, $y) {
+    Assert-NoUserInput
     [In]::Move([int]$x, [int]$y)
     $script:cursor = @([int]$x, [int]$y)
 }
@@ -206,6 +215,9 @@ try {
     $bound = @{}
     foreach ($wheel in $registry.wheels) { $bound[[string]$wheel.default_modifier] = [string]$wheel.family }
     L "registry wheels: $(($bound.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ')"
+
+    Start-GuiGuard -Dir $Dir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    $originalCursor = [System.Windows.Forms.Cursor]::Position
 
     $env:PEEL_LOG = $peelLog
     $env:PEEL_EXIT_AFTER = '240'
@@ -370,17 +382,21 @@ try {
     Check 'no unhandled exceptions' (-not ($text -match 'unhandled')) 'log has no unhandled exception'
 }
 catch {
-    Check 'driver completed' $false "$_"
+    $script:GuiAbort = Get-GuiAbort $_
+    if ($script:GuiAbort) { L "ABORTED: $_" } else { Check 'driver completed' $false "$_" }
 }
 finally {
+    # First: end any drag and let go of every button and key (gui-guard.ps1).
+    try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
     try { L ("end: " + (Close-ShareSheets).Text) } catch { L "end: share sheet check failed: $_" }
     [System.Windows.Forms.Cursor]::Position = $originalCursor
     if ($peelProcess) { Stop-Process -Id $peelProcess.Id -ErrorAction SilentlyContinue }
     CloseTestExplorer
     $failed = @($checks | Where-Object { -not $_.ok })
     $summary = [pscustomobject]@{
-        ok     = ($failed.Count -eq 0)
-        checks = $checks
+        ok      = ($failed.Count -eq 0 -and -not $script:GuiAbort)
+        aborted = $script:GuiAbort
+        checks  = $checks
         log    = $peelLog
         shot   = $shot
         when   = (Get-Date).ToString('o')

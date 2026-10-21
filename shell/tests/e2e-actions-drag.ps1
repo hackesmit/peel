@@ -26,7 +26,10 @@ param(
     # so the installed engine may not have them yet; point both the app (via
     # PEEL_CLI) and this script's own `peel options` read at the dev engine.
     [string]$Engine,
-    [string]$Source = 'sample.txt'
+    [string]$Source = 'sample.txt',
+    # gui-guard.ps1: user idle to wait for before driving, and how long to wait.
+    [int]$IdleSeconds = 300,
+    [int]$IdleTimeout = 1800
 )
 if (-not $Engine) { $Engine = "$env:LOCALAPPDATA\Peel\venv\Scripts\peel.exe" }
 $Peel = $Engine
@@ -39,6 +42,7 @@ $shareShot = Join-Path $Dir 'shot-share.png'
 $resultPath = Join-Path $Dir 'result.json'
 $checks = [System.Collections.ArrayList]::new()
 $script:cursor = @(0, 0)
+$script:GuiAbort = $null
 
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Remove-Item $driveLog, $peelLog, $shareShot, $resultPath -ErrorAction SilentlyContinue
@@ -68,6 +72,7 @@ function WaitLog($pattern, $timeoutMs, $atLeast = 1) {
     while ((Get-Date) -lt $deadline) {
         $found = [regex]::Matches((PeelLog), $pattern)
         if ($found.Count -ge $atLeast) { return $found[$found.Count - 1] }
+        Assert-NoUserInput
         Start-Sleep -Milliseconds 100
     }
     return $null
@@ -98,11 +103,14 @@ public static class In {
 }
 '@
 [void][In]::SetProcessDPIAware()
+# Idle wait, real input abort, and the teardown that ends any drag.
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
 
 $VkAlt = [byte]0xA4
 $VkEsc = [byte]0x1B
 
 function MoveTo($x, $y) {
+    Assert-NoUserInput
     [In]::Move([int]$x, [int]$y)
     $script:cursor = @([int]$x, [int]$y)
 }
@@ -226,6 +234,8 @@ try {
     Check 'engine has an action wheel' ($actionWheel -ne $null) "default_modifier: $($actionWheel.default_modifier)"
     Check 'the action wheel opens on Alt' ($actionWheel.default_modifier -eq 'Alt') "$($actionWheel.default_modifier)"
 
+    Start-GuiGuard -Dir $Dir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+
     $env:PEEL_LOG = $peelLog
     $env:PEEL_EXIT_AFTER = '240'
     # The app inherits this and uses the dev engine, which has the five new
@@ -295,9 +305,12 @@ try {
     }
 }
 catch {
-    Check 'driver completed without throwing' $false "$_"
+    $script:GuiAbort = Get-GuiAbort $_
+    if ($script:GuiAbort) { L "ABORTED: $_" } else { Check 'driver completed without throwing' $false "$_" }
 }
 finally {
+    # First: end any drag and let go of every button and key (gui-guard.ps1).
+    try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
     if ($peelProcess) {
         try { Stop-Process -Id $peelProcess.Id -Force -ErrorAction SilentlyContinue } catch { }
     }
@@ -313,7 +326,7 @@ finally {
     # Leave the clipboard clean: the Copy scenario put files on it.
     try { [System.Windows.Forms.Clipboard]::Clear() } catch { }
     $allOk = -not ($checks | Where-Object { -not $_.ok })
-    $result = [pscustomobject]@{ ok = [bool]$allOk; checks = $checks }
+    $result = [pscustomobject]@{ ok = ([bool]$allOk -and -not $script:GuiAbort); aborted = $script:GuiAbort; checks = $checks }
     $result | ConvertTo-Json -Depth 5 | Set-Content -Path $resultPath -Encoding UTF8
     L ("done, ok=$allOk")
 }
