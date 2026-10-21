@@ -1,14 +1,9 @@
-$task = 'PeelReview5f8a'
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f (Join-Path $PSScriptRoot 'review-keyboard-gui.ps1'))
-$me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Force | Out-Null
-try {
-  Start-ScheduledTask -TaskName $task
-  $deadline = (Get-Date).AddSeconds(300)
-  do { Start-Sleep 3; $s = (Get-ScheduledTask -TaskName $task).State } while ($s -eq 'Running' -and (Get-Date) -lt $deadline)
-  if ($s -eq 'Running') { Stop-ScheduledTask -TaskName $task; 'TIMEOUT' }
-} finally { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue }
+# A unique task, the idle wait first, and a teardown of any drag if the
+# driver is killed or dies before its own finally (gui-guard.ps1).
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
+$dir = 'C:\peel-dev\review-5f8a-gui'
+$run = Invoke-GuiTask -Name 'PeelReview5f8a' -Dir $dir -ResultPath (Join-Path $dir 'drive.log') -TimeoutSeconds 300 `
+    -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -Dir "{1}"' -f (Join-Path $PSScriptRoot 'review-keyboard-gui.ps1'), $dir)
 Get-Process Peel -ErrorAction SilentlyContinue | Select-Object Id, Path
 $drive = 'C:\peel-dev\review-5f8a-gui\drive.log'
 if (Test-Path $drive) { Get-Content $drive | Where-Object { $_ -match 'CHECK |DRIVER ERROR' } }

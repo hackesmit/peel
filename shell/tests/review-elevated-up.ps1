@@ -16,7 +16,10 @@ Attack:   drag from Explorer, release over an elevated Notepad, then tap Shift
 #>
 param(
     [string]$Dir = 'C:\peel-dev\review-e2e',
-    [string]$Source = 'sample.txt'
+    [string]$Source = 'sample.txt',
+    # gui-guard.ps1: user idle to wait for before driving, and how long to wait.
+    [int]$IdleSeconds = 300,
+    [int]$IdleTimeout = 1800
 )
 
 $ErrorActionPreference = 'Stop'
@@ -66,8 +69,10 @@ public static class In {
 }
 '@
 [void][In]::SetProcessDPIAware()
+# Idle wait, real input abort, and the teardown that ends any drag.
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
 
-function MoveTo($x, $y) { [In]::Move([int]$x, [int]$y); $script:cursor = @([int]$x, [int]$y) }
+function MoveTo($x, $y) { Assert-NoUserInput; [In]::Move([int]$x, [int]$y); $script:cursor = @([int]$x, [int]$y) }
 function GlideTo($x, $y, $steps = 10) {
     $from = $script:cursor
     for ($i = 1; $i -le $steps; $i++) {
@@ -111,6 +116,7 @@ function DragFromItem() {
 $notepad = $null
 $originalCursor = [System.Windows.Forms.Cursor]::Position
 try {
+    Start-GuiGuard -Dir $Dir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
     New-Item -ItemType Directory -Force $test | Out-Null
     Set-Content -Path (Join-Path $test $Source) -Value 'x' -Encoding UTF8
     $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
@@ -180,6 +186,8 @@ catch {
     Check 'driver finished' $false $_.Exception.Message
 }
 finally {
+    # First: end any drag and let go of every button and key (gui-guard.ps1).
+    try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
     try { if ($notepad -and -not $notepad.HasExited) { $notepad.Kill() } } catch { }
     CloseTestExplorer
     [void][In]::SetCursorPos($originalCursor.X, $originalCursor.Y)

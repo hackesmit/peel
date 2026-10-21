@@ -21,6 +21,19 @@ editors: each image editor, opened from the tools wheel by a real drag, driven
 keyboard: the keyboard path. Select a file in Explorer, press the global hotkey
          (Ctrl+Alt+Enter), drive the highlight with the arrow keys, press Enter,
          and the engine writes the file. No drag, no mouse past the first click.
+abort-fail, abort-kill: the GUI guard itself (gui-guard.ps1, e2e-drag-abort.ps1).
+         A real Explorer drag is held and then the driver throws (fail) or is
+         killed by this runner after -TimeoutSeconds of driving (kill, use a
+         short one such as 20). Passes only when no SysDragImage window and no
+         held button is left, with a screenshot after the teardown.
+
+Every driver waits for -IdleSeconds of user idle (GetLastInputInfo, default
+300) before it touches the mouse, and gives up after -IdleTimeout. Once it
+drives, any input without the injected flag (a person) aborts it: RESULT
+ABORTED (user input), exit 3, which is not a test failure. -TimeoutSeconds
+counts from the moment the driver starts to drive (driving.txt). Whatever
+happens, the driver's finally, its watchdog, or this runner ends the drag
+(gui-guard.ps1). Take C:\peel-dev\gui.lock first.
 
 Daniel has to be logged in at the console. If the session is locked, Explorer
 may not be visible to UI Automation, and the run reports that rather than
@@ -28,7 +41,7 @@ guessing.
 #>
 param(
     [string]$Root = (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)),
-    [ValidateSet('drag', 'render', 'editors', 'keyboard')]
+    [ValidateSet('drag', 'render', 'editors', 'keyboard', 'abort-fail', 'abort-kill')]
     [string]$Test = 'drag',
     [string]$Source = 'sample.txt',
     [string]$Segment = 'MD',
@@ -36,7 +49,9 @@ param(
     [int]$TimeoutSeconds = 900,
     # editors only: the peel.exe to test against, when the installed engine is
     # older than the branch. The python beside it runs the pixel checks.
-    [string]$Engine = ''
+    [string]$Engine = '',
+    [int]$IdleSeconds = 300,
+    [int]$IdleTimeout = 1800
 )
 
 $ErrorActionPreference = 'Stop'
@@ -44,8 +59,10 @@ $ErrorActionPreference = 'Stop'
 # the first folder alphabetically: a dev copy that still holds an old
 # net8.0-windows build would otherwise launch that stale exe silently.
 . (Join-Path $PSScriptRoot 'e2e-hygiene.ps1')
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
 $app = Find-PeelApp $Root
-if (-not $app) { throw "build the shell first (dotnet build -c Release): no Peel.exe under shell\Peel\bin\Release\net8.0-windows*" }
+# The abort proofs drag in Explorer only; every other test needs the shell.
+if (-not $app -and $Test -notlike 'abort-*') { throw "build the shell first (dotnet build -c Release): no Peel.exe under shell\Peel\bin\Release\net8.0-windows*" }
 
 if ($Test -eq 'drag') {
     $script = Join-Path $Root 'shell\tests\e2e-drag.ps1'
@@ -64,6 +81,11 @@ elseif ($Test -eq 'keyboard') {
     $dir = 'C:\peel-dev\e2e-keyboard'
     $arguments = '-Dir "{0}" -App "{1}" -Source "{2}" -Segment "{3}" -Expect "{4}"' -f $dir, $app, $Source, $Segment, $Expect
 }
+elseif ($Test -like 'abort-*') {
+    $script = Join-Path $Root 'shell\tests\e2e-drag-abort.ps1'
+    $dir = 'C:\peel-dev\e2e-abort'
+    $arguments = '-Dir "{0}" -Mode {1}' -f $dir, ($Test -replace '^abort-', '')
+}
 else {
     $script = Join-Path $Root 'shell\tests\e2e-wheel-render.ps1'
     $dir = 'C:\peel-dev\e2e-render'
@@ -77,37 +99,36 @@ else {
     $arguments = '-Dir "{0}" -App "{1}" -Fake "{2}" -Options "{3}"' -f $dir, $app, $fake, $options
 }
 if (-not (Test-Path $script)) { throw "driver not found: $script" }
+$arguments += ' -IdleSeconds {0} -IdleTimeout {1}' -f $IdleSeconds, $IdleTimeout
 
-$taskName = 'PeelE2E'
 $resultPath = Join-Path $dir 'result.json'
 New-Item -ItemType Directory -Force $dir | Out-Null
 Remove-Item $resultPath -ErrorAction SilentlyContinue
 
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f $script, $arguments)
-# $env:USERDOMAIN is WORKGROUP on George, which is not an account domain.
-$me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
-try {
-    Start-ScheduledTask -TaskName $taskName
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    do {
-        Start-Sleep -Seconds 3
-        $state = (Get-ScheduledTask -TaskName $taskName).State
-    } while ($state -eq 'Running' -and (Get-Date) -lt $deadline)
-    if ($state -eq 'Running') {
-        Stop-ScheduledTask -TaskName $taskName
-        Write-Output "TIMEOUT after $TimeoutSeconds seconds"
-    }
-}
-finally {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-}
+# Runs the driver in the desktop session and ends its drag whatever happens:
+# the driver's finally, its watchdog, or a teardown from here (gui-guard.ps1).
+$run = Invoke-GuiTask -Name 'PeelE2E' -Dir $dir -ResultPath $resultPath -TimeoutSeconds $TimeoutSeconds -IdleTimeout $IdleTimeout `
+    -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f $script, $arguments)
+$timedOut = $run.TimedOut
+$teardown = $run.Teardown
 
 $driveLog = Join-Path $dir 'drive.log'
 if (Test-Path $driveLog) {
     Write-Output '--- drive.log ---'
     Get-Content $driveLog | Select-Object -Last 40
+}
+if ($Test -eq 'abort-kill') {
+    # The run under test is the kill: no result.json is expected, the drag
+    # image and the button must be gone after the watchdog and the runner.
+    $mid = Join-Path $dir 'shot-mid-drag.png'
+    $ok = $timedOut -and (Test-Path (Join-Path $dir 'holding.txt')) -and (Test-Path $mid) -and $teardown -and $teardown.dragImagesLeft -eq 0 -and -not $teardown.stillDown
+    Write-Output '--- checks ---'
+    Write-Output ("{0} the driver was killed while it held the drag: timed out {1}, holding.txt {2}, {3}" -f $(if ($timedOut -and (Test-Path $mid)) { 'PASS' } else { 'FAIL' }), $timedOut, (Test-Path (Join-Path $dir 'holding.txt')), $mid)
+    if ($teardown) {
+        Write-Output ("{0} no drag image and no button left after the kill: images left {1}, still down '{2}', screenshot {3}" -f $(if ($ok) { 'PASS' } else { 'FAIL' }), $teardown.dragImagesLeft, $teardown.stillDown, $teardown.shot)
+    }
+    Write-Output ("RESULT: {0}" -f $(if ($ok) { 'PASS' } else { 'FAIL' }))
+    if ($ok) { exit 0 } else { exit 1 }
 }
 if (-not (Test-Path $resultPath)) {
     Write-Output 'RESULT: no result.json, the driver did not finish'
@@ -117,6 +138,10 @@ $result = Get-Content $resultPath -Raw | ConvertFrom-Json
 Write-Output '--- checks ---'
 foreach ($check in $result.checks) {
     Write-Output ("{0} {1}: {2}" -f $(if ($check.ok) { 'PASS' } else { 'FAIL' }), $check.name, $check.detail)
+}
+if ($result.aborted) {
+    Write-Output "RESULT: ABORTED ($($result.aborted)), not a test failure: run it again when George is idle"
+    exit 3
 }
 Write-Output ("RESULT: {0}" -f $(if ($result.ok) { 'PASS' } else { 'FAIL' }))
 if (-not $result.ok) { exit 1 }

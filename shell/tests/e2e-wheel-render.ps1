@@ -13,7 +13,10 @@ param(
     [string]$Dir = 'C:\peel-dev\e2e-render',
     [string]$App = 'C:\peel-dev\peel-4500-hq-plct-7\shell\Peel\bin\Release\net8.0-windows\Peel.exe',
     [string]$Fake = 'C:\peel-dev\peel-4500-hq-plct-7\shell\tests\FakeEngine\bin\Release\net8.0\FakeEngine.exe',
-    [string]$Options = 'C:\peel-dev\peel-4500-hq-plct-7\shell\tests\fake-options.json'
+    [string]$Options = 'C:\peel-dev\peel-4500-hq-plct-7\shell\tests\fake-options.json',
+    # gui-guard.ps1: user idle to wait for before driving, and how long to wait.
+    [int]$IdleSeconds = 300,
+    [int]$IdleTimeout = 1800
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,6 +26,7 @@ $peelLog = Join-Path $Dir 'peel.log'
 $resultPath = Join-Path $Dir 'result.json'
 $checks = [System.Collections.ArrayList]::new()
 $script:cursor = @(0, 0)
+$script:GuiAbort = $null
 
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Remove-Item (Join-Path $Dir '*.png'), $driveLog, $peelLog, $resultPath -ErrorAction SilentlyContinue
@@ -43,6 +47,7 @@ function WaitLog($pattern, $timeoutMs, $atLeast = 1) {
     while ((Get-Date) -lt $deadline) {
         $found = [regex]::Matches((PeelLog), $pattern)
         if ($found.Count -ge $atLeast) { return $found[$found.Count - 1] }
+        Assert-NoUserInput
         Start-Sleep -Milliseconds 100
     }
     return $null
@@ -70,8 +75,10 @@ public static class In2 {
 }
 '@
 [void][In2]::SetProcessDPIAware()
+# Idle wait, real input abort, and the teardown that ends any drag.
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
 
-function MoveTo($x, $y) { [In2]::Move([int]$x, [int]$y); $script:cursor = @([int]$x, [int]$y) }
+function MoveTo($x, $y) { Assert-NoUserInput; [In2]::Move([int]$x, [int]$y); $script:cursor = @([int]$x, [int]$y) }
 function Jiggle($times = 4) {
     for ($i = 1; $i -le $times; $i++) { MoveTo ($script:cursor[0] + 2) ($script:cursor[1] + 2); Start-Sleep -Milliseconds 70 }
 }
@@ -128,6 +135,9 @@ try {
     L ("start: " + (Close-ShareSheets).Text)
     if (-not (Test-Path $Fake)) { throw "build the fake engine first: $Fake" }
     Set-Content -Path (Join-Path $test 'sample.txt') -Value "wheel rendering test`r`n" -Encoding UTF8
+
+    Start-GuiGuard -Dir $Dir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    $originalCursor = [System.Windows.Forms.Cursor]::Position
 
     $env:PEEL_LOG = $peelLog
     $env:PEEL_EXIT_AFTER = '240'
@@ -202,15 +212,18 @@ try {
     Check 'no unhandled exceptions' (-not ((PeelLog) -match 'unhandled')) 'log has no unhandled exception'
 }
 catch {
-    Check 'driver completed' $false "$_"
+    $script:GuiAbort = Get-GuiAbort $_
+    if ($script:GuiAbort) { L "ABORTED: $_" } else { Check 'driver completed' $false "$_" }
 }
 finally {
+    # First: end any drag and let go of every button and key (gui-guard.ps1).
+    try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
     try { L ("end: " + (Close-ShareSheets).Text) } catch { L "end: share sheet check failed: $_" }
     [System.Windows.Forms.Cursor]::Position = $originalCursor
     if ($peelProcess) { Stop-Process -Id $peelProcess.Id -ErrorAction SilentlyContinue }
     CloseTestExplorer
     $failed = @($checks | Where-Object { -not $_.ok })
-    [pscustomobject]@{ ok = ($failed.Count -eq 0); checks = $checks; shots = $shots; log = $peelLog } |
+    [pscustomobject]@{ ok = ($failed.Count -eq 0 -and -not $script:GuiAbort); aborted = $script:GuiAbort; checks = $checks; shots = $shots; log = $peelLog } |
         ConvertTo-Json -Depth 4 | Set-Content $resultPath -Encoding UTF8
     L ("done, {0} of {1} checks passed" -f ($checks.Count - $failed.Count), $checks.Count)
     if ($failed.Count -gt 0) { exit 1 }

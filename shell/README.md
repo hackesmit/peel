@@ -106,6 +106,41 @@ They leave their evidence in `C:\peel-dev\e2e`, `C:\peel-dev\e2e-render` and
 `C:\peel-dev\e2e-editors`: `result.json`, `drive.log`, Peel's own `peel.log`
 and the screenshots.
 
+### The GUI guard: no stuck drag on Daniel's screen
+
+On 2026-10-20 an aborted test drag left an Explorer drag image (a
+`SysDragImage` window, a file icon ghost) stuck on George's screen: Daniel
+moved the mouse while a test drove it, which broke the injected drag. Every
+driver that moves the real mouse or presses real keys (the `e2e-*.ps1`
+drivers, the `review-*` drivers and `install/smoke.ps1`) now dot-sources
+`tests/gui-guard.ps1`:
+
+- **Before driving** it waits for `-IdleSeconds` (default 300) with no user
+  input (`GetLastInputInfo`) and logs the wait; after `-IdleTimeout` it gives up
+  as `ABORTED (user busy)`.
+- **While driving** a low level mouse and keyboard hook counts input without
+  the injected flag. The first one aborts the run as `ABORTED (user input)`,
+  exit code 3, which is not a test failure.
+- **In every finally** the teardown ends the drag: Escape (cancels the OLE
+  drag), then the held button is released over a small window of our own with
+  no drop target (so a drag that missed the Escape drops on nothing), then
+  every held modifier is released and every visible `SysDragImage` is hidden
+  and closed. After a person touched George it releases only what the driver
+  itself pressed, so it never cancels their own drag.
+- **When the driver is killed** (a timeout, `Stop-ScheduledTask`) its finally
+  never runs. A watchdog process it started (`tests/gui-teardown.ps1
+  -WaitPid`) sees it exit and tears down, and the runner tears down again from
+  an Interactive task, with a screenshot (`teardown-*.json`,
+  `shot-after-teardown.png`). Runners kill a driver they lost track of by its
+  pid, and use a unique task name per run, so two workers never stop or delete
+  each other's task.
+
+`-TimeoutSeconds` on a runner counts from the end of the idle wait
+(`driving.txt`). The guard proves itself with `run-e2e.ps1 -Test abort-fail`
+(the driver throws while it holds a real Explorer drag) and `-Test abort-kill
+-TimeoutSeconds 25` (the runner kills it mid drag); both pass only when no
+drag image and no held button is left.
+
 ## The editor windows
 
 `Editors/` holds the windows that collect parameters for an entry the registry

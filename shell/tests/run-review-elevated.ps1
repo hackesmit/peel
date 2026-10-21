@@ -12,6 +12,7 @@ $ErrorActionPreference = 'Stop'
 # the first folder alphabetically: a dev copy that still holds an old
 # net8.0-windows build would otherwise launch that stale exe silently.
 . (Join-Path $PSScriptRoot 'e2e-hygiene.ps1')
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
 $app = Find-PeelApp $Root
 if (-not $app) { throw "build the shell first (dotnet build -c Release): no Peel.exe under shell\Peel\bin\Release\net8.0-windows*" }
 $driver = Join-Path $Root 'shell\tests\review-elevated-up.ps1'
@@ -25,12 +26,18 @@ $appAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ("-NoPr
 $driveAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -Dir "{1}"' -f $driver, $Dir)
 Register-ScheduledTask -TaskName 'PeelReviewApp' -Action $appAction -Principal (New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited) -Force | Out-Null
 Register-ScheduledTask -TaskName 'PeelReviewDrive' -Action $driveAction -Principal (New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Highest) -Force | Out-Null
+$died = $false
 try {
-    Start-ScheduledTask -TaskName 'PeelReviewApp'
-    Start-Sleep -Seconds 2
+    # The driver waits for user idle first (gui-guard.ps1); Peel exits by
+    # itself after 75 s, so start it only once the driver drives.
     Start-ScheduledTask -TaskName 'PeelReviewDrive'
+    $deadline = (Get-Date).AddSeconds(1920)
+    do { Start-Sleep -Seconds 3; $state = (Get-ScheduledTask -TaskName 'PeelReviewDrive' -ErrorAction SilentlyContinue).State } `
+        while ($state -eq 'Running' -and -not (Test-Path (Join-Path $Dir 'driving.txt')) -and (Get-Date) -lt $deadline)
+    Start-ScheduledTask -TaskName 'PeelReviewApp'
     $deadline = (Get-Date).AddSeconds(120)
-    do { Start-Sleep -Seconds 3; $state = (Get-ScheduledTask -TaskName 'PeelReviewDrive').State } while ($state -eq 'Running' -and (Get-Date) -lt $deadline)
+    do { Start-Sleep -Seconds 3; $state = (Get-ScheduledTask -TaskName 'PeelReviewDrive' -ErrorAction SilentlyContinue).State } while ($state -eq 'Running' -and (Get-Date) -lt $deadline)
+    $died = $state -ne 'Ready'
 }
 finally {
     foreach ($t in 'PeelReviewDrive', 'PeelReviewApp') {
@@ -38,6 +45,8 @@ finally {
         Unregister-ScheduledTask -TaskName $t -Confirm:$false -ErrorAction SilentlyContinue
     }
     Get-Process Peel -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # A driver stopped mid drag never ran its finally: end the drag from here.
+    $null = Complete-GuiRun -Dir $Dir -DriverDied ($died -or -not (Test-Path (Join-Path $Dir 'result.json')))
 }
 Write-Output '--- drive.log ---'
 Get-Content (Join-Path $Dir 'drive.log') -ErrorAction SilentlyContinue | Select-Object -Last 30
