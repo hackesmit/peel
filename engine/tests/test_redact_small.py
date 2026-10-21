@@ -142,7 +142,7 @@ def checkerboard(target: Path, size: str, *, chroma: bool = False) -> Path:
     subprocess.run(
         [FFMPEG, "-v", "error", "-y", "-f", "lavfi",
          "-i", f"color=c=black:size={size}:rate=10:duration=0.3,format=yuv444p,geq={expr}",
-         "-c:v", "ffv1", "-slices", "1", "-pix_fmt", "yuv420p", str(target)],
+         "-c:v", "ffv1", "-level", "1", "-pix_fmt", "yuv420p", str(target)],
         check=True,
     )
     return target
@@ -194,3 +194,71 @@ def test_colour_too_small_to_blur_is_still_obscured(reg, tmp_path):
         assert max(plane(source, rect, fmt)) - min(plane(source, rect, fmt)) > 70
         pixels = plane(result.outputs[0], rect, fmt)
         assert max(pixels) - min(pixels) < 20, (fmt, pixels)
+
+
+# Round 3 (lucy, review round 2): the average fill was pixelize with its block
+# capped at 1024, so a box with a longer side came out as two or more tiles,
+# each its own average. A 2x2048 frame half black and half white came back
+# unchanged while the run reported success. A box that cannot be blurred and
+# is longer than one block is now refused, and nothing is written.
+
+def halves(target: Path, size: str, *, across: bool = False) -> Path:
+    """A lossless clip, black in its first half and white in its second: top
+    and bottom, or (across=True) left and right."""
+    w, h = (int(n) for n in size.split("x"))
+    expr = f"lt(X,{w // 2})" if across else f"lt(Y,{h // 2})"
+    subprocess.run(
+        [FFMPEG, "-v", "error", "-y", "-f", "lavfi",
+         "-i", f"color=c=black:size={size}:rate=10:duration=0.3,format=yuv444p,"
+               f"geq=lum='if({expr},16,235)':cb=128:cr=128",
+         "-c:v", "ffv1", "-level", "1", "-pix_fmt", "yuv420p", str(target)],
+        check=True,
+    )
+    return target
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(
+    "size, across",
+    [
+        ("2x2048", False),  # the lucy repro
+        ("2048x2", True),
+        ("4x2048", False),  # luma holds a radius of 1, its chroma none
+    ],
+)
+def test_a_box_too_long_to_fill_in_one_colour_is_refused(reg, tmp_path, size, across):
+    source = halves(tmp_path / "halves.mkv", size, across=across)
+    w, h = (int(n) for n in size.split("x"))
+    assert max(plane(source, (0, 0, w, h))) - min(plane(source, (0, 0, w, h))) > 200
+    result = reg.run("av.video_redact", [source], {"x": 0, "y": 0, "w": w, "h": h, "strength": 12})
+    assert not result.ok
+    assert result.code == "redact_box_too_long"
+    assert "Traceback" not in result.message
+    assert "1024" in result.message
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["halves.mkv"]
+
+
+@needs_ffmpeg
+def test_a_fill_up_to_one_block_long_is_one_colour(reg, tmp_path):
+    # 1024 is the longest side one pixelize block covers: still filled, and
+    # black and white meet in the middle.
+    source = halves(tmp_path / "halves.mkv", "2x1024")
+    rect = (0, 0, 2, 1024)
+    result = reg.run("av.video_redact", [source], {"x": 0, "y": 0, "w": 2, "h": 1024, "strength": 12})
+    assert result.ok, result.message
+    pixels = plane(result.outputs[0], rect)
+    assert max(pixels) - min(pixels) < 4, (min(pixels), max(pixels))
+    assert all(100 < v < 150 for v in pixels), (min(pixels), max(pixels))
+
+
+@needs_ffmpeg
+def test_a_box_taller_than_one_block_on_a_wider_frame_is_blurred(reg, tmp_path):
+    # A frame with room around the box blurs it, at any length.
+    source = checkerboard(tmp_path / "check.mkv", "64x2048")
+    rect = (30, 0, 2, 2048)
+    assert max(plane(source, rect)) - min(plane(source, rect)) > 200
+    result = reg.run("av.video_redact", [source], {"x": 30, "y": 0, "w": 2, "h": 2048, "strength": 12})
+    assert result.ok, result.message
+    pixels = plane(result.outputs[0], rect)
+    assert max(pixels) - min(pixels) < 40, (min(pixels), max(pixels))
+    assert all(70 < v < 180 for v in pixels), (min(pixels), max(pixels))

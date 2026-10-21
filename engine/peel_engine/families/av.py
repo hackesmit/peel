@@ -1342,6 +1342,11 @@ def video_mute(job: Job) -> Result:
 # boxblur passes the box through untouched.
 _MIN_BLUR_RADIUS = 2
 
+# pixelize's largest block. The average fill is one block over the whole box,
+# so a box with a longer side would come out as two or more tiles, each its
+# own average: a box half black and half white would come back unchanged.
+_MAX_FILL_SIDE = 1024
+
 
 def _box_window(x: int, y: int, w: int, h: int, width: int, height: int, strength: int) -> tuple[int, int, int, int]:
     """The left, top, right and bottom of the neighbourhood the box is blurred
@@ -1377,9 +1382,10 @@ def _box_blur(x: int, y: int, w: int, h: int, width: int, height: int, strength:
     When the window is too small for a useful radius (_blur_reaches), the box
     is filled with its own average colour instead, so it is always hidden.
     The caller runs that fill on yuv444p, where every pixel has its own
-    chroma."""
+    chroma, and refuses a box with a side over _MAX_FILL_SIDE first, so the
+    fill is always one block and one colour."""
     if not _blur_reaches(x, y, w, h, width, height, strength):
-        return f"crop={w}:{h}:{x}:{y},pixelize=w={min(w, 1024)}:h={min(h, 1024)}:m=avg"
+        return f"crop={w}:{h}:{x}:{y},pixelize=w={w}:h={h}:m=avg"
     left, top, right, bottom = _box_window(x, y, w, h, width, height, strength)
     radius = (
         f"lr='min({strength},floor((min(w,h)-1)/2))':lp=2:"
@@ -1406,8 +1412,20 @@ def video_redact(job: Job) -> Result:
         start, end = _span(job.params, duration, label="Redact")
         window = f":enable='between(t,{start:.3f},{end:.3f})'"
 
+    reaches = _blur_reaches(x, y, w, h, width, height, strength)
+    if not reaches and max(w, h) > _MAX_FILL_SIDE:
+        # Fail closed: a box that cannot be blurred and is too long to fill in
+        # one colour would not be hidden.
+        raise UnsupportedInput(
+            f"{job.source.name} ({width}x{height}) leaves too little room around the "
+            f"{w}x{h} box to blur it at strength {strength}, and a box filled in one "
+            f"colour instead can be at most {_MAX_FILL_SIDE} px long. Select a shorter "
+            "box, or redact it in parts.",
+            code="redact_box_too_long",
+        )
+
     target = job.output_path()
-    if w % 2 or h % 2 or x % 2 or y % 2 or not _blur_reaches(x, y, w, h, width, height, strength):
+    if w % 2 or h % 2 or x % 2 or y % 2 or not reaches:
         # On a chroma subsampled frame (yuv420p) crop and overlay snap to the
         # 2 pixel chroma grid (overlay also works in yuv420 unless told
         # otherwise), so an odd box (an odd frame covered edge to edge, say)
