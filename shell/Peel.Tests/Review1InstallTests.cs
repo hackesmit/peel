@@ -92,7 +92,7 @@ public class Review1InstallTests
     [InlineData("string", null, null)]
     public void APresetLeavesAParamItsValueDoesNotFit(string type, int? min, int? max)
     {
-        var entry = new ActionEntry { Id = "x.other" };
+        var entry = new ActionEntry { Id = "image.compress" };
         entry.Params.Add(new ParamSpec { Name = "quality", Type = type, Minimum = min, Maximum = max });
         var none = new Dictionary<string, string>();
         Assert.Same(none, QualityPresets.Apply(entry, none, QualityPresets.Better));
