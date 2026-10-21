@@ -126,6 +126,12 @@ public static class PeelGuard {
     /// <summary>GetLastInputInfo's tick: injected input moves it too, so an unchanged tick means nothing was injected.</summary>
     public static uint LastInputTick() { var info = new LASTINPUTINFO(); info.cbSize = 8; GetLastInputInfo(ref info); return info.dwTime; }
 
+    [StructLayout(LayoutKind.Sequential)] struct POINT { public int X; public int Y; }
+    [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
+    [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint f);
+    /// <summary>The top level window under a screen point.</summary>
+    public static long RootAt(int x, int y) { var p = new POINT(); p.X = x; p.Y = y; return GetAncestor(WindowFromPoint(p), 2).ToInt64(); }
+
     public static bool IsDown(int vk) { return fakeDown.Contains(vk) || (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
     // Mouse buttons as virtual keys, and the mouse_event flags for each.
@@ -635,6 +641,31 @@ function Stop-GuiGuard {
         $script:GuiGuardPaused = $null
     }
     return $result
+}
+
+# UI Automation reports an item's rectangle even when another window covers
+# it, so a grab can land on whatever is on top (Daniel's browser, a console).
+# Brings the item's own top level window to the front when it is not the one
+# under ($x, $y). Returns $true when the point is on the item's window.
+function Confirm-GrabPoint($item, [int]$x, [int]$y) {
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $root = [System.Windows.Automation.AutomationElement]::RootElement
+    $top = $item
+    for ($i = 0; $i -lt 50; $i++) {
+        $parent = $walker.GetParent($top)
+        if (-not $parent -or $parent -eq $root) { break }
+        $top = $parent
+    }
+    $window = [long]$top.Current.NativeWindowHandle
+    if (-not $window) { Write-GuiGuardLog "grab check: no window handle for the item"; return $true }
+    for ($attempt = 0; $attempt -lt 3; $attempt++) {
+        $under = [PeelGuard]::RootAt($x, $y)
+        if ($under -eq $window) { return $true }
+        Write-GuiGuardLog ("grab check: window {0} is over the item's window {1} at {2},{3}; bringing it to the front" -f $under, $window, $x, $y)
+        [void][PeelGuard]::Front($window)
+        Wait-Gui 400
+    }
+    return ([PeelGuard]::RootAt($x, $y) -eq $window)
 }
 
 function Restore-GuiCursor($position) {
