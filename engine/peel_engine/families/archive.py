@@ -76,6 +76,12 @@ STREAM_SLACK = 16 * MIB
 #: before one member. Real ones are a few hundred bytes, one or two deep.
 MAX_TAR_META = MIB
 MAX_TAR_META_CHAIN = 8
+#: Deepest folder nesting and longest name an archive entry or link target
+#: may have. The tar logical tree stores every prefix of a name, so memory
+#: grows with the square of its depth; no real archive nests this deep, and
+#: Windows cannot write a path longer than MAX_NAME_CHARS anyway.
+MAX_NAME_DEPTH = 256
+MAX_NAME_CHARS = 32767
 
 #: The extraction budget, as params on every entry that unpacks an archive.
 LIMIT_PARAMS = (
@@ -758,6 +764,13 @@ def _drop_7z_folder_links(listing: str, dest: Path, skipped: list[str]) -> None:
             out = _safe_target(dest, rel)
         except RunnerFailed:
             continue
+        # _safe_target follows links; on Linux 7-Zip writes a stored folder
+        # link as a real symlink, and following it would empty-check and
+        # remove the folder it points at. Only a path with no link anywhere
+        # along it (resolved equals literal) is the folder 7-Zip wrote.
+        literal = dest.resolve().joinpath(*[p for p in PureWindowsPath(rel).parts if p not in ("", ".")])
+        if os.path.normcase(out) != os.path.normcase(literal):
+            continue
         if not os.path.isdir(out) or os.path.islink(out):
             continue
         with os.scandir(out) as it:
@@ -1266,9 +1279,14 @@ def _safe_target(dest: Path, name: str) -> Path:
     # back slashes or carry a drive letter. Reject anything absolute outright.
     if PurePosixPath(name).is_absolute() or PureWindowsPath(name).is_absolute():
         raise RunnerFailed(f"refused unsafe archive path: {name!r}")
+    if len(name) > MAX_NAME_CHARS:
+        raise RunnerFailed(f"refused archive path longer than {MAX_NAME_CHARS} characters: {name[:80]!r}...")
     parts = [p for p in PureWindowsPath(name).parts if p not in ("", ".")]
     if any(p == ".." for p in parts):
         raise RunnerFailed(f"refused unsafe archive path: {name!r}")
+    if len(parts) > MAX_NAME_DEPTH:
+        # Checked before resolve(), which costs time with the square of depth.
+        raise RunnerFailed(f"refused archive path deeper than {MAX_NAME_DEPTH} folders: {name[:80]!r}...")
     dest_root = dest.resolve()
     target = (dest_root / Path(*parts)).resolve()
     if target != dest_root and dest_root not in target.parents:
