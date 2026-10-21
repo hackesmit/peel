@@ -24,7 +24,20 @@ claim     gui-teardown.ps1 takes a state only when it is not done and its
           owner is dead, and a run that never drove gets no input at all.
 lock      gui.lock is exclusive, a second taker gives up as 'user busy', and
           it is gone when its holder lets go; Invoke-GuiTask refuses to run
-          without it.
+          without it. A dead runner's lock is taken over only after its
+          driver (named by a RUN line) is killed and its run torn down, and a
+          pid that was reused since the lock was taken is never killed.
+restart   Stop-GuiGuard starts the paused installed Peel with no PEEL_*
+          variable, though the driver set PEEL_CLI and PEEL_EXIT_AFTER (a
+          probe stands in for Peel.exe; Daniel's Peel is never touched).
+press     (session 0 only) a press whose state cannot be written is refused:
+          no injection, nothing owned, nothing in inject.log.
+sheets    share sheets on screen at the start are never the run's, and
+          Close-ShareSheets touches none after a person touched George or
+          when the start was never noted.
+clipboard (session 0 only, its own clipboard) Clear-ClipboardIfOurs empties
+          the clipboard only while it holds exactly the run's files, and
+          never when the run put nothing there.
 
 Exit 0 when every check passes, 1 otherwise.
 #>
@@ -215,6 +228,102 @@ if ($session -eq 0) {
     Check 'claim: a dead run that held Shift gets exactly one release, once' ($r.claimed -and -not $r2.claimed -and @($log).Count -eq 1 -and $log[0] -match 'cleanup release 0xa0') ("first: $($r.text) | second: $($r2.text) | log: $($log -join ' | ')")
 }
 
+# ---- restart: Daniel's Peel gets none of the driver's PEEL_* variables ------
+$run = Join-Path $Dir ('restart-{0:HHmmss}' -f (Get-Date))
+New-Item -ItemType Directory -Force $run | Out-Null
+$envDump = Join-Path $run 'probe-env.txt'
+$env:PEEL_CLI = 'C:\fake\peel.exe'; $env:PEEL_EXIT_AFTER = '240'; $env:PEEL_LOG = (Join-Path $run 'x.log')
+$savedInstalled = $script:InstalledPeel
+try {
+    [PeelGuard]::Open($run)
+    $script:InstalledPeel = Join-Path $run 'not-installed\Peel.exe'
+    $script:GuiGuardPaused = (Get-Command powershell.exe).Source
+    $script:GuiGuardPausedFor = Join-Path $run 'not-under-test\Peel.exe'
+    $script:GuiGuardRestartArgs = '-NoProfile -Command "Get-ChildItem Env: | ForEach-Object {{ $_.Name }} | Set-Content ''{0}''"' -f $envDump
+    $t = Stop-GuiGuard
+    $deadline = (Get-Date).AddSeconds(30)
+    while (-not (Test-Path $envDump) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    Start-Sleep -Milliseconds 300
+    $names = @(Get-Content $envDump -ErrorAction SilentlyContinue)
+    $peelVars = @($names | Where-Object { $_ -like 'PEEL_*' })
+    Check 'restart: Stop-GuiGuard restarted the paused Peel' ($t.Text -match 'restarted the installed Peel') $t.Text
+    Check 'restart: the restarted process has no PEEL_* variable' ($names.Count -gt 0 -and $peelVars.Count -eq 0) ("{0} variables, PEEL_*: {1}" -f $names.Count, ($peelVars -join ','))
+    Check 'restart: the driver itself still has its PEEL_* variables' ($env:PEEL_CLI -and $env:PEEL_EXIT_AFTER) "PEEL_CLI=$env:PEEL_CLI"
+    Check 'restart: the restart sent no input' ($t.Cleanups -eq 0 -and -not (Test-Path (Join-Path $run 'inject.log'))) $t.Text
+}
+finally {
+    $script:InstalledPeel = $savedInstalled; $script:GuiGuardPaused = $null; $script:GuiGuardRestartArgs = ''
+    Remove-Item Env:PEEL_CLI, Env:PEEL_EXIT_AFTER, Env:PEEL_LOG -ErrorAction SilentlyContinue
+}
+
+# ---- press: no record, no press (session 0 only) ----------------------------
+if ($session -eq 0) {
+    $run = Join-Path $Dir ('press-{0:HHmmss}' -f (Get-Date))
+    New-Item -ItemType Directory -Force $run | Out-Null
+    [PeelGuard]::Open($run)
+    [PeelGuard]::BeginDrive()
+    # A folder where Save writes its temp file: the state write fails.
+    New-Item -ItemType Directory -Force (Join-Path $run 'guard-state.json.tmp') | Out-Null
+    $before = [PeelGuard]::Injections
+    try { [PeelGuard]::Key([byte]0xA0, $true); $pressed = 'pressed' } catch { $pressed = "$_" }
+    $log = @(Get-Content (Join-Path $run 'inject.log') -ErrorAction SilentlyContinue)
+    Check 'press: a key press whose state cannot be written is refused' ($pressed -match 'PEEL_GUARD refused key 0xa0 down: guard-state.json could not be written') $pressed
+    Check 'press: the refused press was not injected, counted or logged' ([PeelGuard]::Injections -eq $before -and -not ($log -match 'drive key 0xa0')) ("injections {0} -> {1}; log: {2}" -f $before, [PeelGuard]::Injections, ($log -join ' | '))
+    Check 'press: the refused press is not owned' (@([PeelGuard]::Owned()).Count -eq 0) (@([PeelGuard]::Owned()) -join ',')
+    try { [PeelGuard]::Down(); $down = 'pressed' } catch { $down = "$_" }
+    Check 'press: a button press whose state cannot be written is refused' ($down -match 'PEEL_GUARD refused button 0x01 down' -and @([PeelGuard]::Owned()).Count -eq 0) $down
+    Remove-Item (Join-Path $run 'guard-state.json.tmp') -Recurse -Force
+    [PeelGuard]::Key([byte]0xA0, $true)
+    $state = Get-Content (Join-Path $run 'guard-state.json') -Raw | ConvertFrom-Json
+    Check 'press: once the state can be written the press is on record' ((@($state.owned) -join ',') -eq '160') (Get-Content (Join-Path $run 'guard-state.json') -Raw)
+    [PeelGuard]::Key([byte]0xA0, $false)
+    [PeelGuard]::EndDrive()
+    [PeelGuard]::Finish()
+}
+else { Check 'press: skipped outside session 0 (injected input would reach the desktop)' $true "session $session" }
+
+# ---- sheets: only the run's own, and not after a person ---------------------
+. (Join-Path $here 'e2e-hygiene.ps1')
+$own = @(Select-OwnShareSheets @(11, 22, 33) @(22))
+Check 'sheets: a sheet on screen at the start is not the run''s' (($own -join ',') -eq '11,33') ($own -join ',')
+Check 'sheets: no sheet is the run''s when nothing is new' (@(Select-OwnShareSheets @(22) @(22)).Count -eq 0) ''
+function Run-Sheets([string]$name, [string]$body, [hashtable]$vars) {
+    $d = Join-Path $Dir ('sheets-{0}-{1:HHmmssfff}' -f $name, (Get-Date))
+    New-Item -ItemType Directory -Force $d | Out-Null
+    foreach ($k in $vars.Keys) { Set-Item "Env:$k" $vars[$k] }
+    $out = & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command (". '{0}'; . '{1}'; [PeelGuard]::Open('{2}'); [PeelGuard]::BeginDrive(); {3}; (Close-ShareSheets).Text; [PeelGuard]::Finish()" -f
+        (Join-Path $here 'gui-guard.ps1'), (Join-Path $here 'e2e-hygiene.ps1'), $d, $body)
+    foreach ($k in $vars.Keys) { Remove-Item "Env:$k" }
+    return [pscustomobject]@{ Text = "$out"; Injected = (Test-Path (Join-Path $d 'inject.log')) }
+}
+$r = Run-Sheets 'person' 'Register-ShareSheets | Out-Null' @{ PEEL_GUARD_FAKE_REAL = '1' }
+Check 'sheets: none touched once a person touched George' ($r.Text -match 'not touched: a person touched George' -and -not $r.Injected) $r.Text
+$r = Run-Sheets 'unnoted' '$null' @{}
+Check 'sheets: none touched when the start was never noted' ($r.Text -match 'not touched: the sheets on screen at the start were not noted' -and -not $r.Injected) $r.Text
+
+# ---- clipboard: only the run's own payload (session 0 only) ------------------
+if ($session -eq 0) {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        $mine = Join-Path $Dir 'clip-sample.txt'
+        Set-Content $mine 'x'
+        $list = New-Object System.Collections.Specialized.StringCollection
+        [void]$list.Add($mine)
+        [System.Windows.Forms.Clipboard]::SetFileDropList($list)
+        $t1 = Clear-ClipboardIfOurs @()
+        Check 'clipboard: a run that put nothing there leaves it alone' ($t1 -match 'not touched' -and [System.Windows.Forms.Clipboard]::ContainsFileDropList()) $t1
+        [System.Windows.Forms.Clipboard]::SetText('Daniel copied this')
+        $t2 = Clear-ClipboardIfOurs @($mine)
+        Check 'clipboard: something copied since is left alone' ($t2 -match 'no longer holds' -and [System.Windows.Forms.Clipboard]::GetText() -eq 'Daniel copied this') $t2
+        [System.Windows.Forms.Clipboard]::SetFileDropList($list)
+        $t3 = Clear-ClipboardIfOurs @($mine.ToUpperInvariant())
+        Check 'clipboard: the run''s own file list is cleared' ($t3 -match 'cleared' -and -not [System.Windows.Forms.Clipboard]::ContainsFileDropList()) $t3
+        [System.Windows.Forms.Clipboard]::Clear()
+    }
+    catch { Check 'clipboard: skipped, no clipboard in this session' $true "$_" }
+}
+else { Check 'clipboard: skipped outside session 0 (it is Daniel''s clipboard)' $true "session $session" }
+
 # ---- lock -------------------------------------------------------------------
 $lockFree = -not (Test-Path $script:GuiLockPath)
 if ($lockFree) {
@@ -233,6 +342,36 @@ if ($lockFree) {
     Enter-GuiLock 5
     Check 'lock: a lock left by a dead pid is taken over' ((Get-Content $script:GuiLockPath -Raw) -match "pid $PID") (Get-Content $script:GuiLockPath -Raw)
     Exit-GuiLock
+    # A dead runner's lock that names a run whose driver still runs: the
+    # driver is killed and its run torn down (here, not in the desktop)
+    # before the lock is taken over.
+    function Invoke-InteractiveTeardown([string]$RunDir, [string]$Report, [string]$Shot) {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $teardown -RunDir $RunDir -Report $Report | Out-Null
+        if (Test-Path $Report) { Get-Content $Report -Raw | ConvertFrom-Json }
+    }
+    $lockedAt = (Get-Date).AddSeconds(-5)
+    $sleeper = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 120'
+    $d = New-State 'reclaim' $dead $false $false @()
+    Set-Content (Join-Path $d 'driver.pid') $sleeper.Id
+    Set-Content $script:GuiLockPath ("LOCKED by C:\gone.ps1 pid 999999 at {0:o}`r`nRUN {1}" -f $lockedAt, $d)
+    Enter-GuiLock 10
+    Start-Sleep -Milliseconds 300
+    Check 'lock: a dead runner''s live driver is killed before the takeover' (-not (Get-Process -Id $sleeper.Id -ErrorAction SilentlyContinue)) "driver pid $($sleeper.Id)"
+    $claimed = Join-Path $d 'guard-state.runner.json'
+    Check 'lock: the dead runner''s run was torn down (state claimed, done)' ((Test-Path $claimed) -and (Get-Content $claimed -Raw | ConvertFrom-Json).done -and -not (Test-Path (Join-Path $d 'inject.log'))) $(if (Test-Path $claimed) { Get-Content $claimed -Raw } else { 'no runner state' })
+    Check 'lock: then the lock is taken over' ((Get-Content $script:GuiLockPath -Raw) -match "pid $PID") (Get-Content $script:GuiLockPath -Raw)
+    Add-GuiLockRun 'C:\peel-dev\x\runs\r1'
+    Check 'lock: a run folder is noted in the held lock' ((Get-Content $script:GuiLockPath -Raw) -match 'RUN C:\\peel-dev\\x\\runs\\r1') (Get-Content $script:GuiLockPath -Raw)
+    Exit-GuiLock
+    # A pid that started after the lock was taken is not the dead runner's driver.
+    $other = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 120'
+    $d = New-State 'reused' $dead $false $false @()
+    Set-Content (Join-Path $d 'driver.pid') $other.Id
+    Set-Content $script:GuiLockPath ("LOCKED by C:\gone.ps1 pid 999999 at {0:o}`r`nRUN {1}" -f (Get-Date).AddHours(1), $d)
+    Enter-GuiLock 10
+    Check 'lock: a reused pid (started after the lock) is never killed' ([bool](Get-Process -Id $other.Id -ErrorAction SilentlyContinue)) "pid $($other.Id)"
+    Exit-GuiLock
+    Stop-Process -Id $other.Id -Force -ErrorAction SilentlyContinue
     Set-Content $script:GuiLockPath 'taken by hand'
     try { Enter-GuiLock 1; $manual = 'TAKEN' } catch { $manual = "$_" }
     Check 'lock: a lock of unknown form is waited on, never removed' ($manual -match 'PEEL_ABORT user busy' -and (Test-Path $script:GuiLockPath)) $manual
@@ -240,5 +379,5 @@ if ($lockFree) {
 }
 else { Check 'lock: skipped, C:\peel-dev\gui.lock is held by another run right now' $true (Get-Content 'C:\peel-dev\gui.lock' -Raw -ErrorAction SilentlyContinue) }
 
-Get-ChildItem $Dir -Directory | Where-Object { $_.Name -match '^(refuse|own|claim)-' } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+Get-ChildItem $Dir -Directory | Where-Object { $_.Name -match '^(refuse|own|claim|restart|press|sheets)-' } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 Finish-Checks ''

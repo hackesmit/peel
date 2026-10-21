@@ -50,7 +50,15 @@ function Highlight() { $m = [regex]::Matches((PeelLog), 'keyboard highlight (.+)
 function AimAt($t) { for ($i=0; $i -lt 30; $i++) { if ((Highlight) -eq $t) { return $true }; $s = CountLog 'keyboard highlight '; [PeelGuard]::TapEx(0x27,$true); WaitLog 'keyboard highlight ' 3000 ($s+1) | Out-Null }; $false }
 function ShellWins() { @((New-Object -ComObject Shell.Application).Windows()) }
 function DumpWins($tag) { foreach ($w in ShellWins) { try { L ("  $tag win hwnd={0} url={1} sel={2}" -f $w.HWND, $w.LocationURL, (@($w.Document.SelectedItems()) | ForEach-Object { $_.Name }) -join ';') } catch { } } }
-function CloseMine() { foreach ($w in ShellWins) { try { if ($w.LocationURL -like '*review2-5f8a-gui*') { $w.Quit() } } catch { } } }
+# The scratch folders live under this run's own folder (gui-guard.ps1), so a
+# run never deletes another run's folders, and gui-teardown.ps1 closes the
+# Explorer windows on them if this driver is killed. No run folder yet: no window is ours.
+$script:Work = $null
+function CloseMine() {
+    if (-not $script:Work) { return }
+    $prefix = ([uri]($script:Work.TrimEnd('\') + '\')).AbsoluteUri
+    foreach ($w in ShellWins) { try { if ("$($w.LocationURL)/" -like "$prefix*") { $w.Quit() } } catch { } }
+}
 function FindItem($name) {
     $root = [System.Windows.Automation.AutomationElement]::RootElement
     $stem = [System.IO.Path]::GetFileNameWithoutExtension($name)
@@ -77,7 +85,7 @@ function StartPeel($log) {
 function Files($d) { (@(Get-ChildItem $d -File | ForEach-Object { $_.Name }) | Sort-Object) -join ',' }
 
 
-function MkDir($n) { $d = Join-Path $Dir $n; Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force $d | Out-Null
+function MkDir($n) { $d = Join-Path $script:Work $n; Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force $d | Out-Null
     Set-Content -Path (Join-Path $d ("{0}.txt" -f $n.ToLower())) -Value "review2 $n`r`nline two`r`n" -Encoding UTF8; $d }
 function NewTab($d) {
     $hw = [In]::GetForegroundWindow().ToInt64()
@@ -108,6 +116,7 @@ $cursor = [System.Windows.Forms.Cursor]::Position
 $peel = $null
 try {
     Start-GuiGuard -Dir $Dir -RunDir $GuardDir -PauseInstalledFor $App -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    $script:Work = Join-Path ([PeelGuard]::RunDir) 'scratch'
     L ("screens: " + ((@([System.Windows.Forms.Screen]::AllScreens) | ForEach-Object { "$($_.DeviceName) $($_.Bounds)" }) -join ' | '))
     $peel = StartPeel (Join-Path $Dir 'peel-R2.log')
     CloseMine

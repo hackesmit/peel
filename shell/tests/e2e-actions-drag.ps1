@@ -45,6 +45,9 @@ $resultPath = Join-Path $Dir 'result.json'
 $checks = [System.Collections.ArrayList]::new()
 $script:cursor = @(0, 0)
 $script:GuiAbort = $null
+# The file list the Copy scenario put on the clipboard; the finally empties
+# the clipboard only while it still holds exactly this (e2e-hygiene.ps1).
+$script:clipboardPayload = @()
 
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Remove-Item $driveLog, $peelLog, $shareShot, $resultPath -ErrorAction SilentlyContinue
@@ -218,10 +221,9 @@ try {
     Check 'the action wheel opens on Alt' ($actionWheel.default_modifier -eq 'Alt') "$($actionWheel.default_modifier)"
 
     Start-GuiGuard -Dir $Dir -RunDir $GuardDir -PauseInstalledFor $App -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
-    # A share sheet left by an earlier run sits over the test window and
-    # swallows the drag, so clear the desktop first (e2e-hygiene.ps1). Only
-    # once the drive started: before that the sheet can be Daniel's own.
-    L ("start: " + (Close-ShareSheets).Text)
+    # Note the share sheets already on screen: they are not this run's, so
+    # Close-ShareSheets leaves them alone (e2e-hygiene.ps1).
+    L ("start: " + (Register-ShareSheets).Text)
 
     $env:PEEL_LOG = $peelLog
     $env:PEEL_EXIT_AFTER = '240'
@@ -247,6 +249,7 @@ try {
         [PeelGuard]::Up()
         $drop = WaitLog 'drop on Copy with (\d+) file' 6000 ($copy.dropSeen + 1)
         Check 'drop lands on Copy' ($drop -ne $null) "$($drop.Value)"
+        if ($drop) { $script:clipboardPayload = @(Join-Path $test $Source) }
         # CopyAction puts the files on the clipboard as a file list.
         Start-Sleep -Milliseconds 800
         $onClipboard = $null
@@ -313,8 +316,9 @@ finally {
     }
     catch { Check 'no share sheet left on screen' $false "$_" }
     CloseTestExplorer
-    # Leave the clipboard clean: the Copy scenario put files on it.
-    try { [System.Windows.Forms.Clipboard]::Clear() } catch { }
+    # The Copy scenario put the file on the clipboard: take it off again, but
+    # never what Daniel copied since, and nothing at all on an early abort.
+    try { L ("end: " + (Clear-ClipboardIfOurs $script:clipboardPayload)) } catch { L "end: clipboard check failed: $_" }
     $allOk = -not ($checks | Where-Object { -not $_.ok })
     $result = [pscustomobject]@{ ok = ([bool]$allOk -and -not $script:GuiAbort); aborted = $script:GuiAbort; checks = $checks }
     $result | ConvertTo-Json -Depth 5 | Set-Content -Path $resultPath -Encoding UTF8
