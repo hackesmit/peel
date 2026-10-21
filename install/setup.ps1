@@ -8,6 +8,12 @@
   module backends into it, and drops a `peel` shim on the user PATH. Finishes
   by running `peel doctor` so you can see what was found.
 
+  Once publish.ps1 has run, venv is a junction to the engine venv of the
+  installed pair (versions\<stamp>\venv), which publish.ps1 owns. Then this
+  script leaves that venv exactly as it is: no pip upgrade, no editable
+  engine, no module installs, and -RecreateVenv refuses. Backends, the shim
+  and the doctor run still happen; to change the engine, run publish.ps1.
+
   Run it over ssh from hqbox:
     ssh george "powershell -NoProfile -ExecutionPolicy Bypass -File C:\peel-dev\main\install\setup.ps1"
 
@@ -17,6 +23,11 @@
 .PARAMETER SkipWinget
   Skip the winget backend installs (venv and shim only). Useful when the
   backends are already present and you only touched the engine.
+
+.PARAMETER InstallRoot
+  Defaults to %LOCALAPPDATA%\Peel. Another root is a scratch one
+  (install\test-setup.ps1, or publish.ps1 run with -InstallRoot): the venv
+  and shim go there and the user PATH is left as it is.
 #>
 [CmdletBinding()]
 param(
@@ -25,7 +36,8 @@ param(
     # Python for the venv, as the py launcher spells it: '3' (newest), '3.12'.
     [string]$PythonVersion = '3',
     # Delete and rebuild the venv, for example after changing -PythonVersion.
-    [switch]$RecreateVenv
+    [switch]$RecreateVenv,
+    [string]$InstallRoot = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -112,13 +124,33 @@ function Add-ToUserPath([string]$dir) {
 if (-not $SkipWinget) { Ensure-VipsOnPath }
 
 # --- Python venv and engine -----------------------------------------------
-$peelHome = Join-Path $env:LOCALAPPDATA 'Peel'
+$defaultRoot = Join-Path $env:LOCALAPPDATA 'Peel'
+$peelHome = if ($InstallRoot) { $InstallRoot } else { $defaultRoot }
 $venv = Join-Path $peelHome 'venv'
 $binDir = Join-Path $peelHome 'bin'
 $venvPy = Join-Path $venv 'Scripts\python.exe'
 $venvPeel = Join-Path $venv 'Scripts\peel.exe'
 
 New-Item -ItemType Directory -Force -Path $peelHome, $binDir | Out-Null
+
+# A junction here is publish.ps1's: the venv of the installed pair. Writing
+# into it would change the running engine under publish.ps1's journal, and
+# Remove-Item -Recurse on a junction can empty its target in Windows
+# PowerShell 5.1, so nothing below touches it.
+$venvItem = Get-Item -LiteralPath $venv -Force -ErrorAction SilentlyContinue
+$published = ($null -ne $venvItem) -and [bool]($venvItem.Attributes -band [IO.FileAttributes]::ReparsePoint)
+if ($published) {
+    $target = @($venvItem.Target)[0]
+    if ($RecreateVenv) {
+        Write-Step "$venv is a junction to $target, which publish.ps1 owns: not recreating it. Run install\publish.ps1 to build a fresh app and engine pair."
+        exit 1
+    }
+    if (-not (Test-Path $venvPy)) {
+        Write-Step "$venv is a junction to $target, which has no Scripts\python.exe. Run install\publish.ps1."
+        exit 1
+    }
+    Write-Step "venv is a junction to $target (publish.ps1 owns it): leaving the engine and modules as they are"
+}
 
 if ($RecreateVenv -and (Test-Path $venv)) {
     Write-Step "removing venv at $venv (-RecreateVenv)"
@@ -132,33 +164,36 @@ if (-not (Test-Path $venvPy)) {
     Write-Step "venv already present at $venv"
 }
 
-Write-Step 'upgrading pip'
-& $venvPy -m pip install --upgrade pip --quiet
-if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
+if (-not $published) {
+    Write-Step 'upgrading pip'
+    & $venvPy -m pip install --upgrade pip --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
 
-Write-Step "installing engine (editable) from $EnginePath"
-& $venvPy -m pip install -e $EnginePath --quiet
-if ($LASTEXITCODE -ne 0) { throw "engine install failed from $EnginePath" }
+    Write-Step "installing engine (editable) from $EnginePath"
+    & $venvPy -m pip install -e $EnginePath --quiet
+    if ($LASTEXITCODE -ne 0) { throw "engine install failed from $EnginePath" }
 
-# Module backends are intentionally not engine dependencies (the engine runs
-# with whatever is present); install them explicitly here. pytest runs the
-# core test suite.
-Write-Step 'installing pinned module backends and pytest'
-# Pinned so a re-run never upgrades silently. pymupdf stays on 1.26.x: 2.x
-# shifts PDF table columns and pulls in onnxruntime (hq-plct.4 review).
-$modules = @(
-    'pillow==13.0.0', 'pillow-heif==1.8.1', 'pymupdf==1.26.7', 'pdf2docx==0.5.13',
-    'openpyxl==3.1.5', 'python-pptx==1.0.2', 'python-docx==1.2.0', 'pytest==9.1.1'
-)
-& $venvPy -m pip install @modules --quiet
-if ($LASTEXITCODE -ne 0) { throw 'module backend install failed' }
+    # Module backends are intentionally not engine dependencies (the engine
+    # runs with whatever is present); install them explicitly here. pytest
+    # runs the core test suite.
+    Write-Step 'installing pinned module backends and pytest'
+    # Pinned so a re-run never upgrades silently. pymupdf stays on 1.26.x:
+    # 2.x shifts PDF table columns and pulls in onnxruntime (hq-plct.4 review).
+    $modules = @(
+        'pillow==13.0.0', 'pillow-heif==1.8.1', 'pymupdf==1.26.7', 'pdf2docx==0.5.13',
+        'openpyxl==3.1.5', 'python-pptx==1.0.2', 'python-docx==1.2.0', 'pytest==9.1.1'
+    )
+    & $venvPy -m pip install @modules --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'module backend install failed' }
+}
 
 # --- peel shim on PATH -----------------------------------------------------
 $shim = Join-Path $binDir 'peel.cmd'
 $shimBody = "@echo off`r`n`"$venvPeel`" %*`r`n"
 Set-Content -Path $shim -Value $shimBody -Encoding Ascii -NoNewline
 Write-Step "wrote shim $shim"
-Add-ToUserPath $binDir
+if ($peelHome -eq $defaultRoot) { Add-ToUserPath $binDir }
+else { Write-Step "scratch root: leaving the user PATH as it is" }
 
 # --- doctor ----------------------------------------------------------------
 Write-Step 'running peel doctor'
