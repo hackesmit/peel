@@ -19,7 +19,9 @@ param(
     [string]$Source = 'sample.txt',
     # gui-guard.ps1: user idle to wait for before driving, and how long to wait.
     [int]$IdleSeconds = 300,
-    [int]$IdleTimeout = 1800
+    [int]$IdleTimeout = 1800,
+    # The run folder a runner made for this run (gui-guard.ps1, Invoke-GuiTask).
+    [string]$GuardDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +30,7 @@ $driveLog = Join-Path $Dir 'drive.log'
 $peelLog = Join-Path $Dir 'peel.log'
 $resultPath = Join-Path $Dir 'result.json'
 $checks = [System.Collections.ArrayList]::new()
+$script:GuiAbort = $null
 $script:cursor = @(0, 0)
 
 function L($message) { Add-Content $driveLog ("{0:HH:mm:ss.fff} {1}" -f (Get-Date), $message) }
@@ -51,28 +54,17 @@ Add-Type -AssemblyName System.Drawing, System.Windows.Forms, UIAutomationClient,
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class In {
-  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
-  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint f, UIntPtr e);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
   [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int hh, bool r);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-  public static void Move(int x, int y) {
-    int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77), vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
-    int ax = (int)(((x - vx) * 65535.0) / (vw - 1)), ay = (int)(((y - vy) * 65535.0) / (vh - 1));
-    mouse_event(0x0001 | 0x8000 | 0x4000, ax, ay, 0, UIntPtr.Zero);
-  }
-  public static void Down() { mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero); }
-  public static void Up() { mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero); }
-  public static void Tap(byte vk) { keybd_event(vk, 0, 0, UIntPtr.Zero); System.Threading.Thread.Sleep(60); keybd_event(vk, 0, 2, UIntPtr.Zero); }
 }
 '@
 [void][In]::SetProcessDPIAware()
 # Idle wait, real input abort, and the teardown that ends any drag.
 . (Join-Path $PSScriptRoot 'gui-guard.ps1')
 
-function MoveTo($x, $y) { Assert-NoUserInput; [In]::Move([int]$x, [int]$y); $script:cursor = @([int]$x, [int]$y) }
+function MoveTo($x, $y) { Assert-NoUserInput; [PeelGuard]::Move([int]$x, [int]$y); $script:cursor = @([int]$x, [int]$y) }
 function GlideTo($x, $y, $steps = 10) {
     $from = $script:cursor
     for ($i = 1; $i -le $steps; $i++) {
@@ -107,16 +99,16 @@ function DragFromItem() {
     $x = [int]($r.X + 24); $y = [int]($r.Y + $r.Height / 2)
     $script:grab = @($x, $y)
     L "grab at $x,$y"
-    [void][In]::SetCursorPos($x, $y); Start-Sleep -Milliseconds 250
+    [void][PeelGuard]::Place($x, $y); Start-Sleep -Milliseconds 250
     MoveTo $x $y; Start-Sleep -Milliseconds 120
-    [In]::Down(); Start-Sleep -Milliseconds 120
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 120
     for ($i = 1; $i -le 8; $i++) { MoveTo ($x + $i * 10) ($y + $i * 5); Start-Sleep -Milliseconds 30 }
 }
 
 $notepad = $null
 $originalCursor = [System.Windows.Forms.Cursor]::Position
 try {
-    Start-GuiGuard -Dir $Dir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    Start-GuiGuard -Dir $Dir -RunDir $GuardDir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
     New-Item -ItemType Directory -Force $test | Out-Null
     Set-Content -Path (Join-Path $test $Source) -Value 'x' -Encoding UTF8
     $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
@@ -129,11 +121,11 @@ try {
 
     CloseTestExplorer
     Start-Process explorer.exe $test | Out-Null
-    Start-Sleep -Seconds 3
+    Wait-Gui 3000
     $shellWin = $null
     for ($i = 0; $i -lt 20 -and -not $shellWin; $i++) {
         $shellWin = (New-Object -ComObject Shell.Application).Windows() | Where-Object { $_.LocationURL -like '*review-e2e/testdir*' } | Select-Object -First 1
-        if (-not $shellWin) { Start-Sleep -Milliseconds 300 }
+        if (-not $shellWin) { Wait-Gui 300 }
     }
     if (-not $shellWin) { throw 'test Explorer window not found' }
     $explorerHwnd = [IntPtr][int64]$shellWin.HWND
@@ -142,10 +134,10 @@ try {
     # An elevated classic window: a WinForms form in a child of this elevated driver.
     $formCmd = "Add-Type -AssemblyName System.Windows.Forms; `$f = New-Object System.Windows.Forms.Form; `$f.Text = 'PeelReviewElevated'; `$f.StartPosition = 'Manual'; `$f.Left = $($bounds.X + $half + 20); `$f.Top = $($bounds.Y + 40); `$f.Width = $($half - 40); `$f.Height = 500; [void]`$f.ShowDialog()"
     $notepad = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-Command', $formCmd) -PassThru
-    Start-Sleep -Seconds 4
-    Start-Sleep -Milliseconds 500
+    Wait-Gui 4000
+    Wait-Gui 500
     [void][In]::SetForegroundWindow($explorerHwnd)
-    Start-Sleep -Milliseconds 800
+    Wait-Gui 800
 
     # Control: release over Explorer.
     DragFromItem
@@ -153,9 +145,9 @@ try {
     # Release on the blank file list of the same folder (a no-op drop). Never
     # near the navigation pane: a drop there moves the file into that folder.
     GlideTo ($script:grab[0] + 160) ($script:grab[1] + 180)
-    [In]::Up()
+    [PeelGuard]::Up()
     Check 'control: drag end seen' ((WaitLog 'drag end' 3000 1) -ne $null) 'drag end after release over Explorer'
-    Start-Sleep -Seconds 1
+    Wait-Gui 1000
 
     # Attack: release over the elevated Notepad.
     $endsBefore = CountLog 'drag end'
@@ -164,33 +156,37 @@ try {
     DragFromItem
     Check 'attack: drag start seen' ((WaitLog 'drag start at' 4000 2) -ne $null) 'second drag start'
     GlideTo ($bounds.X + $half + 200) ($bounds.Y + 300) 14
-    Start-Sleep -Milliseconds 300
-    [In]::Up()
-    Start-Sleep -Milliseconds 1500
+    Wait-Gui 300
+    [PeelGuard]::Up()
+    Wait-Gui 1500
     $endsAfter = CountLog 'drag end'
     L "drag end lines before/after release over elevated window: $endsBefore/$endsAfter"
     Check 'attack: button up over elevated window reaches Peel' ($endsAfter -gt $endsBefore) "drag end count $endsBefore to $endsAfter"
 
     # Back to a medium window under the pointer, then a plain Shift press with no button held.
     MoveTo ($script:grab[0] + 160) ($script:grab[1] + 180)
-    Start-Sleep -Milliseconds 300
-    [In]::Tap([byte]0xA0)
-    Start-Sleep -Milliseconds 1500
+    Wait-Gui 300
+    [PeelGuard]::Tap([byte]0xA0)
+    Wait-Gui 1500
     $tapsAfter = CountLog 'tapped mid drag'
     $shownAfter = CountLog 'wheel shown at'
     Check 'attack: plain Shift with no button held opens no wheel' (($tapsAfter -eq $tapsBefore) -and ($shownAfter -eq $shownBefore)) "tapped mid drag $tapsBefore to $tapsAfter, wheel shown $shownBefore to $shownAfter"
-    [In]::Tap([byte]0x1B)
-    Start-Sleep -Seconds 5
+    [PeelGuard]::Tap([byte]0x1B)
+    Wait-Gui 5000
 }
 catch {
-    Check 'driver finished' $false $_.Exception.Message
+    # A guard abort (a person at George, or no idle) is not a failure.
+    $script:GuiAbort = Get-GuiAbort $_
+    if ($script:GuiAbort) { L "ABORTED: $_" } else { Check 'driver finished' $false $_.Exception.Message }
 }
 finally {
     # First: end any drag and let go of every button and key (gui-guard.ps1).
     try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
     try { if ($notepad -and -not $notepad.HasExited) { $notepad.Kill() } } catch { }
     CloseTestExplorer
-    [void][In]::SetCursorPos($originalCursor.X, $originalCursor.Y)
+    Restore-GuiCursor $originalCursor
     $ok = -not ($checks | Where-Object { -not $_.ok })
-    [pscustomobject]@{ ok = $ok; checks = $checks } | ConvertTo-Json -Depth 4 | Set-Content $resultPath
+    [pscustomobject]@{ ok = ($ok -and -not $script:GuiAbort); aborted = $script:GuiAbort; checks = $checks
+        drove = [PeelGuard]::Drove; injections = [PeelGuard]::Injections; cleanups = [PeelGuard]::Cleanups; runDir = [PeelGuard]::RunDir } |
+        ConvertTo-Json -Depth 4 | Set-Content $resultPath
 }

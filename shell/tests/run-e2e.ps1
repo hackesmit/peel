@@ -27,13 +27,18 @@ abort-fail, abort-kill: the GUI guard itself (gui-guard.ps1, e2e-drag-abort.ps1)
          short one such as 20). Passes only when no SysDragImage window and no
          held button is left, with a screenshot after the teardown.
 
-Every driver waits for -IdleSeconds of user idle (GetLastInputInfo, default
-300) before it touches the mouse, and gives up after -IdleTimeout. Once it
-drives, any input without the injected flag (a person) aborts it: RESULT
-ABORTED (user input), exit 3, which is not a test failure. -TimeoutSeconds
-counts from the moment the driver starts to drive (driving.txt). Whatever
-happens, the driver's finally, its watchdog, or this runner ends the drag
-(gui-guard.ps1). Take C:\peel-dev\gui.lock first.
+This runner takes C:\peel-dev\gui.lock itself (do not create it first: it
+would wait on you) and holds it until the teardown and the restart of the
+installed Peel are done. Every driver waits for -IdleSeconds of user idle
+(GetLastInputInfo, default 300) before it touches the mouse, and gives up
+after -IdleTimeout: RESULT ABORTED (user busy), exit 3, with nothing driven.
+Once it drives, any input without the injected flag (a person) aborts it:
+RESULT ABORTED (user input), exit 3, which is not a test failure either.
+-TimeoutSeconds counts from the moment the driver starts to drive
+(driving.txt). Whatever happens, the driver's finally, its watchdog, or this
+runner ends the drag (gui-guard.ps1), and only one of them does. A driver
+pauses Daniel's installed Peel while it drives a dev build; this runner starts
+it again at the end if it ran before.
 
 Daniel has to be logged in at the console. If the session is locked, Explorer
 may not be visible to UI Automation, and the run reports that rather than
@@ -103,12 +108,21 @@ $arguments += ' -IdleSeconds {0} -IdleTimeout {1}' -f $IdleSeconds, $IdleTimeout
 
 $resultPath = Join-Path $dir 'result.json'
 New-Item -ItemType Directory -Force $dir | Out-Null
-Remove-Item $resultPath -ErrorAction SilentlyContinue
 
 # Runs the driver in the desktop session and ends its drag whatever happens:
 # the driver's finally, its watchdog, or a teardown from here (gui-guard.ps1).
-$run = Invoke-GuiTask -Name 'PeelE2E' -Dir $dir -ResultPath $resultPath -TimeoutSeconds $TimeoutSeconds -IdleTimeout $IdleTimeout `
-    -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f $script, $arguments)
+# All of it inside gui.lock, which also covers stopping a test Peel the driver
+# left and the restart of Daniel's Peel.
+try {
+    $run = Invoke-GuiDriver -Name 'PeelE2E' -Dir $dir -ResultPath $resultPath -App $app -TimeoutSeconds $TimeoutSeconds -IdleTimeout $IdleTimeout `
+        -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f $script, $arguments)
+}
+catch {
+    # gui.lock stayed held by another run: nothing was scheduled or driven.
+    if (-not (Get-GuiAbort $_)) { throw }
+    Write-Output "RESULT: ABORTED ($(Get-GuiAbort $_)), not a test failure: $_"
+    exit 3
+}
 $timedOut = $run.TimedOut
 $teardown = $run.Teardown
 
@@ -120,12 +134,21 @@ if (Test-Path $driveLog) {
 if ($Test -eq 'abort-kill') {
     # The run under test is the kill: no result.json is expected, the drag
     # image and the button must be gone after the watchdog and the runner.
-    $mid = Join-Path $dir 'shot-mid-drag.png'
-    $ok = $timedOut -and (Test-Path (Join-Path $dir 'holding.txt')) -and (Test-Path $mid) -and $teardown -and $teardown.dragImagesLeft -eq 0 -and -not $teardown.stillDown
+    $mid = Join-Path $run.RunDir 'shot-mid-drag.png'
+    $holding = Test-Path (Join-Path $run.RunDir 'holding.txt')
+    $watchdogPath = Join-Path $run.RunDir 'teardown-watchdog.json'
+    $watchdog = if (Test-Path $watchdogPath) { Get-Content $watchdogPath -Raw | ConvertFrom-Json } else { $null }
+    $state = Join-Path $run.RunDir 'guard-state.watchdog.json'
+    $state = if (Test-Path $state) { Get-Content $state -Raw | ConvertFrom-Json } else { $null }
+    $ok = $timedOut -and $holding -and (Test-Path $mid) -and $teardown -and $teardown.dragImagesLeft -eq 0 -and -not $teardown.stillDown -and
+        $watchdog -and $watchdog.claimed -and -not $teardown.claimed -and $state -and $state.done -and @($state.owned).Count -eq 0
     Write-Output '--- checks ---'
-    Write-Output ("{0} the driver was killed while it held the drag: timed out {1}, holding.txt {2}, {3}" -f $(if ($timedOut -and (Test-Path $mid)) { 'PASS' } else { 'FAIL' }), $timedOut, (Test-Path (Join-Path $dir 'holding.txt')), $mid)
+    Write-Output ("{0} the driver was killed while it held the drag: timed out {1}, holding.txt {2}, {3}" -f $(if ($timedOut -and $holding -and (Test-Path $mid)) { 'PASS' } else { 'FAIL' }), $timedOut, $holding, $mid)
+    if ($watchdog) {
+        Write-Output ("{0} one owner tore down: the watchdog claimed the state ({1}), the runner did not ({2}); state done {3}, still owned '{4}'" -f $(if ($watchdog.claimed -and -not $teardown.claimed -and $state.done -and @($state.owned).Count -eq 0) { 'PASS' } else { 'FAIL' }), $watchdog.actions, $(if ($teardown) { $teardown.actions } else { 'no report' }), $state.done, (@($state.owned) -join ','))
+    }
     if ($teardown) {
-        Write-Output ("{0} no drag image and no button left after the kill: images left {1}, still down '{2}', screenshot {3}" -f $(if ($ok) { 'PASS' } else { 'FAIL' }), $teardown.dragImagesLeft, $teardown.stillDown, $teardown.shot)
+        Write-Output ("{0} no drag image and no button left after the kill: images left {1}, still down '{2}', screenshot {3}" -f $(if ($teardown.dragImagesLeft -eq 0 -and -not $teardown.stillDown) { 'PASS' } else { 'FAIL' }), $teardown.dragImagesLeft, $teardown.stillDown, $teardown.shot)
     }
     Write-Output ("RESULT: {0}" -f $(if ($ok) { 'PASS' } else { 'FAIL' }))
     if ($ok) { exit 0 } else { exit 1 }
@@ -138,6 +161,9 @@ $result = Get-Content $resultPath -Raw | ConvertFrom-Json
 Write-Output '--- checks ---'
 foreach ($check in $result.checks) {
     Write-Output ("{0} {1}: {2}" -f $(if ($check.ok) { 'PASS' } else { 'FAIL' }), $check.name, $check.detail)
+}
+if ($null -ne $result.injections) {
+    Write-Output ("guard: drove {0}, injections {1}, cleanup inputs {2}, inject.log in {3}" -f $result.drove, $result.injections, $result.cleanups, $result.runDir)
 }
 if ($result.aborted) {
     Write-Output "RESULT: ABORTED ($($result.aborted)), not a test failure: run it again when George is idle"

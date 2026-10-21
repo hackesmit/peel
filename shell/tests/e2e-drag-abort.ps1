@@ -2,8 +2,8 @@
 Proof for the GUI guard (gui-guard.ps1): a driver that dies in the middle of a
 real Explorer drag must leave no drag image and no button held.
 
-It needs no Peel: it starts an Explorer drag of a file in its own test folder
-with SendInput, holds it, checks that Explorer shows its drag image
+It needs no Peel: it starts an Explorer drag of a file in a scratch folder it
+makes inside its own run folder once the drive starts, with SendInput, holds it, checks that Explorer shows its drag image
 (SysDragImage), screenshots it, and then:
 
 -Mode fail  throws, as a failing check would. The finally runs the guard
@@ -21,11 +21,16 @@ param(
     [ValidateSet('fail', 'kill')]
     [string]$Mode = 'fail',
     [int]$IdleSeconds = 300,
-    [int]$IdleTimeout = 1800
+    [int]$IdleTimeout = 1800,
+    # The run folder a runner made for this run (gui-guard.ps1, Invoke-GuiTask).
+    [string]$GuardDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
-$test = Join-Path $Dir 'testdir'
+# This run's own scratch folder, made inside its fresh run folder once the
+# drive starts: nothing is created or deleted while George may be busy, and
+# the run deletes only the folder it made.
+$test = $null
 $driveLog = Join-Path $Dir 'drive.log'
 $resultPath = Join-Path $Dir 'result.json'
 $checks = [System.Collections.ArrayList]::new()
@@ -33,9 +38,7 @@ $script:cursor = @(0, 0)
 $script:GuiAbort = $null
 
 New-Item -ItemType Directory -Force $Dir | Out-Null
-Remove-Item $driveLog, $resultPath, (Join-Path $Dir 'shot-*.png'), (Join-Path $Dir 'teardown-*.json') -ErrorAction SilentlyContinue
-Remove-Item $test -Recurse -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force $test | Out-Null
+Remove-Item $driveLog, $resultPath -ErrorAction SilentlyContinue
 
 function L($message) { Add-Content $driveLog ("{0:HH:mm:ss.fff} {1}" -f (Get-Date), $message) }
 
@@ -48,22 +51,14 @@ Add-Type -AssemblyName System.Drawing, System.Windows.Forms, UIAutomationClient,
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class InAb {
-  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
-  public static void Move(int x, int y) {
-    int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77), vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
-    int ax = (int)(((x - vx) * 65535.0) / (vw - 1)), ay = (int)(((y - vy) * 65535.0) / (vh - 1));
-    mouse_event(0x0001 | 0x8000 | 0x4000, ax, ay, 0, UIntPtr.Zero);
-  }
-  public static void Down() { mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero); }
 }
 '@
 . (Join-Path $PSScriptRoot 'gui-guard.ps1')
 
 function MoveTo($x, $y) {
     Assert-NoUserInput
-    [InAb]::Move([int]$x, [int]$y)
+    [PeelGuard]::Move([int]$x, [int]$y)
     $script:cursor = @([int]$x, [int]$y)
 }
 
@@ -80,7 +75,7 @@ function Screenshot($path) {
 function CloseTestExplorer() {
     try {
         (New-Object -ComObject Shell.Application).Windows() |
-            Where-Object { $_.LocationURL -like '*peel-dev/e2e-abort/testdir*' } |
+            Where-Object { $test -and $_.LocationURL -like (([uri]$test).AbsoluteUri + '*') } |
             ForEach-Object { $_.Quit() }
     } catch { }
 }
@@ -102,12 +97,19 @@ function FindItem($name) {
     return $null
 }
 
-$source = Join-Path $test 'held.txt'
+$source = $null
+$evidence = $Dir
+$teardown = $null
 $originalCursor = [System.Windows.Forms.Cursor]::Position
 try {
-    Set-Content -Path $source -Value 'held mid drag' -Encoding UTF8
-    Start-GuiGuard -Dir $Dir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    Start-GuiGuard -Dir $Dir -RunDir $GuardDir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
     $originalCursor = [System.Windows.Forms.Cursor]::Position
+    $evidence = [PeelGuard]::RunDir
+    $test = Join-Path $evidence 'testdir'
+    New-Item -ItemType Directory $test | Out-Null
+    $source = Join-Path $test 'held.txt'
+    Set-Content -Path $source -Value 'held mid drag' -Encoding UTF8
+    L "scratch folder $test"
 
     CloseTestExplorer
     Start-Process explorer.exe $test | Out-Null
@@ -117,21 +119,25 @@ try {
     $r = $item.Current.BoundingRectangle
     $x = [int]($r.X + 24); $y = [int]($r.Y + $r.Height / 2)
     L "grab at $x,$y"
-    [void][InAb]::SetCursorPos($x, $y); Start-Sleep -Milliseconds 250
+    [void][PeelGuard]::Place($x, $y); Start-Sleep -Milliseconds 250
     MoveTo $x $y; Start-Sleep -Milliseconds 120
-    [InAb]::Down(); Start-Sleep -Milliseconds 120
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 120
     for ($i = 1; $i -le 14; $i++) { MoveTo ($x + $i * 14) ($y + $i * 7); Start-Sleep -Milliseconds 30 }
     Start-Sleep -Milliseconds 800
 
     $images = ([PeelGuard]::DragImages()).Count
     Check 'Explorer shows a drag image mid drag' ($images -gt 0) "visible SysDragImage windows: $images"
     Check 'the left button is held mid drag' ([PeelGuard]::IsDown(1)) 'GetAsyncKeyState(VK_LBUTTON)'
-    Screenshot (Join-Path $Dir 'shot-mid-drag.png')
+    Screenshot (Join-Path $evidence 'shot-mid-drag.png')
 
     if ($Mode -eq 'kill') {
+        # A person who touches George ends the hold at once (Wait-Gui), and a
+        # runner that never kills this driver gets a failure, not a drag held
+        # for good.
         L 'holding the drag until the runner kills this driver'
-        Set-Content (Join-Path $Dir 'holding.txt') (Get-Date).ToString('o')
-        while ($true) { Start-Sleep -Seconds 1 }
+        Set-Content (Join-Path $evidence 'holding.txt') (Get-Date).ToString('o')
+        Wait-Gui 120000
+        throw 'nobody killed the driver within 120 s of holding the drag'
     }
     throw 'a check failed mid drag (synthetic, -Mode fail)'
 }
@@ -142,21 +148,26 @@ catch {
     else { L "the failure under test: $_" }
 }
 finally {
-    try { L (Stop-GuiGuard).Text } catch { Check 'the guard teardown ran' $false "$_" }
+    try { $teardown = Stop-GuiGuard; L $teardown.Text } catch { Check 'the guard teardown ran' $false "$_" }
     if (-not $script:GuiAbort -and $Mode -eq 'fail') {
         Start-Sleep -Milliseconds 500
         $left = ([PeelGuard]::DragImages()).Count
         Check 'no drag image is left after the failure' ($left -eq 0) "visible SysDragImage windows: $left"
         $down = @([PeelGuard]::Buttons + [PeelGuard]::Modifiers | Where-Object { [PeelGuard]::IsDown($_) })
         Check 'no button or modifier is left down' ($down.Count -eq 0) "still down: $(($down | ForEach-Object { '0x{0:x2}' -f $_ }) -join ',')"
-        Check 'the cancelled drag moved nothing' ((Test-Path $source) -and @(Get-ChildItem $test -File).Count -eq 1) `
-            "files in the test folder: $((Get-ChildItem $test -File -Recurse | ForEach-Object { $_.Name }) -join ',')"
-        try { Screenshot (Join-Path $Dir 'shot-after-teardown.png') } catch { L "screenshot failed: $_" }
+        $files = if ($test -and (Test-Path $test)) { @(Get-ChildItem -LiteralPath $test -File -Recurse | ForEach-Object { $_.Name }) } else { @() }
+        Check 'the cancelled drag moved nothing' ($source -and (Test-Path $source) -and $files.Count -eq 1) "files in the test folder: $($files -join ',')"
+        try { Screenshot (Join-Path $evidence 'shot-after-teardown.png') } catch { L "screenshot failed: $_" }
     }
-    [System.Windows.Forms.Cursor]::Position = $originalCursor
+    Restore-GuiCursor $originalCursor
     CloseTestExplorer
+    if ($test -and (Test-Path $test)) { Remove-Item -LiteralPath $test -Recurse -Force -ErrorAction SilentlyContinue }
     $failed = @($checks | Where-Object { -not $_.ok })
-    [pscustomobject]@{ ok = ($failed.Count -eq 0 -and -not $script:GuiAbort); aborted = $script:GuiAbort; checks = $checks } |
+    [pscustomobject]@{
+        ok = ($failed.Count -eq 0 -and -not $script:GuiAbort); aborted = $script:GuiAbort; checks = $checks
+        runDir = [PeelGuard]::RunDir; drove = [PeelGuard]::Drove; injections = [PeelGuard]::Injections; cleanups = [PeelGuard]::Cleanups
+        teardown = $(if ($teardown) { $teardown.Text } else { '' })
+    } |
         ConvertTo-Json -Depth 4 | Set-Content $resultPath -Encoding UTF8
     L ("done, {0} of {1} checks passed" -f ($checks.Count - $failed.Count), $checks.Count)
     if ($failed.Count -gt 0) { exit 1 }
