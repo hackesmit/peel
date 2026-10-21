@@ -27,7 +27,13 @@ param(
     [string]$Peel = "$env:LOCALAPPDATA\Peel\venv\Scripts\peel.exe",
     [string]$Source = 'sample.txt',
     [string]$Segment = 'MD',
-    [string]$Expect = 'sample.md'
+    [string]$Expect = 'sample.md',
+    # gui-guard.ps1: wait for this much user idle before driving (0 when a
+    # caller that already waited and drove runs this, as smoke.ps1 does).
+    [int]$IdleSeconds = 300,
+    [int]$IdleTimeout = 1800,
+    # The run folder a runner made for this run (gui-guard.ps1, Invoke-GuiTask).
+    [string]$GuardDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,6 +44,7 @@ $shot = Join-Path $Dir 'shot-wheel.png'
 $resultPath = Join-Path $Dir 'result.json'
 $checks = [System.Collections.ArrayList]::new()
 $script:cursor = @(0, 0)
+$script:GuiAbort = $null
 
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Remove-Item $driveLog, $peelLog, $shot, $resultPath -ErrorAction SilentlyContinue
@@ -67,6 +74,7 @@ function WaitLog($pattern, $timeoutMs, $atLeast = 1) {
     while ((Get-Date) -lt $deadline) {
         $found = [regex]::Matches((PeelLog), $pattern)
         if ($found.Count -ge $atLeast) { return $found[$found.Count - 1] }
+        Assert-NoUserInput
         Start-Sleep -Milliseconds 100
     }
     return $null
@@ -76,34 +84,20 @@ Add-Type -AssemblyName System.Drawing, System.Windows.Forms, UIAutomationClient,
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class In {
-  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
-  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint f, UIntPtr e);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
-  // SetCursorPos does not reach a low level hook. Absolute SendInput moves do.
-  public static void Move(int x, int y) {
-    int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77), vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
-    int ax = (int)(((x - vx) * 65535.0) / (vw - 1)), ay = (int)(((y - vy) * 65535.0) / (vh - 1));
-    mouse_event(0x0001 | 0x8000 | 0x4000, ax, ay, 0, UIntPtr.Zero);
-  }
-  public static void Place(int x, int y) { SetCursorPos(x, y); }
-  public static void Down() { mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero); }
-  public static void Up() { mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero); }
-  public static void Tap(byte vk) {
-    keybd_event(vk, 0, 0, UIntPtr.Zero);
-    System.Threading.Thread.Sleep(60);
-    keybd_event(vk, 0, 2, UIntPtr.Zero);
-  }
 }
 '@
 [void][In]::SetProcessDPIAware()
+# Idle wait, real input abort, and the teardown that ends any drag.
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
 
 $modifierKeys = @{ 'Shift' = [byte]0xA0; 'Ctrl' = [byte]0xA2; 'Alt' = [byte]0xA4 }
 $VkEsc = [byte]0x1B
 
 function MoveTo($x, $y) {
-    [In]::Move([int]$x, [int]$y)
+    Assert-NoUserInput
+    [PeelGuard]::Move([int]$x, [int]$y)
     $script:cursor = @([int]$x, [int]$y)
 }
 
@@ -155,9 +149,10 @@ function StartDragFrom($item) {
     $r = $item.Current.BoundingRectangle
     $x = [int]($r.X + 24); $y = [int]($r.Y + $r.Height / 2)
     L "grab at $x,$y"
-    [void][In]::Place($x, $y); Start-Sleep -Milliseconds 250
+    if (-not (Confirm-GrabPoint $item $x $y)) { throw "another window stays over the test Explorer at $x,$y" }
+    [void][PeelGuard]::Place($x, $y); Start-Sleep -Milliseconds 250
     MoveTo $x $y; Start-Sleep -Milliseconds 120
-    [In]::Down(); Start-Sleep -Milliseconds 120
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 120
     for ($i = 1; $i -le 14; $i++) {
         MoveTo ($x + $i * 14) ($y + $i * 7)
         Start-Sleep -Milliseconds 30
@@ -187,10 +182,7 @@ function SegmentPoint($centre, $labels, $label) {
 $peelProcess = $null
 $originalCursor = [System.Windows.Forms.Cursor]::Position
 try {
-    # A share sheet left by an earlier run sits over the test window and
-    # swallows the drag, so clear the desktop first (e2e-hygiene.ps1).
     . (Join-Path $PSScriptRoot 'e2e-hygiene.ps1')
-    L ("start: " + (Close-ShareSheets).Text)
     Set-Content -Path (Join-Path $test $Source) -Value "Peel end to end test`r`nline two`r`n" -Encoding UTF8
     L "source ready: $test\$Source"
 
@@ -206,6 +198,13 @@ try {
     $bound = @{}
     foreach ($wheel in $registry.wheels) { $bound[[string]$wheel.default_modifier] = [string]$wheel.family }
     L "registry wheels: $(($bound.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ' ')"
+
+    Start-GuiGuard -Dir $Dir -RunDir $GuardDir -PauseInstalledFor $App -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    # A share sheet left by an earlier run sits over the test window and
+    # swallows the drag, so clear the desktop first (e2e-hygiene.ps1). Only
+    # once the drive started: before that the sheet can be Daniel's own.
+    L ("start: " + (Close-ShareSheets).Text)
+    $originalCursor = [System.Windows.Forms.Cursor]::Position
 
     $env:PEEL_LOG = $peelLog
     $env:PEEL_EXIT_AFTER = '240'
@@ -225,7 +224,7 @@ try {
     StartDragFrom $item
     Check 'drag detected' ((WaitLog 'drag start at' 4000) -ne $null) 'hook saw the drag'
 
-    [In]::Tap($modifierKeys['Shift'])
+    [PeelGuard]::Tap($modifierKeys['Shift'])
     $shown = WaitLog 'wheel shown at (\d+),(\d+)' 4000
     Check 'wheel opens on the modifier tap' ($shown -ne $null) "$($shown.Value)"
     if (-not $shown) { throw 'the wheel never opened' }
@@ -256,7 +255,7 @@ try {
     $graphics.Dispose(); $bitmap.Dispose()
     Check 'wheel screenshot taken' (Test-Path $shot) $shot
 
-    [In]::Up()
+    [PeelGuard]::Up()
     $drop = WaitLog "drop on $Segment with (\d+) file" 6000
     Check 'drop lands on the segment' ($drop -ne $null) "$($drop.Value)"
 
@@ -284,7 +283,7 @@ try {
         # Count the matches already in the log: every wait below is for a line
         # this tap produces, never one an earlier scenario left behind.
         $seen = CountLog $pattern
-        [In]::Tap($modifierKeys[$modifier])
+        [PeelGuard]::Tap($modifierKeys[$modifier])
         ApproachRing $centreB
         $line = WaitLog $pattern 6000 ($seen + 1)
         if ($family) {
@@ -295,12 +294,12 @@ try {
         }
     }
 
-    [In]::Tap($VkEsc)
+    [PeelGuard]::Tap($VkEsc)
     $cancelled = WaitLog 'wheel hidden \(escape\)' 4000
     Check 'Escape closes the wheel' ($cancelled -ne $null) "$($cancelled.Value)"
 
     GlideTo ($script:cursor[0] + 30) ($script:cursor[1] + 60) 4
-    [In]::Up()
+    [PeelGuard]::Up()
     Start-Sleep -Seconds 2
     $after = @(Get-ChildItem $test -File | ForEach-Object { $_.Name })
     $new = @($after | Where-Object { $before -notcontains $_ })
@@ -316,7 +315,7 @@ try {
     $shownSeen = CountLog 'wheel shown at'
     $drawnSeen = CountLog 'wheel convert page 0: '
     StartDragFrom $item
-    [In]::Tap($modifierKeys['Shift'])
+    [PeelGuard]::Tap($modifierKeys['Shift'])
     $shown = WaitLog 'wheel shown at (\d+),(\d+)' 4000 ($shownSeen + 1)
     Check 'wheel opens again' ($shown -ne $null) "$($shown.Value)"
     if ($shown) {
@@ -327,7 +326,7 @@ try {
         GlideTo $centre[0] $centre[1] 4
     }
     Start-Sleep -Milliseconds 300
-    [In]::Up()
+    [PeelGuard]::Up()
     Start-Sleep -Seconds 3
     Check 'a drop in the hub runs nothing' ((CountLog 'drop on ') -eq $dropsBefore) "drops seen: $(CountLog 'drop on ') (was $dropsBefore)"
     $after = @(Get-ChildItem $test -File | ForEach-Object { $_.Name })
@@ -346,7 +345,7 @@ try {
     $sinkRect = $sink.Current.BoundingRectangle
     StartDragFrom $item
     $shownSeen = CountLog 'wheel shown at'
-    [In]::Tap($modifierKeys['Shift'])
+    [PeelGuard]::Tap($modifierKeys['Shift'])
     $shown = WaitLog 'wheel shown at (\d+),(\d+)' 4000 ($shownSeen + 1)
     if ($shown) { ApproachRing @([int]$shown.Groups[1].Value, [int]$shown.Groups[2].Value) }
     Stop-Process -Id $peelProcess.Id -ErrorAction SilentlyContinue
@@ -354,7 +353,7 @@ try {
     Check 'the app is gone' ((Get-Process -Id $peelProcess.Id -ErrorAction SilentlyContinue) -eq $null) 'Peel.exe was killed mid drag'
     GlideTo ([int]($sinkRect.X + $sinkRect.Width / 2)) ([int]($sinkRect.Y + $sinkRect.Height / 2)) 10
     Start-Sleep -Milliseconds 500
-    [In]::Up()
+    [PeelGuard]::Up()
     $moved = Join-Path (Join-Path $test 'sink') $Source
     $deadline = (Get-Date).AddSeconds(15)
     while (-not (Test-Path $moved) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
@@ -370,17 +369,21 @@ try {
     Check 'no unhandled exceptions' (-not ($text -match 'unhandled')) 'log has no unhandled exception'
 }
 catch {
-    Check 'driver completed' $false "$_"
+    $script:GuiAbort = Get-GuiAbort $_
+    if ($script:GuiAbort) { L "ABORTED: $_" } else { Check 'driver completed' $false "$_" }
 }
 finally {
+    # First: end any drag and let go of every button and key (gui-guard.ps1).
+    try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
     try { L ("end: " + (Close-ShareSheets).Text) } catch { L "end: share sheet check failed: $_" }
-    [System.Windows.Forms.Cursor]::Position = $originalCursor
+    Restore-GuiCursor $originalCursor
     if ($peelProcess) { Stop-Process -Id $peelProcess.Id -ErrorAction SilentlyContinue }
     CloseTestExplorer
     $failed = @($checks | Where-Object { -not $_.ok })
     $summary = [pscustomobject]@{
-        ok     = ($failed.Count -eq 0)
-        checks = $checks
+        ok      = ($failed.Count -eq 0 -and -not $script:GuiAbort)
+        aborted = $script:GuiAbort
+        checks  = $checks
         log    = $peelLog
         shot   = $shot
         when   = (Get-Date).ToString('o')

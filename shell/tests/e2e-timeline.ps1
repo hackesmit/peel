@@ -10,6 +10,8 @@ session (session 1) and puts Daniel's installed Peel back if this run dies.
 Before the first input it waits until George has had no user input for
 -IdleSeconds (default 300, GetLastInputInfo), so it never moves the mouse
 under someone who is using the machine, and gives up after -IdleTimeout.
+Once it drives, a person's input aborts the run as 'user input', and its
+finally (or its watchdog, or run-timeline.ps1) ends any drag: gui-guard.ps1.
 Then it pauses the installed Peel (its single instance mutex would make the
 test copy exit at once) and starts it again at the end, without this run's
 PEEL_* variables.
@@ -46,7 +48,9 @@ param(
     [string]$Peel = 'C:\peel-dev\venv-64ec\Scripts\peel.exe',
     [string]$Check = '',
     [int]$IdleSeconds = 300,
-    [int]$IdleTimeout = 3600
+    [int]$IdleTimeout = 3600,
+    # The run folder a runner made for this run (gui-guard.ps1, Invoke-GuiTask).
+    [string]$GuardDir = ''
 )
 $Python = Join-Path (Split-Path -Parent $Peel) 'python.exe'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -60,6 +64,7 @@ $resultPath = Join-Path $Dir 'result.json'
 $pausedMarker = Join-Path $Dir 'installed-paused.txt'
 $installedApp = Join-Path $env:LOCALAPPDATA 'Peel\app\Peel.exe'
 $checks = [System.Collections.ArrayList]::new()
+$script:GuiAbort = $null
 $shots = [System.Collections.ArrayList]::new()
 $script:cursor = @(0, 0)
 
@@ -87,6 +92,7 @@ function WaitLog($pattern, $timeoutMs, $atLeast = 1) {
     while ((Get-Date) -lt $deadline) {
         $found = [regex]::Matches((PeelLog), $pattern)
         if ($found.Count -ge $atLeast) { return $found[$found.Count - 1] }
+        Assert-NoUserInput
         Start-Sleep -Milliseconds 100
     }
     return $null
@@ -96,34 +102,14 @@ Add-Type -AssemblyName System.Drawing, System.Windows.Forms, UIAutomationClient,
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class InTl {
-  [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
-  [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
-  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
-  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint f, UIntPtr e);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
   [DllImport("user32.dll")] public static extern uint GetDoubleClickTime();
-  public static uint IdleMs() {
-    var info = new LASTINPUTINFO(); info.cbSize = 8;
-    GetLastInputInfo(ref info);
-    return (uint)Environment.TickCount - info.dwTime;
-  }
-  // SetCursorPos does not reach a low level hook. Absolute SendInput moves do.
-  public static void Move(int x, int y) {
-    int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77), vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
-    int ax = (int)(((x - vx) * 65535.0) / (vw - 1)), ay = (int)(((y - vy) * 65535.0) / (vh - 1));
-    mouse_event(0x0001 | 0x8000 | 0x4000, ax, ay, 0, UIntPtr.Zero);
-  }
-  public static void Place(int x, int y) { SetCursorPos(x, y); }
-  public static void Down() { mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero); }
-  public static void Up() { mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero); }
-  public static void Tap(byte vk) {
-    keybd_event(vk, 0, 0, UIntPtr.Zero); System.Threading.Thread.Sleep(60); keybd_event(vk, 0, 2, UIntPtr.Zero);
-  }
 }
 '@
 [void][InTl]::SetProcessDPIAware()
+# Idle wait, real input abort, and the teardown that ends any drag.
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
 
 $VkCtrl = [byte]0xA2
 $VkEsc = [byte]0x1B
@@ -131,7 +117,8 @@ $UIA = [System.Windows.Automation.AutomationElement]
 $Tree = [System.Windows.Automation.TreeScope]
 
 function MoveTo($x, $y) {
-    [InTl]::Move([int]$x, [int]$y)
+    Assert-NoUserInput
+    [PeelGuard]::Move([int]$x, [int]$y)
     $script:cursor = @([int]$x, [int]$y)
 }
 
@@ -146,27 +133,27 @@ function GlideTo($x, $y, $steps = 8) {
 function ClickAt($x, $y) {
     MoveTo $x $y
     Start-Sleep -Milliseconds 120
-    [InTl]::Down(); Start-Sleep -Milliseconds 80; [InTl]::Up()
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 80; [PeelGuard]::Up()
     Start-Sleep -Milliseconds 250
 }
 
 function DoubleClickAt($x, $y) {
     MoveTo $x $y
     Start-Sleep -Milliseconds 120
-    [InTl]::Down(); Start-Sleep -Milliseconds 40; [InTl]::Up()
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 40; [PeelGuard]::Up()
     Start-Sleep -Milliseconds 60
-    [InTl]::Down(); Start-Sleep -Milliseconds 40; [InTl]::Up()
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 40; [PeelGuard]::Up()
     Start-Sleep -Milliseconds 300
 }
 
 function DragFromTo($from, $to) {
     MoveTo $from[0] $from[1]
     Start-Sleep -Milliseconds 150
-    [InTl]::Down()
+    [PeelGuard]::Down()
     Start-Sleep -Milliseconds 120
     GlideTo $to[0] $to[1] 12
     Start-Sleep -Milliseconds 150
-    [InTl]::Up()
+    [PeelGuard]::Up()
     Start-Sleep -Milliseconds 300
 }
 
@@ -202,9 +189,9 @@ function StartDragFrom($item) {
     $r = $item.Current.BoundingRectangle
     $x = [int]($r.X + 24); $y = [int]($r.Y + $r.Height / 2)
     L "grab at $x,$y"
-    [void][InTl]::Place($x, $y); Start-Sleep -Milliseconds 250
+    [void][PeelGuard]::Place($x, $y); Start-Sleep -Milliseconds 250
     MoveTo $x $y; Start-Sleep -Milliseconds 120
-    [InTl]::Down(); Start-Sleep -Milliseconds 120
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 120
     for ($i = 1; $i -le 14; $i++) {
         MoveTo ($x + $i * 14) ($y + $i * 7)
         Start-Sleep -Milliseconds 30
@@ -359,7 +346,7 @@ function OpenEditorFrom($source, $label) {
     if (-not (WaitLog 'drag start at' 5000 ($drags + 1))) { throw "the hook did not see the drag of $source" }
     $shown = CountLog 'wheel shown at'
     $drawn = CountLog 'wheel tool page 0: '
-    [InTl]::Tap($VkCtrl)
+    [PeelGuard]::Tap($VkCtrl)
     $line = WaitLog 'wheel shown at (\d+),(\d+)' 5000 ($shown + 1)
     if (-not $line) { throw 'the tools wheel never opened' }
     $centre = @([int]$line.Groups[1].Value, [int]$line.Groups[2].Value)
@@ -373,7 +360,7 @@ function OpenEditorFrom($source, $label) {
     GlideTo $target[0] $target[1]
     Start-Sleep -Milliseconds 400
     $drops = CountLog "drop on $label with"
-    [InTl]::Up()
+    [PeelGuard]::Up()
     $drop = WaitLog "drop on $label with (\d+) file" 6000 ($drops + 1)
     Check "$label opens from the wheel for $source" ($drop -ne $null) "$($drop.Value)"
 }
@@ -393,18 +380,6 @@ function WaitJob($id, $before, $seconds = 90) {
     return (WaitLog "job end $([regex]::Escape($id)) ok=True" ($seconds * 1000) ($before + 1))
 }
 
-function WaitForIdle() {
-    $deadline = (Get-Date).AddSeconds($IdleTimeout)
-    $started = Get-Date
-    while ([InTl]::IdleMs() -lt ($IdleSeconds * 1000)) {
-        if ((Get-Date) -gt $deadline) {
-            throw "George was in use: no $IdleSeconds s of user idle within $IdleTimeout s, so nothing was driven"
-        }
-        Start-Sleep -Seconds 10
-    }
-    L ("George idle for {0:0} s after waiting {1:0} s" -f ([InTl]::IdleMs() / 1000), ((Get-Date) - $started).TotalSeconds)
-}
-
 $peelProcess = $null
 $paused = $false
 $originalCursor = [System.Windows.Forms.Cursor]::Position
@@ -422,7 +397,7 @@ try {
         Check "the engine offers the $($pair[0]) editors" ($offered.Count -eq $pair[1]) ($offered -join ',')
     }
 
-    WaitForIdle
+    Start-GuiGuard -Dir $Dir -RunDir $GuardDir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
     $originalCursor = [System.Windows.Forms.Cursor]::Position
 
     # Daniel's Peel holds the single instance mutex; pause it for the run.
@@ -717,7 +692,7 @@ try {
     if ($win) {
         $null = BarRect 'av.video_trim' 20000 ($bars + 1)
         $null = WaitLog 'av\.video_trim: frame strip of' 30000 2
-        [InTl]::Tap($VkEsc)
+        [PeelGuard]::Tap($VkEsc)
         Check 'Escape closes the editor' ((WaitLog 'av\.video_trim: editor cancelled' 5000) -ne $null) 'from the log'
     }
     Start-Sleep -Seconds 2
@@ -736,11 +711,13 @@ try {
     Check 'every editor opened from the wheel' ((CountLog ': editor open') -ge 10) "$(CountLog ': editor open') editor windows opened"
 }
 catch {
-    Check 'driver completed' $false "$_"
+    $script:GuiAbort = Get-GuiAbort $_
+    if ($script:GuiAbort) { L "ABORTED: $_" } else { Check 'driver completed' $false "$_" }
 }
 finally {
-    try { [InTl]::Up() } catch { }
-    [System.Windows.Forms.Cursor]::Position = $originalCursor
+    # First: end any drag and let go of every button and key (gui-guard.ps1).
+    try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
+    Restore-GuiCursor $originalCursor
     if ($peelProcess) {
         # Its editor windows go with it.
         Stop-Process -Id $peelProcess.Id -ErrorAction SilentlyContinue
@@ -756,7 +733,7 @@ finally {
         Remove-Item $pausedMarker -ErrorAction SilentlyContinue
     }
     $failed = @($checks | Where-Object { -not $_.ok })
-    [pscustomobject]@{ ok = ($failed.Count -eq 0); checks = $checks; shots = $shots; log = $peelLog } |
+    [pscustomobject]@{ ok = ($failed.Count -eq 0 -and -not $script:GuiAbort); aborted = $script:GuiAbort; checks = $checks; shots = $shots; log = $peelLog } |
         ConvertTo-Json -Depth 4 | Set-Content $resultPath -Encoding UTF8
     L ("done, {0} of {1} checks passed" -f ($checks.Count - $failed.Count), $checks.Count)
     if ($failed.Count -gt 0) { exit 1 }

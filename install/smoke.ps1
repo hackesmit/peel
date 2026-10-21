@@ -9,7 +9,9 @@
   Over ssh this lands in session 0, which has no desktop, so it re-runs itself
   with -Inner through a scheduled task with an Interactive principal (the way
   shell\tests\run-e2e.ps1 does) and prints the checks. Daniel has to be signed
-  in. The real mouse and keyboard are driven: take C:\peel-dev\gui.lock first.
+  in. The real mouse and keyboard are driven: this script takes
+  C:\peel-dev\gui.lock itself (do not create it first) and holds it until
+  Daniel's Peel runs again.
 
   What the inner run does, all against the installed build:
     1. Stops the installed Peel, so the test copy can hold the single instance
@@ -40,7 +42,12 @@ param(
     [string]$Dir = 'C:\peel-dev\smoke',
     [int]$Presses = 100,
     [int]$Drags = 100,
-    [int]$TimeoutSeconds = 1500
+    [int]$TimeoutSeconds = 1500,
+    # shell\tests\gui-guard.ps1: user idle to wait for before driving.
+    [int]$IdleSeconds = 300,
+    [int]$IdleTimeout = 1800,
+    # The run folder a runner made for this run (gui-guard.ps1, Invoke-GuiTask).
+    [string]$GuardDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,6 +57,9 @@ $app = Join-Path $env:LOCALAPPDATA 'Peel\app\Peel.exe'
 $peel = Join-Path $env:LOCALAPPDATA 'Peel\venv\Scripts\peel.exe'
 $resultPath = Join-Path $Dir 'result.json'
 $driveLog = Join-Path $Dir 'drive.log'
+# Idle wait, real input abort, and the teardown that ends any drag, in the
+# inner run, its watchdog, and from the outer run after a kill.
+. (Join-Path $root 'shell\tests\gui-guard.ps1')
 
 # --- outer: schedule the inner run in the desktop session --------------------
 function Get-InstalledPeel {
@@ -80,35 +90,29 @@ function Start-InstalledInteractive {
 if (-not $Inner) {
     if (-not (Test-Path $app)) { throw "Peel is not installed: run install\publish.ps1 first ($app)" }
     New-Item -ItemType Directory -Force $Dir | Out-Null
-    Remove-Item $resultPath -ErrorAction SilentlyContinue
     # Recorded here, outside the disposable inner run: when the task is killed
     # (timeout, Stop-ScheduledTask) its finally never runs, so restoring
     # Daniel's Peel is this script's job too.
     $wasRunning = @(Get-InstalledPeel | Where-Object { $_.SessionId -ne 0 }).Count -gt 0
-    $task = 'PeelSmoke'
-    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Inner -Dir "{1}" -Presses {2} -Drags {3}' -f `
-        $MyInvocation.MyCommand.Path, $Dir, $Presses, $Drags
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
-    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds $TimeoutSeconds)
-    Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Inner -Dir "{1}" -Presses {2} -Drags {3} -IdleSeconds {4} -IdleTimeout {5}' -f `
+        $MyInvocation.MyCommand.Path, $Dir, $Presses, $Drags, $IdleSeconds, $IdleTimeout
     $timedOut = $false
+    # gui.lock for the whole run, the restart of Daniel's Peel included; it
+    # is created exclusively and goes when this process ends (gui-guard.ps1).
+    try { Enter-GuiLock $IdleTimeout }
+    catch {
+        if (-not (Get-GuiAbort $_)) { throw }
+        Write-Output "RESULT: ABORTED ($(Get-GuiAbort $_)), not a test failure: $_"
+        exit 3
+    }
     try {
-        Start-ScheduledTask -TaskName $task
-        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-        do {
-            Start-Sleep -Seconds 5
-            $state = (Get-ScheduledTask -TaskName $task).State
-        } while ($state -eq 'Running' -and (Get-Date) -lt $deadline)
-        if ($state -eq 'Running') {
-            Stop-ScheduledTask -TaskName $task
-            $timedOut = $true
-            Write-Output "TIMEOUT after $TimeoutSeconds seconds"
-        }
+        # A unique task, a drive budget that starts after the idle wait, and a
+        # teardown of any drag when the inner run is killed (gui-guard.ps1).
+        $run = Invoke-GuiTask -Name 'PeelSmoke' -Arguments $arguments -Dir $Dir -ResultPath $resultPath `
+            -TimeoutSeconds $TimeoutSeconds -IdleTimeout $IdleTimeout
+        $timedOut = $run.TimedOut
     }
     finally {
-        Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
         # No result.json means the inner run died before its finally: any
         # Peel.exe from the installed folder is then a test copy (on the
         # smoke settings and log), so stop it and start Daniel's own.
@@ -124,6 +128,7 @@ if (-not $Inner) {
             $back = @(Get-InstalledPeel | Where-Object { $_.SessionId -ne 0 }).Count
             Write-Output "RECOVERY: restarted the installed Peel: $back running"
         }
+        Exit-GuiLock
     }
     if (-not (Test-Path $resultPath)) {
         Write-Output 'RESULT: no result.json, the driver did not finish'
@@ -133,6 +138,10 @@ if (-not $Inner) {
     $result = Get-Content $resultPath -Raw | ConvertFrom-Json
     foreach ($check in $result.checks) {
         Write-Output ("{0} {1}: {2}" -f $(if ($check.ok) { 'PASS' } else { 'FAIL' }), $check.name, $check.detail)
+    }
+    if ($result.aborted) {
+        Write-Output "RESULT: ABORTED ($($result.aborted)), not a test failure: run it again when George is idle"
+        exit 3
     }
     Write-Output ("RESULT: {0}" -f $(if ($result.ok) { 'PASS' } else { 'FAIL' }))
     if (-not $result.ok) { exit 1 }
@@ -148,6 +157,7 @@ $defaultsFile = Join-Path $Dir 'defaults.json'
 $shot = Join-Path $Dir 'settings.png'
 $checks = [System.Collections.ArrayList]::new()
 $samples = [System.Collections.ArrayList]::new()
+$script:GuiAbort = $null
 
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Remove-Item $driveLog, $peelLog, $shot, $resultPath -ErrorAction SilentlyContinue
@@ -177,6 +187,7 @@ function WaitLog($pattern, $timeoutMs, $atLeast = 1) {
     while ((Get-Date) -lt $deadline) {
         $found = [regex]::Matches((PeelLog), $pattern)
         if ($found.Count -ge $atLeast) { return $found[$found.Count - 1] }
+        Assert-NoUserInput
         Start-Sleep -Milliseconds 100
     }
     return $null
@@ -192,9 +203,6 @@ Add-Type -AssemblyName System.Drawing, System.Windows.Forms, UIAutomationClient,
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class In {
-  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
-  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint f, UIntPtr e);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
   [DllImport("user32.dll")] public static extern uint GetGuiResources(IntPtr process, uint flags);
@@ -205,30 +213,6 @@ public static class In {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
   [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
-  public static void Move(int x, int y) {
-    int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77), vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
-    int ax = (int)(((x - vx) * 65535.0) / (vw - 1)), ay = (int)(((y - vy) * 65535.0) / (vh - 1));
-    mouse_event(0x0001 | 0x8000 | 0x4000, ax, ay, 0, UIntPtr.Zero);
-  }
-  public static void Place(int x, int y) { SetCursorPos(x, y); }
-  public static void Down() { mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero); }
-  public static void Up() { mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero); }
-  public static void TapEx(byte vk, bool ext) {
-    uint f = ext ? 0x0001u : 0u;
-    keybd_event(vk, 0, f, UIntPtr.Zero);
-    System.Threading.Thread.Sleep(45);
-    keybd_event(vk, 0, f | 0x0002u, UIntPtr.Zero);
-  }
-  public static void Tap(byte vk) { TapEx(vk, false); }
-  public static void Key(byte vk, bool down) { keybd_event(vk, 0, down ? 0u : 0x0002u, UIntPtr.Zero); }
-  public static void Chord(byte key) {
-    Key(0x11, true);  System.Threading.Thread.Sleep(40);
-    Key(0x12, true);  System.Threading.Thread.Sleep(40);
-    Key(key, true);   System.Threading.Thread.Sleep(60);
-    Key(key, false);  System.Threading.Thread.Sleep(40);
-    Key(0x12, false); System.Threading.Thread.Sleep(40);
-    Key(0x11, false);
-  }
   public static void Shot(IntPtr hwnd, string path) {
     RECT r; GetWindowRect(hwnd, out r);
     using (var bmp = new System.Drawing.Bitmap(r.Right - r.Left, r.Bottom - r.Top)) {
@@ -322,8 +306,8 @@ function ItemPoint($item) {
 
 function SelectItem($item) {
     $p = ItemPoint $item
-    [void][In]::Place($p[0], $p[1]); Start-Sleep -Milliseconds 150
-    [In]::Down(); Start-Sleep -Milliseconds 70; [In]::Up()
+    [void][PeelGuard]::Place($p[0], $p[1]); Start-Sleep -Milliseconds 150
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 70; [PeelGuard]::Up()
     Start-Sleep -Milliseconds 350
 }
 
@@ -352,7 +336,7 @@ function FocusExplorer($item) {
         if ($hwnd -ne [IntPtr]::Zero) {
             if ([In]::GetForegroundWindow() -eq $hwnd) { return $true }
             if ([In]::IsIconic($hwnd)) { [void][In]::ShowWindow($hwnd, 9) }
-            if ($attempt -gt 0) { [In]::Tap([byte]0x12) }
+            if ($attempt -gt 0) { [PeelGuard]::Tap([byte]0x12) }
             [void][In]::SetForegroundWindow($hwnd)
             Start-Sleep -Milliseconds 250
             if ([In]::GetForegroundWindow() -eq $hwnd) { return $true }
@@ -367,7 +351,7 @@ function AimAt($target, $count) {
     for ($i = 0; $i -lt ($count + 2); $i++) {
         if ((Highlight) -eq $target) { return }
         $seen = CountLog 'keyboard highlight '
-        [In]::TapEx($VkRight, $true)
+        [PeelGuard]::TapEx($VkRight, $true)
         WaitLog 'keyboard highlight ' 3000 ($seen + 1) | Out-Null
     }
 }
@@ -377,12 +361,12 @@ function RunByKeyboard($item, $switchKey, $family, $label) {
     SelectItem $item
     if (-not (FocusExplorer $item)) { return "Explorer never took the foreground" }
     $shownSeen = CountLog 'keyboard wheel shown at'
-    [In]::Chord($VkP)
+    [PeelGuard]::Chord($VkP)
     $shown = WaitLog 'keyboard wheel shown at' 6000 ($shownSeen + 1)
     if (-not $shown) { return "the hotkey did not open the wheel" }
     WaitLog 'keyboard wheel convert page 0: ' 6000 | Out-Null
     $drawnSeen = CountLog "keyboard wheel $family page 0: "
-    [In]::Tap($keys[$switchKey])
+    [PeelGuard]::Tap($keys[$switchKey])
     $drawn = WaitLog "keyboard wheel $family page 0: (.+)" 6000 ($drawnSeen + 1)
     if (-not $drawn) { return "$switchKey did not switch to the $family wheel" }
     $labels = @($drawn.Groups[1].Value.Trim() -split ',')
@@ -390,7 +374,7 @@ function RunByKeyboard($item, $switchKey, $family, $label) {
     AimAt $label $labels.Count
     if ((Highlight) -ne $label) { return "the highlight never reached $label" }
     $runs = CountLog 'keyboard run '
-    [In]::Tap($VkEnter)
+    [PeelGuard]::Tap($VkEnter)
     $ran = WaitLog 'keyboard run (\S+) on' 6000 ($runs + 1)
     if (-not $ran) { return "Enter ran nothing" }
     return "ran $($ran.Groups[1].Value)"
@@ -401,6 +385,8 @@ $wasRunning = (Installed).Count -gt 0
 $originalCursor = [System.Windows.Forms.Cursor]::Position
 try {
     if (-not (Test-Path $app)) { throw "not installed: $app" }
+    Start-GuiGuard -Dir $Dir -RunDir $GuardDir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    $originalCursor = [System.Windows.Forms.Cursor]::Position
     foreach ($process in Installed) {
         L "stopping the installed Peel pid $($process.Id) for the run"
         StopPeel $process
@@ -425,8 +411,10 @@ try {
     $env:PEEL_SETTINGS = $defaultsFile
     $dragScript = Join-Path $root 'shell\tests\e2e-drag.ps1'
     L "running $dragScript against $app"
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $dragScript -Dir $dragDir -App $app -Peel $peel | Out-Null
+    # This run already waited for idle and has been driving since: no wait.
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $dragScript -Dir $dragDir -App $app -Peel $peel -IdleSeconds 0 | Out-Null
     $drag = Get-Content (Join-Path $dragDir 'result.json') -Raw | ConvertFrom-Json
+    if ($drag.aborted) { throw "PEEL_ABORT $($drag.aborted): in the drag driver" }
     $failed = @($drag.checks | Where-Object { -not $_.ok } | ForEach-Object { $_.name })
     Check 'conversion by drag (installed build)' $drag.ok ("{0} checks, failed: {1}" -f @($drag.checks).Count, ($failed -join '; '))
 
@@ -558,14 +546,14 @@ try {
         $shownSeen = CountLog 'keyboard wheel shown at'
         $hiddenSeen = CountLog 'keyboard wheel hidden'
         if (-not (FocusExplorer $item)) { $missed++; continue }
-        [In]::Chord($VkP)
+        [PeelGuard]::Chord($VkP)
         if (-not (WaitLog 'keyboard wheel shown at' 4000 ($shownSeen + 1))) {
             $missed++
             $item = FindItem 'sample.txt'
             if ($item) { SelectItem $item }
             continue
         }
-        [In]::Tap($VkEsc)
+        [PeelGuard]::Tap($VkEsc)
         WaitLog 'keyboard wheel hidden' 4000 ($hiddenSeen + 1) | Out-Null
         Start-Sleep -Milliseconds 150
         if ($i % 25 -eq 0) { Sample $smokePeel "after $i presses" }
@@ -579,16 +567,17 @@ try {
         if (-not $item) { throw 'sample.txt vanished during the drag soak' }
         $start = ItemPoint $item
         $shownSeen = CountLog '(?<!keyboard )wheel shown at'
-        [void][In]::Place($start[0], $start[1]); Start-Sleep -Milliseconds 120
-        [In]::Move($start[0], $start[1]); Start-Sleep -Milliseconds 80
-        [In]::Down(); Start-Sleep -Milliseconds 100
-        for ($s = 1; $s -le 10; $s++) { [In]::Move($start[0] + $s * 12, $start[1] + $s * 6); Start-Sleep -Milliseconds 25 }
-        [In]::Tap($keys['Shift'])
+        [void][PeelGuard]::Place($start[0], $start[1]); Start-Sleep -Milliseconds 120
+        [PeelGuard]::Move($start[0], $start[1]); Start-Sleep -Milliseconds 80
+        Assert-NoUserInput
+        [PeelGuard]::Down(); Start-Sleep -Milliseconds 100
+        for ($s = 1; $s -le 10; $s++) { [PeelGuard]::Move($start[0] + $s * 12, $start[1] + $s * 6); Start-Sleep -Milliseconds 25 }
+        [PeelGuard]::Tap($keys['Shift'])
         if (-not (WaitLog '(?<!keyboard )wheel shown at' 3000 ($shownSeen + 1))) { $missedDrags++ }
-        [In]::Tap($VkEsc)
+        [PeelGuard]::Tap($VkEsc)
         Start-Sleep -Milliseconds 150
-        for ($s = 9; $s -ge 0; $s--) { [In]::Move($start[0] + $s * 12, $start[1] + $s * 6); Start-Sleep -Milliseconds 20 }
-        [In]::Up()
+        for ($s = 9; $s -ge 0; $s--) { [PeelGuard]::Move($start[0] + $s * 12, $start[1] + $s * 6); Start-Sleep -Milliseconds 20 }
+        [PeelGuard]::Up()
         Start-Sleep -Milliseconds 300
         if ($i % 25 -eq 0) { Sample $smokePeel "after $i drags" }
     }
@@ -635,10 +624,13 @@ try {
     Check 'no unhandled exceptions' (-not ($text -match 'unhandled')) 'peel.log has no unhandled exception'
 }
 catch {
-    Check 'driver completed' $false "$_"
+    $script:GuiAbort = Get-GuiAbort $_
+    if ($script:GuiAbort) { L "ABORTED: $_" } else { Check 'driver completed' $false "$_" }
 }
 finally {
-    [System.Windows.Forms.Cursor]::Position = $originalCursor
+    # First: end any drag and let go of every button and key (gui-guard.ps1).
+    try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
+    Restore-GuiCursor $originalCursor
     StopPeel $smokePeel
     CloseTestExplorer
     Remove-Item Env:PEEL_LOG, Env:PEEL_SETTINGS, Env:PEEL_EXIT_AFTER, Env:PEEL_KEYBOARD_IDLE_MS -ErrorAction SilentlyContinue
@@ -656,7 +648,8 @@ finally {
     }
     $failed = @($checks | Where-Object { -not $_.ok })
     [pscustomobject]@{
-        ok      = ($failed.Count -eq 0)
+        ok      = ($failed.Count -eq 0 -and -not $script:GuiAbort)
+        aborted = $script:GuiAbort
         checks  = $checks
         samples = $samples
     } | ConvertTo-Json -Depth 4 | Set-Content $resultPath -Encoding UTF8
