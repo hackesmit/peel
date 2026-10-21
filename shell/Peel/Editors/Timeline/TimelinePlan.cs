@@ -333,6 +333,7 @@ internal sealed class TimelinePlan
         }
         var stop = Duration - MinSpan;
         var step = 1L;
+        var column = double.NegativeInfinity;
         while (true)
         {
             var at = First + every * step;
@@ -341,7 +342,13 @@ internal sealed class TimelinePlan
                 break;
             }
             var x = axis.ToX(at);
-            marks.Add(x);
+            // The jump below can land a rounding error short of the next
+            // column; then the next step crosses it.
+            if (Math.Floor(x) > column)
+            {
+                marks.Add(x);
+                column = Math.Floor(x);
+            }
             // The first cut whose column is past this one.
             var next = (Math.Floor(x) + 1) / axis.Width * axis.Duration;
             step = Math.Max(step + 1, (long)Math.Ceiling((next - First) / every));
