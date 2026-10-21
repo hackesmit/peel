@@ -228,7 +228,7 @@ internal static class Native
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    internal static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    internal static extern bool IsProcessInJob(IntPtr process, IntPtr job, [MarshalAs(UnmanagedType.Bool)] out bool result);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -246,6 +246,8 @@ internal static class Native
     internal const uint CREATE_NO_WINDOW = 0x08000000;
     internal const int STARTF_USESTDHANDLES = 0x00000100;
     internal static readonly IntPtr PROC_THREAD_ATTRIBUTE_HANDLE_LIST = new(0x00020002);
+    // Windows 10 1607 and later: the process is created already in these jobs.
+    internal static readonly IntPtr PROC_THREAD_ATTRIBUTE_JOB_LIST = new(0x0002000D);
 
     [StructLayout(LayoutKind.Sequential)]
     internal struct STARTUPINFO
