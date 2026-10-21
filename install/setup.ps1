@@ -41,6 +41,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Windows PowerShell 5.1 leaves $PSScriptRoot empty in a param default.
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 function Write-Step([string]$message) {
     Write-Host "[peel-setup] $message"
@@ -176,14 +178,9 @@ if (-not $published) {
     # Module backends are intentionally not engine dependencies (the engine
     # runs with whatever is present); install them explicitly here. pytest
     # runs the core test suite.
+    # The pinned list is shared with publish.ps1 (modules.txt).
     Write-Step 'installing pinned module backends and pytest'
-    # Pinned so a re-run never upgrades silently. pymupdf stays on 1.26.x:
-    # 2.x shifts PDF table columns and pulls in onnxruntime (hq-plct.4 review).
-    $modules = @(
-        'pillow==13.0.0', 'pillow-heif==1.8.1', 'pymupdf==1.26.7', 'pdf2docx==0.5.13',
-        'openpyxl==3.1.5', 'python-pptx==1.0.2', 'python-docx==1.2.0', 'pytest==9.1.1'
-    )
-    & $venvPy -m pip install @modules --quiet
+    & $venvPy -m pip install -r (Join-Path $here 'modules.txt') --quiet
     if ($LASTEXITCODE -ne 0) { throw 'module backend install failed' }
 }
 

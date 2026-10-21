@@ -22,14 +22,21 @@
   failed first install must leave no Run value of ours, a rollback killed
   before Peel starts again must leave the restart to the next run, and a
   rollback that cannot put a read only settings.json back must keep the
-  journal and settings.before, exit 7 and leave Peel stopped. Nothing moves the mouse or the
+  journal and settings.before, exit 7 and leave Peel stopped, with no
+  start with Windows entry until a run can put settings.json back
+  (hq-plct.29). With
+  -RealEngine (hq-plct.28) it also runs publish.ps1's real pip build once,
+  with -NoStart, from a scratch venv that lacks openpyxl: the new venv must
+  have every module in modules.txt and a green peel doctor. That one needs
+  the backends setup.ps1 installs and pip's network or cache, and takes a
+  few minutes. Nothing moves the mouse or the
   keyboard; the stand in starts in the signed in session through a scheduled
   task, so someone has to be signed in at George.
 
-  ssh george "powershell -NoProfile -ExecutionPolicy Bypass -File C:\peel-dev\<branch>\install\test-publish.ps1"
+  ssh george "powershell -NoProfile -ExecutionPolicy Bypass -File C:\peel-dev\<branch>\install\test-publish.ps1 [-RealEngine]"
 #>
 [CmdletBinding()]
-param()
+param([switch]$RealEngine)
 
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -402,10 +409,25 @@ try {
     Check 'a settings file that cannot be put back keeps settings.before' ((Test-Path $snapshot) -and (Get-Bytes $snapshot) -eq $settingsBytes)
     Check 'a settings file that cannot be put back keeps the candidate in the journal' ($null -ne (Get-Journal).candidate) (ConvertTo-Json -Compress (Get-Journal))
     Check 'a settings file that cannot be put back leaves Peel stopped' ((Get-Running).Count -eq 0) "($((Get-Running).Count) running)"
+    # Log on must not start Peel on the candidate's settings (hq-plct.29).
+    $value = Get-RunValue
+    Check 'a settings file that cannot be put back drops the start with Windows entry' ($null -eq $value) $value
+    Check 'a settings file that cannot be put back records the dropped entry' ([bool](Get-Journal).run) (ConvertTo-Json -Compress (Get-Journal))
+    # A second run that still cannot write it keeps that record, with no entry of ours left to see.
+    $settingsItem.IsReadOnly = $true
+    $code = Publish 'good1' 'fail'
+    $settingsItem.IsReadOnly = $false
+    Check 'a second run with settings still read only exits 7' ($code -eq 7) "(exit $code)"
+    $value = Get-RunValue
+    Check 'a second run with settings still read only registers no entry' ($null -eq $value) $value
+    Check 'a second run with settings still read only keeps the dropped entry record' ([bool](Get-Journal).run) (ConvertTo-Json -Compress (Get-Journal))
     $code = Publish 'good1' 'fail'
     Check 'once settings is writable, a failed engine build exits non zero' ($code -ne 0 -and $code -ne 7) "(exit $code)"
     Check 'once settings is writable, the old settings bytes are back' ((Get-Bytes $settings) -eq $settingsBytes) ([IO.File]::ReadAllText($settings))
     Check 'once settings is writable, good2 runs on engine e13' ((Get-RunningBuild) -eq 'good2' -and (Get-Engine) -eq 'e13') "$(Get-RunningBuild) $(Get-Engine)"
+    $value = Get-RunValue
+    Check 'once settings is writable, the start with Windows entry names the app in the root again' ($value -eq ('"{0}"' -f (Join-Path $app 'Peel.exe'))) $value
+    Check 'once settings is writable, the dropped entry record is gone' (-not (Get-Journal).run) (ConvertTo-Json -Compress (Get-Journal))
     Check-Clean 'once settings is writable'
 
     # 11 two runs at once: the second one must not touch the install
@@ -471,6 +493,42 @@ try {
     Check 'start with Windows off exits 0' ($code -eq 0) "(exit $code)"
     $value = (Get-ItemProperty -Path $runKey -Name Peel -ErrorAction SilentlyContinue).Peel
     Check 'start with Windows off removes the Run value' ($null -eq $value) $value
+
+    # 14 the real pip build: a current venv that lacks a pinned module gets
+    # it in the new venv (hq-plct.28). Its own root, so the cases above keep
+    # theirs; -NoStart, since the stand in app has no engine to talk to.
+    if ($RealEngine) {
+        $realRoot = Join-Path $scratch 'real'
+        $realVenv = Join-Path $realRoot 'venv'
+        $realPy = Join-Path $realVenv 'Scripts\python.exe'
+        $ErrorActionPreference = 'Continue'
+        & py -3 -m venv $realVenv *> (Join-Path $scratch 'real-venv.log')
+        $lacking = Join-Path $scratch 'modules-without-openpyxl.txt'
+        Get-Content (Join-Path $here 'modules.txt') | Where-Object { $_ -notmatch '^\s*openpyxl\b' } | Set-Content -LiteralPath $lacking -Encoding Ascii
+        & $realPy -m pip install --quiet --disable-pip-version-check -r $lacking *> (Join-Path $scratch 'real-pip.log')
+        & $realPy -m pip install --quiet --disable-pip-version-check (Join-Path (Split-Path -Parent $here) 'engine') *>> (Join-Path $scratch 'real-pip.log')
+        $templateMissing = @((& (Join-Path $realVenv 'Scripts\peel.exe') doctor | Out-String | ConvertFrom-Json).missing)
+        Check 'the real template venv lacks openpyxl' ($templateMissing -contains 'openpyxl') ($templateMissing -join ', ')
+
+        $log = Join-Path $scratch 'publish-real.log'
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $here 'publish.ps1') -InstallRoot $realRoot `
+            -SettingsPath $settings -RunKey $runKey -PrebuiltApp (Join-Path $builds 'good1') -NoStart *> $log
+        $code = $LASTEXITCODE
+        Get-Content $log | Where-Object { $_ -match 'peel-publish' } | ForEach-Object { Write-Host "     $_" }
+        Check 'the real publish exits 0' ($code -eq 0) "(exit $code)"
+        Check 'the real publish switches venv to a junction' (Test-IsLink $realVenv)
+        $newPy = Join-Path $realVenv 'Scripts\python.exe'
+        $frozen = @(& $newPy -m pip freeze --disable-pip-version-check 2> $null)
+        $pins = @(Get-Content (Join-Path $here 'modules.txt') | Where-Object { $_ -match '^[A-Za-z]' } | ForEach-Object { $_.Trim().ToLowerInvariant() -replace '_', '-' })
+        $have = @($frozen | ForEach-Object { $_.Trim().ToLowerInvariant() -replace '_', '-' })
+        $absent = @($pins | Where-Object { $have -notcontains $_ })
+        Check 'the real publish installs every pinned module at its pin' ($absent.Count -eq 0) ($absent -join ', ')
+        $newMissing = @((& (Join-Path $realVenv 'Scripts\peel.exe') doctor | Out-String | ConvertFrom-Json).missing)
+        Check 'the real publish leaves peel doctor green' ($newMissing.Count -eq 0) ($newMissing -join ', ')
+        $ErrorActionPreference = 'Stop'
+        if (Test-IsLink $realVenv) { [IO.Directory]::Delete($realVenv, $false) }
+        if (Test-IsLink (Join-Path $realRoot 'app')) { [IO.Directory]::Delete((Join-Path $realRoot 'app'), $false) }
+    }
 }
 finally {
     Stop-Scratch 'Peel'
