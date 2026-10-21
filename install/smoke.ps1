@@ -40,7 +40,10 @@ param(
     [string]$Dir = 'C:\peel-dev\smoke',
     [int]$Presses = 100,
     [int]$Drags = 100,
-    [int]$TimeoutSeconds = 1500
+    [int]$TimeoutSeconds = 1500,
+    # shell\tests\gui-guard.ps1: user idle to wait for before driving.
+    [int]$IdleSeconds = 300,
+    [int]$IdleTimeout = 1800
 )
 
 $ErrorActionPreference = 'Stop'
@@ -50,6 +53,9 @@ $app = Join-Path $env:LOCALAPPDATA 'Peel\app\Peel.exe'
 $peel = Join-Path $env:LOCALAPPDATA 'Peel\venv\Scripts\peel.exe'
 $resultPath = Join-Path $Dir 'result.json'
 $driveLog = Join-Path $Dir 'drive.log'
+# Idle wait, real input abort, and the teardown that ends any drag, in the
+# inner run, its watchdog, and from the outer run after a kill.
+. (Join-Path $root 'shell\tests\gui-guard.ps1')
 
 # --- outer: schedule the inner run in the desktop session --------------------
 function Get-InstalledPeel {
@@ -85,30 +91,17 @@ if (-not $Inner) {
     # (timeout, Stop-ScheduledTask) its finally never runs, so restoring
     # Daniel's Peel is this script's job too.
     $wasRunning = @(Get-InstalledPeel | Where-Object { $_.SessionId -ne 0 }).Count -gt 0
-    $task = 'PeelSmoke'
-    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Inner -Dir "{1}" -Presses {2} -Drags {3}' -f `
-        $MyInvocation.MyCommand.Path, $Dir, $Presses, $Drags
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
-    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds $TimeoutSeconds)
-    Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+    $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Inner -Dir "{1}" -Presses {2} -Drags {3} -IdleSeconds {4} -IdleTimeout {5}' -f `
+        $MyInvocation.MyCommand.Path, $Dir, $Presses, $Drags, $IdleSeconds, $IdleTimeout
     $timedOut = $false
     try {
-        Start-ScheduledTask -TaskName $task
-        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-        do {
-            Start-Sleep -Seconds 5
-            $state = (Get-ScheduledTask -TaskName $task).State
-        } while ($state -eq 'Running' -and (Get-Date) -lt $deadline)
-        if ($state -eq 'Running') {
-            Stop-ScheduledTask -TaskName $task
-            $timedOut = $true
-            Write-Output "TIMEOUT after $TimeoutSeconds seconds"
-        }
+        # A unique task, a drive budget that starts after the idle wait, and a
+        # teardown of any drag when the inner run is killed (gui-guard.ps1).
+        $run = Invoke-GuiTask -Name 'PeelSmoke' -Arguments $arguments -Dir $Dir -ResultPath $resultPath `
+            -TimeoutSeconds $TimeoutSeconds -IdleTimeout $IdleTimeout
+        $timedOut = $run.TimedOut
     }
     finally {
-        Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
         # No result.json means the inner run died before its finally: any
         # Peel.exe from the installed folder is then a test copy (on the
         # smoke settings and log), so stop it and start Daniel's own.
@@ -134,6 +127,10 @@ if (-not $Inner) {
     foreach ($check in $result.checks) {
         Write-Output ("{0} {1}: {2}" -f $(if ($check.ok) { 'PASS' } else { 'FAIL' }), $check.name, $check.detail)
     }
+    if ($result.aborted) {
+        Write-Output "RESULT: ABORTED ($($result.aborted)), not a test failure: run it again when George is idle"
+        exit 3
+    }
     Write-Output ("RESULT: {0}" -f $(if ($result.ok) { 'PASS' } else { 'FAIL' }))
     if (-not $result.ok) { exit 1 }
     exit 0
@@ -148,6 +145,7 @@ $defaultsFile = Join-Path $Dir 'defaults.json'
 $shot = Join-Path $Dir 'settings.png'
 $checks = [System.Collections.ArrayList]::new()
 $samples = [System.Collections.ArrayList]::new()
+$script:GuiAbort = $null
 
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Remove-Item $driveLog, $peelLog, $shot, $resultPath -ErrorAction SilentlyContinue
@@ -177,6 +175,7 @@ function WaitLog($pattern, $timeoutMs, $atLeast = 1) {
     while ((Get-Date) -lt $deadline) {
         $found = [regex]::Matches((PeelLog), $pattern)
         if ($found.Count -ge $atLeast) { return $found[$found.Count - 1] }
+        Assert-NoUserInput
         Start-Sleep -Milliseconds 100
     }
     return $null
@@ -401,6 +400,8 @@ $wasRunning = (Installed).Count -gt 0
 $originalCursor = [System.Windows.Forms.Cursor]::Position
 try {
     if (-not (Test-Path $app)) { throw "not installed: $app" }
+    Start-GuiGuard -Dir $Dir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    $originalCursor = [System.Windows.Forms.Cursor]::Position
     foreach ($process in Installed) {
         L "stopping the installed Peel pid $($process.Id) for the run"
         StopPeel $process
@@ -425,8 +426,10 @@ try {
     $env:PEEL_SETTINGS = $defaultsFile
     $dragScript = Join-Path $root 'shell\tests\e2e-drag.ps1'
     L "running $dragScript against $app"
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $dragScript -Dir $dragDir -App $app -Peel $peel | Out-Null
+    # This run already waited for idle and has been driving since: no wait.
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $dragScript -Dir $dragDir -App $app -Peel $peel -IdleSeconds 0 | Out-Null
     $drag = Get-Content (Join-Path $dragDir 'result.json') -Raw | ConvertFrom-Json
+    if ($drag.aborted) { throw "PEEL_ABORT $($drag.aborted): in the drag driver" }
     $failed = @($drag.checks | Where-Object { -not $_.ok } | ForEach-Object { $_.name })
     Check 'conversion by drag (installed build)' $drag.ok ("{0} checks, failed: {1}" -f @($drag.checks).Count, ($failed -join '; '))
 
@@ -581,6 +584,7 @@ try {
         $shownSeen = CountLog '(?<!keyboard )wheel shown at'
         [void][In]::Place($start[0], $start[1]); Start-Sleep -Milliseconds 120
         [In]::Move($start[0], $start[1]); Start-Sleep -Milliseconds 80
+        Assert-NoUserInput
         [In]::Down(); Start-Sleep -Milliseconds 100
         for ($s = 1; $s -le 10; $s++) { [In]::Move($start[0] + $s * 12, $start[1] + $s * 6); Start-Sleep -Milliseconds 25 }
         [In]::Tap($keys['Shift'])
@@ -635,9 +639,12 @@ try {
     Check 'no unhandled exceptions' (-not ($text -match 'unhandled')) 'peel.log has no unhandled exception'
 }
 catch {
-    Check 'driver completed' $false "$_"
+    $script:GuiAbort = Get-GuiAbort $_
+    if ($script:GuiAbort) { L "ABORTED: $_" } else { Check 'driver completed' $false "$_" }
 }
 finally {
+    # First: end any drag and let go of every button and key (gui-guard.ps1).
+    try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
     [System.Windows.Forms.Cursor]::Position = $originalCursor
     StopPeel $smokePeel
     CloseTestExplorer
@@ -656,7 +663,8 @@ finally {
     }
     $failed = @($checks | Where-Object { -not $_.ok })
     [pscustomobject]@{
-        ok      = ($failed.Count -eq 0)
+        ok      = ($failed.Count -eq 0 -and -not $script:GuiAbort)
+        aborted = $script:GuiAbort
         checks  = $checks
         samples = $samples
     } | ConvertTo-Json -Depth 4 | Set-Content $resultPath -Encoding UTF8

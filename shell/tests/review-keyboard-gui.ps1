@@ -1,6 +1,9 @@
 param(
     [string]$Dir = 'C:\peel-dev\review-5f8a-gui',
-    [string]$App = (Join-Path (Split-Path -Parent $PSScriptRoot) 'Peel\bin\Release\net8.0-windows\Peel.exe')
+    [string]$App = (Join-Path (Split-Path -Parent $PSScriptRoot) 'Peel\bin\Release\net8.0-windows\Peel.exe'),
+    # gui-guard.ps1: user idle to wait for before driving, and how long to wait.
+    [int]$IdleSeconds = 300,
+    [int]$IdleTimeout = 1800
 )
 $ErrorActionPreference = 'Stop'
 New-Item -ItemType Directory -Force $Dir | Out-Null
@@ -45,6 +48,8 @@ public static class Hold {
 }
 '@
 [void][In]::SetProcessDPIAware()
+# Idle wait, real input abort, and the teardown that ends any drag.
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
 $peelLog = $null
 function PeelLog() { if ($peelLog -and (Test-Path $peelLog)) { return (Get-Content $peelLog -Raw -ErrorAction SilentlyContinue) } ; '' }
 function CountLog($p) { [regex]::Matches((PeelLog), $p).Count }
@@ -86,6 +91,7 @@ function Files($d) { (@(Get-ChildItem $d -File | ForEach-Object { $_.Name }) | S
 $cursor = [System.Windows.Forms.Cursor]::Position
 $peel = $null; $holder = $null
 try {
+    Start-GuiGuard -Dir $Dir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
     L ("screens: " + ((@([System.Windows.Forms.Screen]::AllScreens) | ForEach-Object { "$($_.DeviceName) $($_.Bounds)" }) -join ' | '))
     foreach ($n in 'A','B','C') { $d = Join-Path $Dir $n; Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory -Force $d | Out-Null
         Set-Content -Path (Join-Path $d ("{0}.txt" -f $n.ToLower())) -Value "review $n`r`nline two`r`n" -Encoding UTF8 }
@@ -194,6 +200,8 @@ Start-Sleep -Seconds 25
 }
 catch { L "DRIVER ERROR: $_ at $($_.InvocationInfo.ScriptLineNumber)" }
 finally {
+    # First: end any drag and let go of every button and key (gui-guard.ps1).
+    try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
     [System.Windows.Forms.Cursor]::Position = $cursor
     if ($holder) { Stop-Process -Id $holder.Id -ErrorAction SilentlyContinue }
     if ($peel) { Stop-Process -Id $peel.Id -ErrorAction SilentlyContinue }

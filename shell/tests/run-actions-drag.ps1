@@ -13,7 +13,10 @@ From hqbox:
 #>
 param(
     [string]$Root = (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)),
-    [int]$TimeoutSeconds = 300
+    # The drive budget, counted from the end of the idle wait (driving.txt).
+    [int]$TimeoutSeconds = 300,
+    [int]$IdleSeconds = 300,
+    [int]$IdleTimeout = 1800
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,6 +24,7 @@ $ErrorActionPreference = 'Stop'
 # the first folder alphabetically: a dev copy that still holds an old
 # net8.0-windows build would otherwise launch that stale exe silently.
 . (Join-Path $PSScriptRoot 'e2e-hygiene.ps1')
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
 $app = Find-PeelApp $Root
 if (-not $app) { throw "build the shell first (dotnet build -c Release): no Peel.exe under shell\Peel\bin\Release\net8.0-windows*" }
 
@@ -35,27 +39,11 @@ Remove-Item $resultPath -ErrorAction SilentlyContinue
 # the five new shell actions. Falls back to the installed engine if absent.
 $engine = Join-Path $Root 'engine\.venv\Scripts\peel.exe'
 $engineArg = if (Test-Path $engine) { ' -Engine "{0}"' -f $engine } else { '' }
-$arguments = ('-Dir "{0}" -App "{1}"' -f $dir, $app) + $engineArg
-$taskName = 'PeelActionsDrag'
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f $script, $arguments)
-$me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
-try {
-    Start-ScheduledTask -TaskName $taskName
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    do {
-        Start-Sleep -Seconds 3
-        $state = (Get-ScheduledTask -TaskName $taskName).State
-    } while ($state -eq 'Running' -and (Get-Date) -lt $deadline)
-    if ($state -eq 'Running') {
-        Stop-ScheduledTask -TaskName $taskName
-        Write-Output "TIMEOUT after $TimeoutSeconds seconds"
-    }
-}
-finally {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-}
+$arguments = ('-Dir "{0}" -App "{1}" -IdleSeconds {2} -IdleTimeout {3}' -f $dir, $app, $IdleSeconds, $IdleTimeout) + $engineArg
+# A unique task, and a teardown of any drag if the driver is killed or dies
+# before its own finally (gui-guard.ps1).
+$run = Invoke-GuiTask -Name 'PeelActionsDrag' -Dir $dir -ResultPath $resultPath -TimeoutSeconds $TimeoutSeconds -IdleTimeout $IdleTimeout `
+    -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f $script, $arguments)
 
 $driveLog = Join-Path $dir 'drive.log'
 if (Test-Path $driveLog) {
@@ -70,6 +58,10 @@ $result = Get-Content $resultPath -Raw | ConvertFrom-Json
 Write-Output '--- checks ---'
 foreach ($check in $result.checks) {
     Write-Output ("{0} {1}: {2}" -f $(if ($check.ok) { 'PASS' } else { 'FAIL' }), $check.name, $check.detail)
+}
+if ($result.aborted) {
+    Write-Output "RESULT: ABORTED ($($result.aborted)), not a test failure: run it again when George is idle"
+    exit 3
 }
 Write-Output ("RESULT: {0}" -f $(if ($result.ok) { 'PASS' } else { 'FAIL' }))
 if (-not $result.ok) { exit 1 }
