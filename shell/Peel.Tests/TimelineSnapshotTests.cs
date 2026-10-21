@@ -27,6 +27,7 @@ public class TimelineSnapshotTests
         internal readonly TaskCompletionSource<string> Finish = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal readonly TaskCompletionSource Dying = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal readonly TaskCompletionSource Started = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal readonly TaskCompletionSource CancelSeen = new(TaskCreationOptions.RunContinuationsAsynchronously);
         internal CancellationToken Token;
         internal bool Cancelled;
 
@@ -42,6 +43,7 @@ public class TimelineSnapshotTests
             {
                 // What FrameGrab does: a cancelled run is an answer, not a throw.
                 Cancelled = true;
+                CancelSeen.TrySetResult();
                 await Dying.Task;
                 return $"{name} cancelled";
             }
@@ -67,8 +69,9 @@ public class TimelineSnapshotTests
             asks.Add(gate.RunAsync(token => run.RunAsync(name, token), CancellationToken.None));
         }
 
-        // The first run was cancelled; nothing else starts while it dies.
-        Assert.True(runs[0].Cancelled);
+        // The first run was cancelled; nothing else starts while it dies. Its
+        // catch runs as a continuation, so wait for it rather than read a flag.
+        await runs[0].CancelSeen.Task.WaitAsync(Wait);
         Assert.All(runs.Skip(1), run => Assert.False(run.Started.Task.IsCompleted));
         runs[0].Dying.SetResult();
         // Once it has ended, only the latest ask starts.
@@ -113,7 +116,7 @@ public class TimelineSnapshotTests
         run.Dying.SetResult();
         closing.Cancel();
         var result = await ask.WaitAsync(Wait);
-        Assert.True(run.Cancelled);
+        await run.CancelSeen.Task.WaitAsync(Wait);
         Assert.False(result.Latest);
         Assert.Equal(0, gate.Active);
     }
@@ -131,5 +134,72 @@ public class TimelineSnapshotTests
         Assert.Equal(1, gate.Peak);
         Assert.Equal(0, gate.Active);
         Assert.Contains(results, r => r.Ran && r.Latest);
+    }
+
+    // Review round 1 (lucy): a newer ask publishes itself under the lock and
+    // cancels the older run only after it, so latest has to be the request
+    // order read under the lock. Published pauses the newer ask in that gap.
+    // The asks go through Task.Run so their continuations run on the pool
+    // while the paused ask blocks.
+
+    private static Task<(bool Ran, bool Latest, string? Value)> Ask(LatestRun gate, FakeRun run, string name) =>
+        Task.Run(() => gate.RunAsync(token => run.RunAsync(name, token), CancellationToken.None));
+
+    [Fact]
+    public async Task ARunThatEndsBeforeTheNewerAskCancelsItIsNotLatest()
+    {
+        var gate = new LatestRun();
+        var first = new FakeRun();
+        var firstAsk = Ask(gate, first, "0");
+        await first.Started.Task.WaitAsync(Wait);
+
+        gate.Published = () =>
+        {
+            // The newer ask is published but has not cancelled the first yet,
+            // and the first run's frame arrives right now.
+            first.Finish.SetResult("frame 0");
+            Assert.True(firstAsk.Wait(Wait), "the first ask did not end");
+        };
+        var second = new FakeRun();
+        var secondAsk = Ask(gate, second, "1");
+
+        var result = await firstAsk.WaitAsync(Wait);
+        Assert.Equal((true, false, "frame 0"), result);
+        await second.Started.Task.WaitAsync(Wait);
+        second.Finish.SetResult("frame 1");
+        Assert.Equal((true, true, "frame 1"), await secondAsk.WaitAsync(Wait));
+        Assert.False(first.Cancelled);
+        Assert.Equal(1, gate.Peak);
+    }
+
+    [Fact]
+    public async Task AnAskOvertakenButNotYetCancelledNeverStarts()
+    {
+        var gate = new LatestRun();
+        var runs = Enumerable.Range(0, 3).Select(_ => new FakeRun()).ToArray();
+        var asks = new Task<(bool Ran, bool Latest, string? Value)>[3];
+        asks[0] = Ask(gate, runs[0], "0");
+        await runs[0].Started.Task.WaitAsync(Wait);
+        // The second ask cancels the first and waits for it to die.
+        asks[1] = Ask(gate, runs[1], "1");
+        await runs[0].CancelSeen.Task.WaitAsync(Wait);
+
+        var paused = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        gate.Published = () =>
+        {
+            // The third ask is published but has not cancelled the second yet,
+            // and the first run ends now, which lets the second go on.
+            runs[0].Dying.SetResult();
+            var went = Task.WhenAny(asks[1], runs[1].Started.Task).Wait(Wait);
+            paused.SetResult(went && !runs[1].Started.Task.IsCompleted);
+        };
+        asks[2] = Ask(gate, runs[2], "2");
+
+        Assert.True(await paused.Task.WaitAsync(Wait), "the overtaken ask started an engine");
+        Assert.Equal((false, false, (string?)null), await asks[1].WaitAsync(Wait));
+        await runs[2].Started.Task.WaitAsync(Wait);
+        runs[2].Finish.SetResult("frame 2");
+        Assert.Equal((true, true, "frame 2"), await asks[2].WaitAsync(Wait));
+        Assert.Equal(1, gate.Peak);
     }
 }

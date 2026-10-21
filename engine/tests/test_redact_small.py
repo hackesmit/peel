@@ -124,3 +124,73 @@ def test_the_pixels_outside_the_box_are_not_blurred(reg, grainy, tmp_path):
     # The neighbourhood the blur read from stays as sharp as it was.
     ring = (140, 90, 8, 8)
     assert grain(luma(result.outputs[0], ring)) > grain(luma(source, ring)) * 0.6
+
+
+# Round 2 (lucy, review round 1): on a frame only 2 px wide or tall the window
+# cannot hold any radius, both evaluate to 0, and boxblur handed the box back
+# untouched while the run reported success. Such a box is now filled with its
+# own average colour. The fixtures are lossless and a checkerboard of black
+# and white, the most contrast a box can hold.
+
+def checkerboard(target: Path, size: str, *, chroma: bool = False) -> Path:
+    """A lossless clip whose luma alternates black and white pixel by pixel,
+    or (chroma=True) flat luma with red and blue columns two pixels wide."""
+    if chroma:
+        expr = "lum=128:cb='if(lt(mod(X,4),2),90,170)':cr='if(lt(mod(X,4),2),240,16)'"
+    else:
+        expr = "lum='if(eq(mod(X+Y,2),0),235,16)':cb=128:cr=128"
+    subprocess.run(
+        [FFMPEG, "-v", "error", "-y", "-f", "lavfi",
+         "-i", f"color=c=black:size={size}:rate=10:duration=0.3,format=yuv444p,geq={expr}",
+         "-c:v", "ffv1", "-slices", "1", "-pix_fmt", "yuv420p", str(target)],
+        check=True,
+    )
+    return target
+
+
+def plane(path: Path, rect: tuple[int, int, int, int], fmt: str = "gray") -> list[int]:
+    """The first frame's pixels inside rect in one plane: gray is luma; u and v
+    take a yuv444p frame's chroma planes."""
+    x, y, w, h = rect
+    pick = {"gray": "format=gray", "u": "format=yuv444p,extractplanes=u", "v": "format=yuv444p,extractplanes=v"}[fmt]
+    raw = subprocess.run(
+        [FFMPEG, "-v", "error", "-i", str(path), "-frames:v", "1",
+         "-vf", f"crop={w}:{h}:{x}:{y},{pick}", "-f", "rawvideo", "-"],
+        capture_output=True, check=True,
+    ).stdout
+    assert len(raw) == w * h
+    return list(raw)
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(
+    "size, rect",
+    [
+        ("2x2", (0, 0, 2, 2)),     # the whole frame
+        ("2x16", (0, 4, 2, 8)),    # two pixels wide
+        ("16x2", (4, 0, 8, 2)),    # two pixels tall
+    ],
+)
+def test_a_frame_too_small_to_blur_is_still_obscured(reg, tmp_path, size, rect):
+    source = checkerboard(tmp_path / "check.mkv", size)
+    assert max(plane(source, rect)) - min(plane(source, rect)) > 200
+    result = reg.run("av.video_redact", [source], {"x": rect[0], "y": rect[1], "w": rect[2], "h": rect[3], "strength": 12})
+    assert result.ok, result.message
+    pixels = plane(result.outputs[0], rect)
+    # Black and white have met in the middle: no pixel is near either.
+    assert max(pixels) - min(pixels) < 40, pixels
+    assert all(70 < v < 180 for v in pixels), pixels
+
+
+@needs_ffmpeg
+def test_colour_too_small_to_blur_is_still_obscured(reg, tmp_path):
+    # A 4 px wide frame holds a luma radius of 1, but its 4:2:0 chroma plane is
+    # 2 px wide and holds none: red and blue columns would come through.
+    source = checkerboard(tmp_path / "stripes.mkv", "4x16", chroma=True)
+    rect = (0, 0, 4, 16)
+    result = reg.run("av.video_redact", [source], {"x": 0, "y": 0, "w": 4, "h": 16, "strength": 12})
+    assert result.ok, result.message
+    for fmt in ("u", "v"):
+        assert max(plane(source, rect, fmt)) - min(plane(source, rect, fmt)) > 70
+        pixels = plane(result.outputs[0], rect, fmt)
+        assert max(pixels) - min(pixels) < 20, (fmt, pixels)

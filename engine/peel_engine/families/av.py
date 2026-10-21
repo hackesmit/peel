@@ -1337,20 +1337,50 @@ def video_mute(job: Job) -> Result:
     return ok([target], f"Wrote {target.name} without audio")
 
 
+# Below this radius (or the asked strength, if smaller) a blur no longer hides
+# what is under it: on a frame two pixels wide or tall every radius is 0 and
+# boxblur passes the box through untouched.
+_MIN_BLUR_RADIUS = 2
+
+
+def _box_window(x: int, y: int, w: int, h: int, width: int, height: int, strength: int) -> tuple[int, int, int, int]:
+    """The left, top, right and bottom of the neighbourhood the box is blurred
+    in: wide enough for the blur's full reach (two passes of the radius),
+    clamped to the frame, starting on an even pixel."""
+    reach = 2 * strength
+    left, top = max(0, x - reach) & ~1, max(0, y - reach) & ~1
+    return left, top, min(width, x + w + reach), min(height, y + h + reach)
+
+
+def _blur_reaches(x: int, y: int, w: int, h: int, width: int, height: int, strength: int) -> bool:
+    """Whether every plane of the box's window holds a useful blur radius.
+    Chroma is taken as half the window (4:2:0, rounded up), the smallest any
+    source can have, so this never says yes when a plane would come up short."""
+    left, top, right, bottom = _box_window(x, y, w, h, width, height, strength)
+    luma = min(right - left, bottom - top)
+    chroma = min(-(-(right - left) // 2), -(-(bottom - top) // 2))
+    floor = min(strength, _MIN_BLUR_RADIUS)
+    return min((luma - 1) // 2, (chroma - 1) // 2) >= floor
+
+
 def _box_blur(x: int, y: int, w: int, h: int, width: int, height: int, strength: int) -> str:
     """The filters that turn a frame into the blurred box at x, y, w by h.
 
     boxblur refuses a radius over (shorter side - 1) / 2 of each plane, and a
     chroma plane can be half the box, so blurring the cropped box alone fails
     on a small box and cannot touch a 2x2 one at all. Blur a window of the
-    box's neighbourhood instead, wide enough for the blur's full reach (two
-    passes of the radius), with each plane's radius clamped to what the window
-    holds, then crop the box back out at its exact size. The window starts on
-    an even pixel, so on a subsampled frame the inner crop stays on the chroma
-    grid whenever the box does."""
-    reach = 2 * strength
-    left, top = max(0, x - reach) & ~1, max(0, y - reach) & ~1
-    right, bottom = min(width, x + w + reach), min(height, y + h + reach)
+    box's neighbourhood instead (_box_window), with each plane's radius
+    clamped to what the window holds, then crop the box back out at its exact
+    size. The window starts on an even pixel, so on a subsampled frame the
+    inner crop stays on the chroma grid whenever the box does.
+
+    When the window is too small for a useful radius (_blur_reaches), the box
+    is filled with its own average colour instead, so it is always hidden.
+    The caller runs that fill on yuv444p, where every pixel has its own
+    chroma."""
+    if not _blur_reaches(x, y, w, h, width, height, strength):
+        return f"crop={w}:{h}:{x}:{y},pixelize=w={min(w, 1024)}:h={min(h, 1024)}:m=avg"
+    left, top, right, bottom = _box_window(x, y, w, h, width, height, strength)
     radius = (
         f"lr='min({strength},floor((min(w,h)-1)/2))':lp=2:"
         f"cr='min({strength},floor((min(cw,ch)-1)/2))':cp=2"
@@ -1377,12 +1407,14 @@ def video_redact(job: Job) -> Result:
         window = f":enable='between(t,{start:.3f},{end:.3f})'"
 
     target = job.output_path()
-    if w % 2 or h % 2 or x % 2 or y % 2:
+    if w % 2 or h % 2 or x % 2 or y % 2 or not _blur_reaches(x, y, w, h, width, height, strength):
         # On a chroma subsampled frame (yuv420p) crop and overlay snap to the
         # 2 pixel chroma grid (overlay also works in yuv420 unless told
         # otherwise), so an odd box (an odd frame covered edge to edge, say)
         # would blur one column or row short. Blur and overlay on a frame with
         # no subsampling, then hand the encoder the source's own format back.
+        # The average fill for a frame too small to blur goes this way too,
+        # so the fill is one colour per pixel, not per chroma block.
         streams = _streams(info, "video")
         back = streams[0].get("pix_fmt") if streams else None
         graph = (
