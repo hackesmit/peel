@@ -42,8 +42,10 @@ again from its folder also opens the settings.
 - **Output**: next to the source file, or always into one folder. If that
   folder is missing (for example an unplugged drive), Peel writes next to the
   source instead.
-- **Compress quality**: Smaller files, Balanced or Better quality. It changes
-  what Compress does to images and audio when you do not choose a value.
+- **Compress quality**: Smaller files, Balanced or Better quality. It sets the
+  quality of Compress for images, video and audio when you do not choose a
+  value yourself. Balanced is what Compress does with no setting. Other tools,
+  such as video Trim or Crop, keep their own default.
 - **Start up**: start Peel when you sign in.
 
 Changes apply at once, no restart. They are saved in
@@ -69,14 +71,16 @@ Changes apply at once, no restart. They are saved in
 
 | What | Where |
 | --- | --- |
-| The app | `%LOCALAPPDATA%\Peel\app` |
-| The engine and its Python | `%LOCALAPPDATA%\Peel\engine`, `%LOCALAPPDATA%\Peel\venv` |
+| The app | `%LOCALAPPDATA%\Peel\app`, which points to the build in use under `%LOCALAPPDATA%\Peel\versions` |
+| The engine and its Python | `%LOCALAPPDATA%\Peel\venv`, which points to the engine that goes with that build |
 | Settings | `%APPDATA%\Peel\settings.json` |
 | Log | `%LOCALAPPDATA%\Peel\logs\peel.log` |
 | Start at sign in | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, value `Peel` |
 
 Nothing needs administrator rights. To upgrade, the HQ runs
-`install\publish.ps1` again: it stops Peel, replaces the engine and the app
-and starts it again; if the upgrade fails it starts the build it had. The
+`install\publish.ps1` again: it builds the new app and engine while Peel
+runs, then stops Peel, switches to the new pair and starts it. If the new
+build does not stay up for 10 seconds, it goes back to the app, engine and
+settings it had and starts them again. The
 start at sign in entry always names the installed app, never a test build. To remove Peel, quit it, turn off **Start up** in Settings, and delete
 the `%LOCALAPPDATA%\Peel` folder.
