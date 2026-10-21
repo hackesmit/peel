@@ -36,7 +36,9 @@ param(
     [string]$Expect = 'sample.md',
     # gui-guard.ps1: user idle to wait for before driving, and how long to wait.
     [int]$IdleSeconds = 300,
-    [int]$IdleTimeout = 1800
+    [int]$IdleTimeout = 1800,
+    # The run folder a runner made for this run (gui-guard.ps1, Invoke-GuiTask).
+    [string]$GuardDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -91,35 +93,10 @@ Add-Type -AssemblyName System.Windows.Forms, UIAutomationClient, UIAutomationTyp
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class In {
-  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
-  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint f, UIntPtr e);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder s, int n);
   public static string FgClass() { var c = new System.Text.StringBuilder(256); GetClassName(GetForegroundWindow(), c, 256); return c.ToString(); }
-  public static void Click() { mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero); System.Threading.Thread.Sleep(60); mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero); }
-  public static void Place(int x, int y) { SetCursorPos(x, y); }
-  public static void Down() { mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero); }
-  public static void Up() { mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero); }
-  // down then up for one key, with the extended flag for the arrow keys.
-  public static void TapEx(byte vk, bool ext) {
-    uint f = ext ? 0x0001u : 0u;
-    keybd_event(vk, 0, f, UIntPtr.Zero);
-    System.Threading.Thread.Sleep(45);
-    keybd_event(vk, 0, f | 0x0002u, UIntPtr.Zero);
-  }
-  public static void Tap(byte vk) { TapEx(vk, false); }
-  public static void Key(byte vk, bool down) { keybd_event(vk, 0, down ? 0u : 0x0002u, UIntPtr.Zero); }
-  // Ctrl+Alt+Enter, pressed as a chord and released cleanly.
-  public static void Hotkey() {
-    Key(0x11, true);  System.Threading.Thread.Sleep(40);
-    Key(0x12, true);  System.Threading.Thread.Sleep(40);
-    Key(0x0D, true);  System.Threading.Thread.Sleep(60);
-    Key(0x0D, false); System.Threading.Thread.Sleep(40);
-    Key(0x12, false); System.Threading.Thread.Sleep(40);
-    Key(0x11, false);
-  }
 }
 '@
 [void][In]::SetProcessDPIAware()
@@ -164,8 +141,8 @@ function SelectItem($item) {
     $r = $item.Current.BoundingRectangle
     $x = [int]($r.X + 24); $y = [int]($r.Y + $r.Height / 2)
     L "click to select at $x,$y"
-    [void][In]::Place($x, $y); Start-Sleep -Milliseconds 150
-    [In]::Down(); Start-Sleep -Milliseconds 70; [In]::Up()
+    [void][PeelGuard]::Place($x, $y); Start-Sleep -Milliseconds 150
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 70; [PeelGuard]::Up()
     Start-Sleep -Milliseconds 350
 }
 
@@ -175,7 +152,7 @@ function AimAt($target, $labels) {
     for ($i = 0; $i -lt ($labels.Count + 2); $i++) {
         if ((Highlight) -eq $target) { return }
         $seen = CountLog 'keyboard highlight '
-        [In]::TapEx($VkRight, $true)
+        [PeelGuard]::TapEx($VkRight, $true)
         WaitLog 'keyboard highlight ' 3000 ($seen + 1) | Out-Null
     }
 }
@@ -183,10 +160,7 @@ function AimAt($target, $labels) {
 $peelProcess = $null
 $originalCursor = [System.Windows.Forms.Cursor]::Position
 try {
-    # A share sheet left by an earlier run sits over the test window and
-    # swallows the drag, so clear the desktop first (e2e-hygiene.ps1).
     . (Join-Path $PSScriptRoot 'e2e-hygiene.ps1')
-    L ("start: " + (Close-ShareSheets).Text)
     Set-Content -Path (Join-Path $test $Source) -Value "Peel keyboard test`r`nline two`r`n" -Encoding UTF8
     L "source ready: $test\$Source"
 
@@ -198,7 +172,11 @@ try {
     Check 'engine offers the segment' ($offered -contains $Segment) "peel options convert wheel: $($offered -join ',')"
     if ($offered -notcontains $Segment) { throw "the engine does not offer a $Segment conversion for $Source" }
 
-    Start-GuiGuard -Dir $Dir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    Start-GuiGuard -Dir $Dir -RunDir $GuardDir -PauseInstalledFor $App -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    # A share sheet left by an earlier run sits over the test window and
+    # swallows the drag, so clear the desktop first (e2e-hygiene.ps1). Only
+    # once the drive started: before that the sheet can be Daniel's own.
+    L ("start: " + (Close-ShareSheets).Text)
     $originalCursor = [System.Windows.Forms.Cursor]::Position
 
     $env:PEEL_LOG = $peelLog
@@ -219,7 +197,7 @@ try {
 
     # Scenario A: select, hotkey, arrow to the segment, Enter.
     SelectItem $item
-    [In]::Hotkey()
+    [PeelGuard]::Hotkey()
     $shown = WaitLog 'keyboard wheel shown at (\d+),(\d+)' 6000
     Check 'hotkey opens the wheel' ($shown -ne $null) "$($shown.Value)"
     if (-not $shown) { throw 'the keyboard wheel never opened' }
@@ -236,14 +214,14 @@ try {
     # logic itself is pinned by KeyboardNavigatorTests). A busier registry makes
     # AimAt below step across real segments.
     $seen = CountLog 'keyboard highlight '
-    [In]::TapEx($VkRight, $true)
+    [PeelGuard]::TapEx($VkRight, $true)
     $moved = WaitLog 'keyboard highlight ' 3000 ($seen + 1)
     Check 'an arrow key drives the highlight' ($moved -ne $null) "highlight after Right: $($moved.Value)"
 
     AimAt $Segment $labels
     Check 'arrow keys reach the segment' ((Highlight) -eq $Segment) "highlight=$(Highlight), target=$Segment"
 
-    [In]::Tap($VkEnter)
+    [PeelGuard]::Tap($VkEnter)
     $ran = WaitLog 'keyboard run (\S+) on (\d+) file' 6000
     Check 'Enter runs the highlighted segment' ($ran -ne $null) "$($ran.Value)"
 
@@ -264,11 +242,11 @@ try {
     $runsBefore = CountLog 'keyboard run '
     $shownSeen = CountLog 'keyboard wheel shown at'
     SelectItem $item
-    [In]::Hotkey()
+    [PeelGuard]::Hotkey()
     $shown = WaitLog 'keyboard wheel shown at (\d+),(\d+)' 6000 ($shownSeen + 1)
     Check 'hotkey opens the wheel again' ($shown -ne $null) "$($shown.Value)"
     WaitLog 'keyboard wheel convert page 0: (.+)' 6000 | Out-Null
-    [In]::Tap($VkEsc)
+    [PeelGuard]::Tap($VkEsc)
     $cancelled = WaitLog 'keyboard wheel hidden \(escape\)' 4000
     Check 'Escape closes the wheel' ($cancelled -ne $null) "$($cancelled.Value)"
     Start-Sleep -Seconds 2
@@ -285,8 +263,8 @@ try {
     if (-not $item) { throw "$Source vanished from Explorer" }
     SelectItem $item
     $shownSeen = CountLog 'keyboard wheel shown at'
-    [In]::Hotkey()
-    [In]::Click()
+    [PeelGuard]::Hotkey()
+    [PeelGuard]::Click()
     L 'clicked Explorer right after the hotkey'
     $shown = WaitLog 'keyboard wheel shown at (\d+),(\d+)' 6000 ($shownSeen + 1)
     Start-Sleep -Milliseconds 1200
@@ -296,13 +274,13 @@ try {
     $item = FindItem $Source
     if ($item -and [In]::FgClass() -ne 'CabinetWClass') { SelectItem $item }
     $shownSeen = CountLog 'keyboard wheel shown at'
-    [In]::Hotkey()
+    [PeelGuard]::Hotkey()
     $again = WaitLog 'keyboard wheel shown at (\d+),(\d+)' 6000 ($shownSeen + 1)
     Check 'the hotkey opens the wheel again after a click' ($again -ne $null) "$($again.Value)"
     Check 'no press is ignored' ((CountLog 'ignored') -eq 0) "ignored lines: $(CountLog 'ignored')"
     WaitLog 'keyboard wheel convert page 0: (.+)' 6000 | Out-Null
     $hiddenSeen = CountLog 'keyboard wheel hidden \(escape\)'
-    [In]::Tap($VkEsc)
+    [PeelGuard]::Tap($VkEsc)
     $closed = WaitLog 'keyboard wheel hidden \(escape\)' 4000 ($hiddenSeen + 1)
     Check 'Escape closes the reopened wheel' ($closed -ne $null) "$($closed.Value)"
 
@@ -312,7 +290,7 @@ try {
     if (-not $item) { throw "$Source vanished from Explorer" }
     SelectItem $item
     $shownSeen = CountLog 'keyboard wheel shown at'
-    [In]::Hotkey()
+    [PeelGuard]::Hotkey()
     $shown = WaitLog 'keyboard wheel shown at (\d+),(\d+)' 6000 ($shownSeen + 1)
     $timedOut = WaitLog 'keyboard wheel hidden \(timeout\)' 14000
     Check 'an idle wheel closes after the timeout' (($shown -ne $null) -and ($timedOut -ne $null)) "$($timedOut.Value)"
@@ -328,7 +306,7 @@ finally {
     # First: end any drag and let go of every button and key (gui-guard.ps1).
     try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
     try { L ("end: " + (Close-ShareSheets).Text) } catch { L "end: share sheet check failed: $_" }
-    [System.Windows.Forms.Cursor]::Position = $originalCursor
+    Restore-GuiCursor $originalCursor
     if ($peelProcess) { Stop-Process -Id $peelProcess.Id -ErrorAction SilentlyContinue }
     CloseTestExplorer
     $failed = @($checks | Where-Object { -not $_.ok })

@@ -48,7 +48,9 @@ param(
     [string]$Peel = 'C:\peel-dev\venv-64ec\Scripts\peel.exe',
     [string]$Check = '',
     [int]$IdleSeconds = 300,
-    [int]$IdleTimeout = 3600
+    [int]$IdleTimeout = 3600,
+    # The run folder a runner made for this run (gui-guard.ps1, Invoke-GuiTask).
+    [string]$GuardDir = ''
 )
 $Python = Join-Path (Split-Path -Parent $Peel) 'python.exe'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -100,24 +102,9 @@ Add-Type -AssemblyName System.Drawing, System.Windows.Forms, UIAutomationClient,
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class InTl {
-  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
-  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint f, UIntPtr e);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
   [DllImport("user32.dll")] public static extern uint GetDoubleClickTime();
-  // SetCursorPos does not reach a low level hook. Absolute SendInput moves do.
-  public static void Move(int x, int y) {
-    int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77), vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
-    int ax = (int)(((x - vx) * 65535.0) / (vw - 1)), ay = (int)(((y - vy) * 65535.0) / (vh - 1));
-    mouse_event(0x0001 | 0x8000 | 0x4000, ax, ay, 0, UIntPtr.Zero);
-  }
-  public static void Place(int x, int y) { SetCursorPos(x, y); }
-  public static void Down() { mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero); }
-  public static void Up() { mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero); }
-  public static void Tap(byte vk) {
-    keybd_event(vk, 0, 0, UIntPtr.Zero); System.Threading.Thread.Sleep(60); keybd_event(vk, 0, 2, UIntPtr.Zero);
-  }
 }
 '@
 [void][InTl]::SetProcessDPIAware()
@@ -131,7 +118,7 @@ $Tree = [System.Windows.Automation.TreeScope]
 
 function MoveTo($x, $y) {
     Assert-NoUserInput
-    [InTl]::Move([int]$x, [int]$y)
+    [PeelGuard]::Move([int]$x, [int]$y)
     $script:cursor = @([int]$x, [int]$y)
 }
 
@@ -146,27 +133,27 @@ function GlideTo($x, $y, $steps = 8) {
 function ClickAt($x, $y) {
     MoveTo $x $y
     Start-Sleep -Milliseconds 120
-    [InTl]::Down(); Start-Sleep -Milliseconds 80; [InTl]::Up()
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 80; [PeelGuard]::Up()
     Start-Sleep -Milliseconds 250
 }
 
 function DoubleClickAt($x, $y) {
     MoveTo $x $y
     Start-Sleep -Milliseconds 120
-    [InTl]::Down(); Start-Sleep -Milliseconds 40; [InTl]::Up()
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 40; [PeelGuard]::Up()
     Start-Sleep -Milliseconds 60
-    [InTl]::Down(); Start-Sleep -Milliseconds 40; [InTl]::Up()
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 40; [PeelGuard]::Up()
     Start-Sleep -Milliseconds 300
 }
 
 function DragFromTo($from, $to) {
     MoveTo $from[0] $from[1]
     Start-Sleep -Milliseconds 150
-    [InTl]::Down()
+    [PeelGuard]::Down()
     Start-Sleep -Milliseconds 120
     GlideTo $to[0] $to[1] 12
     Start-Sleep -Milliseconds 150
-    [InTl]::Up()
+    [PeelGuard]::Up()
     Start-Sleep -Milliseconds 300
 }
 
@@ -202,9 +189,9 @@ function StartDragFrom($item) {
     $r = $item.Current.BoundingRectangle
     $x = [int]($r.X + 24); $y = [int]($r.Y + $r.Height / 2)
     L "grab at $x,$y"
-    [void][InTl]::Place($x, $y); Start-Sleep -Milliseconds 250
+    [void][PeelGuard]::Place($x, $y); Start-Sleep -Milliseconds 250
     MoveTo $x $y; Start-Sleep -Milliseconds 120
-    [InTl]::Down(); Start-Sleep -Milliseconds 120
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 120
     for ($i = 1; $i -le 14; $i++) {
         MoveTo ($x + $i * 14) ($y + $i * 7)
         Start-Sleep -Milliseconds 30
@@ -359,7 +346,7 @@ function OpenEditorFrom($source, $label) {
     if (-not (WaitLog 'drag start at' 5000 ($drags + 1))) { throw "the hook did not see the drag of $source" }
     $shown = CountLog 'wheel shown at'
     $drawn = CountLog 'wheel tool page 0: '
-    [InTl]::Tap($VkCtrl)
+    [PeelGuard]::Tap($VkCtrl)
     $line = WaitLog 'wheel shown at (\d+),(\d+)' 5000 ($shown + 1)
     if (-not $line) { throw 'the tools wheel never opened' }
     $centre = @([int]$line.Groups[1].Value, [int]$line.Groups[2].Value)
@@ -373,7 +360,7 @@ function OpenEditorFrom($source, $label) {
     GlideTo $target[0] $target[1]
     Start-Sleep -Milliseconds 400
     $drops = CountLog "drop on $label with"
-    [InTl]::Up()
+    [PeelGuard]::Up()
     $drop = WaitLog "drop on $label with (\d+) file" 6000 ($drops + 1)
     Check "$label opens from the wheel for $source" ($drop -ne $null) "$($drop.Value)"
 }
@@ -410,7 +397,7 @@ try {
         Check "the engine offers the $($pair[0]) editors" ($offered.Count -eq $pair[1]) ($offered -join ',')
     }
 
-    Start-GuiGuard -Dir $Dir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    Start-GuiGuard -Dir $Dir -RunDir $GuardDir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
     $originalCursor = [System.Windows.Forms.Cursor]::Position
 
     # Daniel's Peel holds the single instance mutex; pause it for the run.
@@ -705,7 +692,7 @@ try {
     if ($win) {
         $null = BarRect 'av.video_trim' 20000 ($bars + 1)
         $null = WaitLog 'av\.video_trim: frame strip of' 30000 2
-        [InTl]::Tap($VkEsc)
+        [PeelGuard]::Tap($VkEsc)
         Check 'Escape closes the editor' ((WaitLog 'av\.video_trim: editor cancelled' 5000) -ne $null) 'from the log'
     }
     Start-Sleep -Seconds 2
@@ -730,7 +717,7 @@ catch {
 finally {
     # First: end any drag and let go of every button and key (gui-guard.ps1).
     try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
-    [System.Windows.Forms.Cursor]::Position = $originalCursor
+    Restore-GuiCursor $originalCursor
     if ($peelProcess) {
         # Its editor windows go with it.
         Stop-Process -Id $peelProcess.Id -ErrorAction SilentlyContinue

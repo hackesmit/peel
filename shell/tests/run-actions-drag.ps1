@@ -4,9 +4,10 @@ desktop session and report the result. A drag and the share sheet need a real
 desktop; a process started over ssh lands in session 0, which has none. This
 schedules a task with an Interactive principal, the same way run-e2e.ps1 does.
 
-Daniel has to be logged in at the console. The caller takes C:\peel-dev\gui.lock
-before running this (three peel workers share the real mouse) and removes it
-after.
+Daniel has to be logged in at the console. This runner takes
+C:\peel-dev\gui.lock itself (several peel workers share the real mouse; do not
+create it first) and holds it until the teardown and the restart of the
+installed Peel are done (gui-guard.ps1, Invoke-GuiDriver).
 
 From hqbox:
   ssh george "powershell -NoProfile -ExecutionPolicy Bypass -File C:\peel-dev\<branch>\shell\tests\run-actions-drag.ps1"
@@ -33,17 +34,23 @@ if (-not (Test-Path $script)) { throw "driver not found: $script" }
 $dir = 'C:\peel-dev\e2e-actions'
 $resultPath = Join-Path $dir 'result.json'
 New-Item -ItemType Directory -Force $dir | Out-Null
-Remove-Item $resultPath -ErrorAction SilentlyContinue
 
 # The dev engine built in engine\.venv (pip install --no-deps -e .), which has
 # the five new shell actions. Falls back to the installed engine if absent.
 $engine = Join-Path $Root 'engine\.venv\Scripts\peel.exe'
 $engineArg = if (Test-Path $engine) { ' -Engine "{0}"' -f $engine } else { '' }
 $arguments = ('-Dir "{0}" -App "{1}" -IdleSeconds {2} -IdleTimeout {3}' -f $dir, $app, $IdleSeconds, $IdleTimeout) + $engineArg
-# A unique task, and a teardown of any drag if the driver is killed or dies
-# before its own finally (gui-guard.ps1).
-$run = Invoke-GuiTask -Name 'PeelActionsDrag' -Dir $dir -ResultPath $resultPath -TimeoutSeconds $TimeoutSeconds -IdleTimeout $IdleTimeout `
-    -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f $script, $arguments)
+# gui.lock, a unique task, a teardown of any drag if the driver is killed or
+# dies before its own finally, and Daniel's Peel back (gui-guard.ps1).
+try {
+    $run = Invoke-GuiDriver -Name 'PeelActionsDrag' -Dir $dir -ResultPath $resultPath -App $app -TimeoutSeconds $TimeoutSeconds -IdleTimeout $IdleTimeout `
+        -Arguments ('-NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f $script, $arguments)
+}
+catch {
+    if (-not (Get-GuiAbort $_)) { throw }
+    Write-Output "RESULT: ABORTED ($(Get-GuiAbort $_)), not a test failure: $_"
+    exit 3
+}
 
 $driveLog = Join-Path $dir 'drive.log'
 if (Test-Path $driveLog) {

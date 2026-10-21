@@ -37,12 +37,20 @@ $resultPath = Join-Path $dir 'result.json'
 $pausedMarker = Join-Path $dir 'installed-paused.txt'
 $installedApp = Join-Path $env:LOCALAPPDATA 'Peel\app\Peel.exe'
 New-Item -ItemType Directory -Force $dir | Out-Null
-Remove-Item $resultPath, $pausedMarker -ErrorAction SilentlyContinue
 
 $arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" -Dir "{1}" -App "{2}" -Peel "{3}" -IdleSeconds {4} -IdleTimeout {5}' -f `
     $script, $dir, $app, $Engine, $IdleSeconds, $IdleTimeout
 $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $principal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
+# gui.lock for the whole run, the restart of Daniel's Peel included; it is
+# created exclusively and goes when this process ends (gui-guard.ps1).
+try { Enter-GuiLock $IdleTimeout }
+catch {
+    if (-not (Get-GuiAbort $_)) { throw }
+    Write-Output "RESULT: ABORTED ($(Get-GuiAbort $_)), not a test failure: $_"
+    exit 3
+}
+Remove-Item $pausedMarker -ErrorAction SilentlyContinue
 try {
     # A unique task, and a teardown of any drag if the driver is killed or
     # dies before its own finally (gui-guard.ps1).
@@ -72,6 +80,7 @@ finally {
         Remove-Item $pausedMarker -ErrorAction SilentlyContinue
         Write-Output 'RECOVERY: the driver did not finish; restarted the installed Peel'
     }
+    Exit-GuiLock
 }
 
 $driveLog = Join-Path $dir 'drive.log'

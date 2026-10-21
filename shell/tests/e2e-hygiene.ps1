@@ -55,7 +55,6 @@ public static class PeelShareSheet {
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
     [DllImport("user32.dll")] private static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr h);
-    [DllImport("user32.dll")] private static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
     [DllImport("dwmapi.dll")] private static extern int DwmGetWindowAttribute(IntPtr h, int a, out int v, int s);
 
     private static string Text(IntPtr h) { var s = new StringBuilder(256); GetWindowText(h, s, 256); return s.ToString(); }
@@ -83,28 +82,38 @@ public static class PeelShareSheet {
         return found;
     }
 
-    /// <summary>Ask each sheet to close: WM_CLOSE, then Escape if it stays.</summary>
-    public static int CloseAll() {
+    /// <summary>Ask each sheet to close with WM_CLOSE. Returns how many there were.</summary>
+    public static int PostClose() {
         var sheets = Find();
         foreach (var h in sheets) PostMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero);
         System.Threading.Thread.Sleep(800);
-        foreach (var h in Find()) {
-            SetForegroundWindow(h);
-            System.Threading.Thread.Sleep(150);
-            keybd_event(0x1B, 0, 0, UIntPtr.Zero);
-            keybd_event(0x1B, 0, 2, UIntPtr.Zero);
-        }
-        System.Threading.Thread.Sleep(800);
         return sheets.Count;
     }
+
+    public static void Front(IntPtr h) { SetForegroundWindow(h); System.Threading.Thread.Sleep(150); }
 }
 "@
 }
 
 # Returns a one-line description for the caller's log: how many sheets were
 # found, and how many are still on screen afterwards (0 means clean).
+# A sheet that stays after WM_CLOSE gets Escape, through the GUI guard's
+# cleanup path (gui-guard.ps1): only in a run that drove and that no person
+# touched. A run that never drove does not touch the desktop at all, since a
+# sheet on screen then can be Daniel's own.
 function Close-ShareSheets {
-    $found = [PeelShareSheet]::CloseAll()
+    if (('PeelGuard' -as [type]) -and [PeelGuard]::RunDir -and -not [PeelGuard]::Drove) {
+        return [pscustomobject]@{ Found = 0; Left = 0; Text = 'share sheets not touched: this run did not drive' }
+    }
+    $found = [PeelShareSheet]::PostClose()
+    $stayed = @([PeelShareSheet]::Find())
+    if ($stayed.Count -gt 0 -and ('PeelGuard' -as [type])) {
+        foreach ($h in $stayed) {
+            [PeelShareSheet]::Front($h)
+            [void][PeelGuard]::CleanupTap([byte]0x1B)
+        }
+        Start-Sleep -Milliseconds 800
+    }
     $left = ([PeelShareSheet]::Find()).Count
     return [pscustomobject]@{ Found = $found; Left = $left; Text = "share sheets found $found, left $left" }
 }

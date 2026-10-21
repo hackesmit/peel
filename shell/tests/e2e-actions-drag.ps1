@@ -29,7 +29,9 @@ param(
     [string]$Source = 'sample.txt',
     # gui-guard.ps1: user idle to wait for before driving, and how long to wait.
     [int]$IdleSeconds = 300,
-    [int]$IdleTimeout = 1800
+    [int]$IdleTimeout = 1800,
+    # The run folder a runner made for this run (gui-guard.ps1, Invoke-GuiTask).
+    [string]$GuardDir = ''
 )
 if (-not $Engine) { $Engine = "$env:LOCALAPPDATA\Peel\venv\Scripts\peel.exe" }
 $Peel = $Engine
@@ -82,24 +84,8 @@ Add-Type -AssemblyName System.Drawing, System.Windows.Forms, UIAutomationClient,
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class In {
-  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
-  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint f, UIntPtr e);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
-  public static void Move(int x, int y) {
-    int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77), vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
-    int ax = (int)(((x - vx) * 65535.0) / (vw - 1)), ay = (int)(((y - vy) * 65535.0) / (vh - 1));
-    mouse_event(0x0001 | 0x8000 | 0x4000, ax, ay, 0, UIntPtr.Zero);
-  }
-  public static void Place(int x, int y) { SetCursorPos(x, y); }
-  public static void Down() { mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero); }
-  public static void Up() { mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero); }
-  public static void Tap(byte vk) {
-    keybd_event(vk, 0, 0, UIntPtr.Zero);
-    System.Threading.Thread.Sleep(60);
-    keybd_event(vk, 0, 2, UIntPtr.Zero);
-  }
 }
 '@
 [void][In]::SetProcessDPIAware()
@@ -111,7 +97,7 @@ $VkEsc = [byte]0x1B
 
 function MoveTo($x, $y) {
     Assert-NoUserInput
-    [In]::Move([int]$x, [int]$y)
+    [PeelGuard]::Move([int]$x, [int]$y)
     $script:cursor = @([int]$x, [int]$y)
 }
 
@@ -155,9 +141,9 @@ function StartDragFrom($item) {
     $r = $item.Current.BoundingRectangle
     $x = [int]($r.X + 24); $y = [int]($r.Y + $r.Height / 2)
     L "grab at $x,$y"
-    [void][In]::Place($x, $y); Start-Sleep -Milliseconds 250
+    [void][PeelGuard]::Place($x, $y); Start-Sleep -Milliseconds 250
     MoveTo $x $y; Start-Sleep -Milliseconds 120
-    [In]::Down(); Start-Sleep -Milliseconds 120
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 120
     for ($i = 1; $i -le 14; $i++) {
         MoveTo ($x + $i * 14) ($y + $i * 7)
         Start-Sleep -Milliseconds 30
@@ -197,7 +183,7 @@ function DropOnAction($segmentLabel) {
     # opens a wheel the drag data never reaches ("not a file drag").
     if (-not (WaitLog 'drag start at' 4000 ($dragSeen + 1))) { return $null }
     Start-Sleep -Milliseconds 200
-    [In]::Tap($VkAlt)
+    [PeelGuard]::Tap($VkAlt)
     $shown = WaitLog 'wheel shown at (\d+),(\d+)' 4000 ($shownSeen + 1)
     if (-not $shown) { return $null }
     $centre = @([int]$shown.Groups[1].Value, [int]$shown.Groups[2].Value)
@@ -217,10 +203,7 @@ function DropOnAction($segmentLabel) {
 
 $peelProcess = $null
 try {
-    # A share sheet left by an earlier run sits over the test window and
-    # swallows the drag, so clear the desktop first (e2e-hygiene.ps1).
     . (Join-Path $PSScriptRoot 'e2e-hygiene.ps1')
-    L ("start: " + (Close-ShareSheets).Text)
     if (-not $App) {
         $App = Find-PeelApp (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
     }
@@ -234,7 +217,11 @@ try {
     Check 'engine has an action wheel' ($actionWheel -ne $null) "default_modifier: $($actionWheel.default_modifier)"
     Check 'the action wheel opens on Alt' ($actionWheel.default_modifier -eq 'Alt') "$($actionWheel.default_modifier)"
 
-    Start-GuiGuard -Dir $Dir -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    Start-GuiGuard -Dir $Dir -RunDir $GuardDir -PauseInstalledFor $App -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    # A share sheet left by an earlier run sits over the test window and
+    # swallows the drag, so clear the desktop first (e2e-hygiene.ps1). Only
+    # once the drive started: before that the sheet can be Daniel's own.
+    L ("start: " + (Close-ShareSheets).Text)
 
     $env:PEEL_LOG = $peelLog
     $env:PEEL_EXIT_AFTER = '240'
@@ -257,7 +244,7 @@ try {
     $copy = DropOnAction 'Copy'
     Check 'action wheel opens and draws (Copy)' ($copy -ne $null) 'wheel action page 0 drawn'
     if ($copy) {
-        [In]::Up()
+        [PeelGuard]::Up()
         $drop = WaitLog 'drop on Copy with (\d+) file' 6000 ($copy.dropSeen + 1)
         Check 'drop lands on Copy' ($drop -ne $null) "$($drop.Value)"
         # CopyAction puts the files on the clipboard as a file list.
@@ -280,7 +267,7 @@ try {
     Check 'action wheel opens and draws (Share)' ($share -ne $null) 'wheel action page 0 drawn'
     if ($share) {
         $raisedSeen = CountLog 'share: share sheet raised'
-        [In]::Up()
+        [PeelGuard]::Up()
         $drop = WaitLog 'drop on Share with (\d+) file' 6000 ($share.dropSeen + 1)
         Check 'drop lands on Share' ($drop -ne $null) "$($drop.Value)"
         $offered = WaitLog 'share: offered (\d+) item' 6000
@@ -314,7 +301,10 @@ finally {
     if ($peelProcess) {
         try { Stop-Process -Id $peelProcess.Id -Force -ErrorAction SilentlyContinue } catch { }
     }
-    Get-Process -Name 'Peel' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Only the copy under test: Daniel's installed Peel is paused and started
+    # again by the guard, or by the runner if it is still gone (gui-guard.ps1).
+    Get-Process -Name 'Peel' -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -ieq $App } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
     # Nothing may stay on Daniel's desktop, the share sheet least of all.
     try {
         $endClean = Close-ShareSheets
