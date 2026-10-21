@@ -7,7 +7,13 @@
 // in the job: a Peel crash at any point after creation closes the job handle
 // and Windows ends the suspended process (lucy, hq-plct.17; assigning it after
 // creation left a window where a crash orphaned it). Only then is its first
-// thread resumed. If Windows refuses the attribute (before Windows 10 1607) or
+// thread resumed, through a ResumeGate: the caller cancels that gate from its
+// cancellation callbacks, registered before the process is created, and the
+// gate takes one lock around both the cancel and the resume decision with
+// ResumeThread. So a cancel either lands first and the engine is ended still
+// suspended, or lands after ResumeThread and the caller's own kill path ends
+// it; there is no moment between the last check and the resume where a cancel
+// is missed (lucy, hq-plct.17 review). If Windows refuses the attribute (before Windows 10 1607) or
 // the process is somehow not in the job, it is ended while still suspended
 // and the caller gets an error: nothing ever runs outside a job (fail closed).
 //
@@ -54,8 +60,10 @@ internal sealed class ContainedProcess : IDisposable
     /// <summary>
     /// Create the process suspended inside <paramref name="job"/>, run
     /// <paramref name="beforeResume"/> (which may refuse by throwing, as a
-    /// cancelled call does), then resume it. Throws Win32Exception or the
-    /// refusal; in every failure the process has been ended without running.
+    /// cancelled call does), then resume it through <paramref name="gate"/>,
+    /// which refuses with OperationCanceledException once cancelled. Throws
+    /// Win32Exception or the refusal; in every failure the process has been
+    /// ended without running.
     /// </summary>
     internal static ContainedProcess Start(
         string fileName,
@@ -63,8 +71,10 @@ internal sealed class ContainedProcess : IDisposable
         IReadOnlyDictionary<string, string> environment,
         ProcessJob job,
         Action<int>? afterCreate = null,
-        Action? beforeResume = null)
+        Action? beforeResume = null,
+        ResumeGate? gate = null)
     {
+        gate ??= new ResumeGate();
         var stdin = new AnonymousPipeServerStream(PipeDirection.Out, HandleInheritability.Inheritable);
         var stdout = new AnonymousPipeServerStream(PipeDirection.In, HandleInheritability.Inheritable);
         var stderr = new AnonymousPipeServerStream(PipeDirection.In, HandleInheritability.Inheritable);
@@ -74,17 +84,21 @@ internal sealed class ContainedProcess : IDisposable
             stdout.ClientSafePipeHandle.DangerousGetHandle(),
             stderr.ClientSafePipeHandle.DangerousGetHandle(),
         };
-        var pinned = GCHandle.Alloc(handles, GCHandleType.Pinned);
         // UpdateProcThreadAttribute keeps a pointer to the value, not a copy,
         // so the job handle lives in pinned memory until the list is deleted.
         var jobs = new[] { job.Handle };
-        var pinnedJobs = GCHandle.Alloc(jobs, GCHandleType.Pinned);
+        var pinned = default(GCHandle);
+        var pinnedJobs = default(GCHandle);
         var attributes = IntPtr.Zero;
         var environmentBlock = IntPtr.Zero;
         var info = default(Native.PROCESS_INFORMATION);
         var created = false;
         try
         {
+            // Both inside the try, so a failure of either frees the other and
+            // the pipes (lucy, hq-plct.17).
+            pinned = GCHandle.Alloc(handles, GCHandleType.Pinned);
+            pinnedJobs = GCHandle.Alloc(jobs, GCHandleType.Pinned);
             if (jobs[0] == IntPtr.Zero)
             {
                 throw new InvalidOperationException(
@@ -139,10 +153,7 @@ internal sealed class ContainedProcess : IDisposable
             }
             afterCreate?.Invoke(info.dwProcessId);
             beforeResume?.Invoke();
-            if (Native.ResumeThread(info.hThread) == uint.MaxValue)
-            {
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "cannot resume the engine");
-            }
+            gate.Resume(info.hThread);
 
             Native.CloseHandle(info.hThread);
             stdin.DisposeLocalCopyOfClientHandle();
@@ -177,8 +188,14 @@ internal sealed class ContainedProcess : IDisposable
             {
                 Marshal.FreeHGlobal(environmentBlock);
             }
-            pinned.Free();
-            pinnedJobs.Free();
+            if (pinned.IsAllocated)
+            {
+                pinned.Free();
+            }
+            if (pinnedJobs.IsAllocated)
+            {
+                pinnedJobs.Free();
+            }
         }
     }
 
@@ -322,5 +339,49 @@ internal sealed class ContainedProcess : IDisposable
     {
         internal ExitHandle(SafeProcessHandle process) =>
             SafeWaitHandle = new SafeWaitHandle(process.DangerousGetHandle(), ownsHandle: false);
+    }
+}
+
+/// <summary>
+/// One lock around cancelling a suspended engine and resuming it. Cancel and
+/// Resume never overlap: a Cancel before the resume makes Resume refuse, and a
+/// Cancel after it changes nothing here (the caller's kill path, watching the
+/// same cancellation, ends the running engine). Cancel never waits for more
+/// than a ResumeThread call, so it is safe in a cancellation callback.
+/// </summary>
+internal sealed class ResumeGate
+{
+    private readonly object _lock = new();
+    private bool _cancelled;
+    private bool _resumed;
+
+    /// <summary>True when this stopped the resume; false when it had already happened.</summary>
+    internal bool Cancel()
+    {
+        lock (_lock)
+        {
+            if (_resumed)
+            {
+                return false;
+            }
+            _cancelled = true;
+            return true;
+        }
+    }
+
+    internal void Resume(IntPtr thread)
+    {
+        lock (_lock)
+        {
+            if (_cancelled)
+            {
+                throw new OperationCanceledException("The engine was cancelled before it was resumed.");
+            }
+            if (Native.ResumeThread(thread) == uint.MaxValue)
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "cannot resume the engine");
+            }
+            _resumed = true;
+        }
     }
 }

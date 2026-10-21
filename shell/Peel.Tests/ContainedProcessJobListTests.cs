@@ -6,6 +6,10 @@
 //      separate process (tests\JobLauncher), killed the way a crash would be.
 //   2. A call cancelled before the engine is created, or while it is still
 //      suspended, never resumes it.
+// hq-plct.25, from lucy on hq-plct.17: a cancel landing after the last token
+// check and before ResumeThread let the engine start. Cancellation now goes
+// through a ResumeGate registered before launch; the BeforeResume hook sits
+// in exactly that window and cancels there, from another thread.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -224,5 +228,106 @@ public sealed class ContainedProcessJobListTests : IDisposable
         Assert.True(await ExitsWithin(_created[0], TimeSpan.FromSeconds(5)), "the engine outlived KillAll");
         await Task.Delay(500);
         Assert.Empty(Pids());
+    }
+
+    [Fact]
+    public async Task ACancelBetweenTheLastCheckAndTheResumeNeverRunsTheEngine()
+    {
+        using var cancel = new CancellationTokenSource();
+        var engine = new EngineClient
+        {
+            AfterCreate = pid => _created.Add(pid),
+            // Past every token check: only the gate can stop the resume now.
+            // Cancel on another thread, as the user's click would, and wait
+            // until it has returned.
+            BeforeResume = () => Assert.True(Task.Run(cancel.Cancel).Wait(TimeSpan.FromSeconds(10)),
+                "Cancel blocked while the engine was suspended"),
+        };
+
+        var result = await engine.RunAsync("x.y", new[] { @"C:\a.txt" }, null, cancel.Token);
+
+        Assert.False(result.Ok);
+        Assert.Contains("cancelled before it started", result.Message);
+        Assert.Single(_created);
+        Assert.True(await ExitsWithin(_created[0], TimeSpan.FromSeconds(5)), "the cancelled engine is still alive");
+        await Task.Delay(1000);
+        Assert.Empty(Pids());
+    }
+
+    [Fact]
+    public async Task QuittingBetweenTheLastCheckAndTheResumeNeverRunsTheEngine()
+    {
+        EngineClient? engine = null;
+        engine = new EngineClient
+        {
+            AfterCreate = pid => _created.Add(pid),
+            BeforeResume = () => Assert.True(Task.Run(engine!.KillAll).Wait(TimeSpan.FromSeconds(10)),
+                "KillAll blocked while the engine was suspended"),
+        };
+
+        var result = await engine.RunAsync("x.y", new[] { @"C:\a.txt" });
+
+        Assert.False(result.Ok);
+        Assert.Contains("quitting", result.Message);
+        Assert.Single(_created);
+        Assert.True(await ExitsWithin(_created[0], TimeSpan.FromSeconds(5)), "the engine outlived KillAll");
+        await Task.Delay(1000);
+        Assert.Empty(Pids());
+    }
+
+    [Fact]
+    public async Task ACancelRacingTheResumeEitherRefusesItOrEndsTheRunningEngine()
+    {
+        // No hook: a cancel at a random moment around the resume. Whichever
+        // side wins, an engine reported as not started never ran, and no
+        // engine is left alive.
+        var random = new Random(25);
+        for (var i = 0; i < 20; i++)
+        {
+            using var cancel = new CancellationTokenSource();
+            var created = new List<int>();
+            var engine = new EngineClient
+            {
+                AfterCreate = pid =>
+                {
+                    lock (created) { created.Add(pid); }
+                    _created.Add(pid);
+                },
+            };
+            var delay = random.Next(0, 40);
+            var run = engine.RunAsync("x.y", new[] { @"C:\a.txt" }, null, cancel.Token);
+            await Task.Delay(delay);
+            cancel.Cancel();
+            var result = await run.WaitAsync(TimeSpan.FromSeconds(30));
+
+            Assert.False(result.Ok);
+            Assert.Contains("cancelled", result.Message);
+            foreach (var pid in created)
+            {
+                Assert.True(await ExitsWithin(pid, TimeSpan.FromSeconds(5)), $"engine {pid} outlived its cancel (run {i})");
+                if (result.Message.Contains("before it started"))
+                {
+                    Assert.DoesNotContain(pid, Pids());
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public void TheGateRefusesAResumeOnceCancelled()
+    {
+        var gate = new ResumeGate();
+        Assert.True(gate.Cancel());
+        Assert.True(gate.Cancel());
+        // Refused before ResumeThread: the handle is never touched.
+        Assert.Throws<OperationCanceledException>(() => gate.Resume(IntPtr.Zero));
+    }
+
+    [Fact]
+    public void AFailedResumeLeavesTheGateCancellable()
+    {
+        var gate = new ResumeGate();
+        Assert.Throws<System.ComponentModel.Win32Exception>(() => gate.Resume(IntPtr.Zero));
+        Assert.True(gate.Cancel());
     }
 }
