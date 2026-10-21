@@ -1337,11 +1337,35 @@ def video_mute(job: Job) -> Result:
     return ok([target], f"Wrote {target.name} without audio")
 
 
+def _box_blur(x: int, y: int, w: int, h: int, width: int, height: int, strength: int) -> str:
+    """The filters that turn a frame into the blurred box at x, y, w by h.
+
+    boxblur refuses a radius over (shorter side - 1) / 2 of each plane, and a
+    chroma plane can be half the box, so blurring the cropped box alone fails
+    on a small box and cannot touch a 2x2 one at all. Blur a window of the
+    box's neighbourhood instead, wide enough for the blur's full reach (two
+    passes of the radius), with each plane's radius clamped to what the window
+    holds, then crop the box back out at its exact size. The window starts on
+    an even pixel, so on a subsampled frame the inner crop stays on the chroma
+    grid whenever the box does."""
+    reach = 2 * strength
+    left, top = max(0, x - reach) & ~1, max(0, y - reach) & ~1
+    right, bottom = min(width, x + w + reach), min(height, y + h + reach)
+    radius = (
+        f"lr='min({strength},floor((min(w,h)-1)/2))':lp=2:"
+        f"cr='min({strength},floor((min(cw,ch)-1)/2))':cp=2"
+    )
+    return (
+        f"crop={right - left}:{bottom - top}:{left}:{top},boxblur={radius},"
+        f"crop={w}:{h}:{x - left}:{y - top}"
+    )
+
+
 def video_redact(job: Job) -> Result:
     """Blur a rectangle, over the whole clip or only inside a time range."""
     info = probe(job.source)
     width, height = _frame_size(info, job.source)
-    crop, x, y, w, h = _crop_filter(job.params, width, height, even=False)
+    _, x, y, w, h = _crop_filter(job.params, width, height, even=False)
     duration = _duration(info)
     ext = job.action.ext_for(job.source) or ""
     has_audio = bool(_streams(info, "audio"))
@@ -1362,13 +1386,13 @@ def video_redact(job: Job) -> Result:
         streams = _streams(info, "video")
         back = streams[0].get("pix_fmt") if streams else None
         graph = (
-            f"[0:v]format=yuv444p,split[base][box];[box]{crop},boxblur={strength}:2[blur];"
+            f"[0:v]format=yuv444p,split[base][box];[box]{_box_blur(x, y, w, h, width, height, strength)}[blur];"
             f"[base][blur]overlay={x}:{y}:format=yuv444{window},{_EVEN}"
             f"{f',format={back}' if back else ''}[v]"
         )
     else:
         graph = (
-            f"[0:v]{crop},boxblur={strength}:2[blur];"
+            f"[0:v]{_box_blur(x, y, w, h, width, height, strength)}[blur];"
             f"[0:v][blur]overlay={x}:{y}{window},{_EVEN}[v]"
         )
     args = ["-i", job.source, "-filter_complex", graph, "-map", "[v]"]
