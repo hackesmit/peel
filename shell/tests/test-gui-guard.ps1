@@ -25,8 +25,10 @@ claim     gui-teardown.ps1 takes a state only when it is not done and its
 lock      gui.lock is exclusive, a second taker gives up as 'user busy', and
           it is gone when its holder lets go; Invoke-GuiTask refuses to run
           without it. A dead runner's lock is taken over only after its
-          driver (named by a RUN line) is killed and its run torn down, and a
-          pid that was reused since the lock was taken is never killed.
+          driver (named by a RUN line) is killed and its run torn down. A
+          driver is named by pid and start time: a pid reused by another
+          process is never killed, and the lock is kept (not taken over)
+          while a live pid cannot be told apart or a kill does not take.
 restart   Stop-GuiGuard starts the paused installed Peel with no PEEL_*
           variable, though the driver set PEEL_CLI and PEEL_EXIT_AFTER (a
           probe stands in for Peel.exe; Daniel's Peel is never touched).
@@ -34,10 +36,13 @@ press     (session 0 only) a press whose state cannot be written is refused:
           no injection, nothing owned, nothing in inject.log.
 sheets    share sheets on screen at the start are never the run's, and
           Close-ShareSheets touches none after a person touched George or
-          when the start was never noted.
-clipboard (session 0 only, its own clipboard) Clear-ClipboardIfOurs empties
-          the clipboard only while it holds exactly the run's files, and
-          never when the run put nothing there.
+          when the start was never noted, and stops at the first sign of a
+          person before the next close or bring to front (stand in windows:
+          no real window gets a message).
+clipboard (session 0 only, its own clipboard) Clear-ClipboardIfOurs and
+          Clear-ClipboardTextIfOurs empty the clipboard only while it holds
+          exactly the run's files or text, never when the run put nothing
+          there, and hold it open from the check to the empty.
 
 Exit 0 when every check passes, 1 otherwise.
 #>
@@ -300,6 +305,20 @@ $r = Run-Sheets 'person' 'Register-ShareSheets | Out-Null' @{ PEEL_GUARD_FAKE_RE
 Check 'sheets: none touched once a person touched George' ($r.Text -match 'not touched: a person touched George' -and -not $r.Injected) $r.Text
 $r = Run-Sheets 'unnoted' '$null' @{}
 Check 'sheets: none touched when the start was never noted' ($r.Text -match 'not touched: the sheets on screen at the start were not noted' -and -not $r.Injected) $r.Text
+# Stand in windows (handles 101, 102): the finder, the close and the bring to
+# front are replaced, so no real window gets a message. $script:at counts the
+# finder's calls (1 Register, 2 the run's sheets, 3 those that stayed).
+# Each body is one line with no double quotes (it goes through a native
+# command line).
+$fakes = '$script:at = 0; $script:person = $false; ' +
+    'function Get-ShareSheetHandles { $script:at++; if ($script:at -eq 1) { @() } else { @(101, 102) } }; ' +
+    'function Test-PersonTouched { $script:person }; ' +
+    'function Show-ShareSheet([long]$Handle) { Write-Host (''FRONT '' + $Handle) }; ' +
+    'Register-ShareSheets | Out-Null; '
+$r = Run-Sheets 'midclose' ($fakes + 'function Send-ShareSheetClose([long]$Handle) { Write-Host (''CLOSE '' + $Handle); $script:person = $true }') @{}
+Check 'sheets: a person seen after one close stops the next close' ($r.Text -match 'CLOSE 101' -and $r.Text -notmatch 'CLOSE 102|FRONT' -and $r.Text -match 'stopped: a person touched George' -and -not $r.Injected) $r.Text
+$r = Run-Sheets 'midfront' ($fakes + 'function Send-ShareSheetClose([long]$Handle) { Write-Host (''CLOSE '' + $Handle); if ($Handle -eq 102) { $script:person = $true } }') @{}
+Check 'sheets: a person seen after the closes stops the bring to front' ($r.Text -match 'CLOSE 101.*CLOSE 102' -and $r.Text -notmatch 'FRONT' -and $r.Text -match 'stopped: a person touched George' -and -not $r.Injected) $r.Text
 
 # ---- clipboard: only the run's own payload (session 0 only) ------------------
 if ($session -eq 0) {
@@ -318,6 +337,22 @@ if ($session -eq 0) {
         [System.Windows.Forms.Clipboard]::SetFileDropList($list)
         $t3 = Clear-ClipboardIfOurs @($mine.ToUpperInvariant())
         Check 'clipboard: the run''s own file list is cleared' ($t3 -match 'cleared' -and -not [System.Windows.Forms.Clipboard]::ContainsFileDropList()) $t3
+        # Between the check and the empty nobody else can open the clipboard,
+        # so nothing copied there in between is emptied.
+        [System.Windows.Forms.Clipboard]::SetFileDropList($list)
+        $script:otherOpened = $null
+        [PeelClipboard]::AfterCheck = [Action]{ $script:otherOpened = [PeelClipboard]::OtherThreadCanOpen() }
+        try { $t4 = Clear-ClipboardIfOurs @($mine) } finally { [PeelClipboard]::AfterCheck = $null }
+        Check 'clipboard: it stays open from the check to the empty' ($t4 -match 'cleared' -and $script:otherOpened -eq $false -and [PeelClipboard]::OtherThreadCanOpen()) "$t4; another thread opened it in between: $($script:otherOpened)"
+        $payload = '"C:\peel-dev\smoke\testdir\sample.txt"'
+        [System.Windows.Forms.Clipboard]::SetText('Daniel copied this')
+        $t5 = Clear-ClipboardTextIfOurs $payload
+        Check 'clipboard: text copied since is left alone' ($t5 -match 'no longer holds' -and [System.Windows.Forms.Clipboard]::GetText() -eq 'Daniel copied this') $t5
+        $t6 = Clear-ClipboardTextIfOurs ''
+        Check 'clipboard: a run that put no text there leaves it alone' ($t6 -match 'put nothing' -and [System.Windows.Forms.Clipboard]::GetText() -eq 'Daniel copied this') $t6
+        [System.Windows.Forms.Clipboard]::SetText($payload)
+        $t7 = Clear-ClipboardTextIfOurs $payload
+        Check 'clipboard: the run''s own text is cleared' ($t7 -match 'cleared' -and -not [System.Windows.Forms.Clipboard]::ContainsText()) $t7
         [System.Windows.Forms.Clipboard]::Clear()
     }
     catch { Check 'clipboard: skipped, no clipboard in this session' $true "$_" }
@@ -350,9 +385,17 @@ if ($lockFree) {
         if (Test-Path $Report) { Get-Content $Report -Raw | ConvertFrom-Json }
     }
     $lockedAt = (Get-Date).AddSeconds(-5)
+    $pidFile = Join-Path $Dir 'self-driver.pid'
+    Write-DriverPid $pidFile
+    $self = Read-DriverPid $pidFile
+    Check 'lock: driver.pid names the driver by pid and start time' ($self.Pid -eq $PID -and (Get-DriverProcess $self).Id -eq $PID) (Get-Content $pidFile -Raw)
+    Remove-Item $pidFile
+    function Set-DriverPid([string]$RunDir, $Process, [long]$Shift = 0) {
+        Set-Content (Join-Path $RunDir 'driver.pid') ('{0} {1}' -f $Process.Id, ($Process.StartTime.ToFileTimeUtc() + $Shift))
+    }
     $sleeper = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 120'
     $d = New-State 'reclaim' $dead $false $false @()
-    Set-Content (Join-Path $d 'driver.pid') $sleeper.Id
+    Set-DriverPid $d $sleeper
     Set-Content $script:GuiLockPath ("LOCKED by C:\gone.ps1 pid 999999 at {0:o}`r`nRUN {1}" -f $lockedAt, $d)
     Enter-GuiLock 10
     Start-Sleep -Milliseconds 300
@@ -363,14 +406,31 @@ if ($lockFree) {
     Add-GuiLockRun 'C:\peel-dev\x\runs\r1'
     Check 'lock: a run folder is noted in the held lock' ((Get-Content $script:GuiLockPath -Raw) -match 'RUN C:\\peel-dev\\x\\runs\\r1') (Get-Content $script:GuiLockPath -Raw)
     Exit-GuiLock
-    # A pid that started after the lock was taken is not the dead runner's driver.
+    # A live pid with another start time is not the dead runner's driver: it
+    # is never killed, and the driver is gone, so the lock is taken over.
     $other = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 120'
     $d = New-State 'reused' $dead $false $false @()
-    Set-Content (Join-Path $d 'driver.pid') $other.Id
-    Set-Content $script:GuiLockPath ("LOCKED by C:\gone.ps1 pid 999999 at {0:o}`r`nRUN {1}" -f (Get-Date).AddHours(1), $d)
+    Set-DriverPid $d $other -1
+    Set-Content $script:GuiLockPath ("LOCKED by C:\gone.ps1 pid 999999 at {0:o}`r`nRUN {1}" -f (Get-Date), $d)
     Enter-GuiLock 10
-    Check 'lock: a reused pid (started after the lock) is never killed' ([bool](Get-Process -Id $other.Id -ErrorAction SilentlyContinue)) "pid $($other.Id)"
+    Check 'lock: a reused pid (another start time) is never killed' ([bool](Get-Process -Id $other.Id -ErrorAction SilentlyContinue)) "pid $($other.Id)"
+    Check 'lock: and the lock is taken over (its driver is gone)' ((Get-Content $script:GuiLockPath -Raw) -match "pid $PID") (Get-Content $script:GuiLockPath -Raw)
     Exit-GuiLock
+    # A live pid that cannot be told apart (an old pid only driver.pid): not
+    # killed, and the lock is kept.
+    $d = New-State 'pidonly' $dead $false $false @()
+    Set-Content (Join-Path $d 'driver.pid') $other.Id
+    $deadLock = "LOCKED by C:\gone.ps1 pid 999999 at {0:o}`r`nRUN {1}" -f (Get-Date), $d
+    Set-Content $script:GuiLockPath $deadLock
+    try { Enter-GuiLock 1; $kept = 'TAKEN' } catch { $kept = "$_" }
+    Check 'lock: a live pid with no start time is not killed and the lock is kept' ($kept -match 'PEEL_ABORT user busy' -and (Get-Process -Id $other.Id -ErrorAction SilentlyContinue) -and (Get-Content $script:GuiLockPath -Raw) -match 'pid 999999' -and -not (Test-Path (Join-Path $d 'guard-state.runner.json'))) $kept
+    # A driver the kill does not stop (Stop-Process stood in for): the lock is kept.
+    Set-DriverPid $d $other
+    function Stop-Process { }
+    try { Enter-GuiLock 1; $kept = 'TAKEN' } catch { $kept = "$_" }
+    finally { Remove-Item Function:\Stop-Process }
+    Check 'lock: a driver still alive after the kill keeps the lock' ($kept -match 'PEEL_ABORT user busy' -and (Get-Process -Id $other.Id -ErrorAction SilentlyContinue) -and (Get-Content $script:GuiLockPath -Raw) -match 'pid 999999' -and -not (Test-Path (Join-Path $d 'guard-state.runner.json'))) $kept
+    Remove-Item $script:GuiLockPath
     Stop-Process -Id $other.Id -Force -ErrorAction SilentlyContinue
     Set-Content $script:GuiLockPath 'taken by hand'
     try { Enter-GuiLock 1; $manual = 'TAKEN' } catch { $manual = "$_" }
