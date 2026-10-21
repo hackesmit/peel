@@ -488,6 +488,35 @@ function Start-CleanProcess([string]$FilePath, [string]$Arguments = '') {
     return [System.Diagnostics.Process]::Start($info)
 }
 
+# driver.pid names the driver by pid and start time (FILETIME, UTC), so a pid
+# Windows has given to another process since is never taken for the driver.
+function Write-DriverPid([string]$Path) {
+    Set-Content $Path ('{0} {1}' -f $PID, (Get-Process -Id $PID).StartTime.ToFileTimeUtc())
+}
+
+# @{ Pid; Start } from a driver.pid ($Start $null for an old pid only file),
+# or $null when there is no file or it is not in that form.
+function Read-DriverPid([string]$Path) {
+    $text = try { "$(Get-Content -LiteralPath $Path -Raw -ErrorAction Stop)".Trim() } catch { '' }
+    if ($text -notmatch '^(\d+)(?: (\d+))?$') { return $null }
+    $start = if ($Matches[2]) { [long]$Matches[2] } else { $null }
+    return [pscustomobject]@{ Pid = [int]$Matches[1]; Start = $start }
+}
+
+# The driver's process while it lives, $null once it is gone (its pid is
+# free, or now belongs to a process with another start time). Throws when a
+# live process has the pid and cannot be told apart from the driver: no start
+# time in the file, or one that cannot be read from the process.
+function Get-DriverProcess($Id) {
+    $process = Get-Process -Id $Id.Pid -ErrorAction SilentlyContinue
+    if (-not $process) { return $null }
+    if ($null -eq $Id.Start) { throw "pid $($Id.Pid) is alive and driver.pid has no start time to tell whether it is the driver" }
+    $start = try { $process.StartTime.ToFileTimeUtc() } catch { $null }
+    if ($null -eq $start) { throw "pid $($Id.Pid) is alive and its start time cannot be read to tell whether it is the driver" }
+    if ($start -ne $Id.Start) { return $null }
+    return $process
+}
+
 function Get-InstalledPeel {
     @(Get-Process -Name Peel -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -ieq $script:InstalledPeel })
 }
@@ -506,8 +535,8 @@ function Start-GuiGuard {
     New-Item -ItemType Directory -Force $RunDir | Out-Null
     [PeelGuard]::Open($RunDir)
     Write-GuiGuardLog "run folder $RunDir"
-    # The runner kills this pid if it loses track of the task (Invoke-GuiTask).
-    Set-Content (Join-Path $RunDir 'driver.pid') $PID
+    # The runner kills this driver if it loses track of the task (Invoke-GuiTask).
+    Write-DriverPid (Join-Path $RunDir 'driver.pid')
     # A teardown that a dead driver never got to run: the watchdog does it.
     $teardown = Join-Path $script:GuiGuardHere 'gui-teardown.ps1'
     $script:GuiGuardWatchdog = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @(
@@ -772,25 +801,29 @@ function Add-GuiLockRun([string]$RunDir) {
 }
 
 # Before a dead runner's lock is taken over: for each run folder it names,
-# kill a driver still alive (a powershell started after the lock was taken,
+# kill a driver still alive (its driver.pid pid and start time both match,
 # so a reused pid is never hit), give its watchdog time to report, then the
 # runner's teardown (Complete-GuiRun: it acts only on a state nobody
-# finished), and start Daniel's Peel again if that run paused it.
+# finished), and start Daniel's Peel again if that run paused it. Throws, so
+# the lock is not taken over, while a driver cannot be confirmed dead: a
+# driver.pid that cannot be read, a live pid it cannot tell apart, or a
+# driver that is still alive after the kill.
 function Reset-DeadGuiRun([string]$Holder) {
-    $since = [datetime]::MinValue
-    if ($Holder -match ' at (\S+)') { try { $since = [datetime]::Parse($Matches[1]) } catch { } }
     foreach ($line in @($Holder -split "`r?`n" | Where-Object { $_ -match '^RUN (.+)$' })) {
         $runDir = ($line -replace '^RUN ', '').Trim()
         if (-not (Test-Path $runDir)) { continue }
         $pidPath = Join-Path $runDir 'driver.pid'
         $killed = $false
         if (Test-Path $pidPath) {
-            $driver = Get-Process -Id ([int](Get-Content $pidPath -Raw)) -ErrorAction SilentlyContinue
-            if ($driver -and $driver.ProcessName -eq 'powershell' -and $driver.StartTime -ge $since) {
+            $id = Read-DriverPid $pidPath
+            if (-not $id) { throw "$pidPath does not name a pid, so its driver cannot be confirmed dead" }
+            $driver = Get-DriverProcess $id
+            if ($driver) {
                 Stop-Process -Id $driver.Id -Force -ErrorAction SilentlyContinue
                 Wait-Process -Id $driver.Id -Timeout 10 -ErrorAction SilentlyContinue
+                if (Get-DriverProcess $id) { throw "dead runner's driver pid $($id.Pid) is still alive after the kill ($runDir)" }
                 $killed = $true
-                Write-Host "dead runner's driver pid $($driver.Id) killed ($runDir)"
+                Write-Host "dead runner's driver pid $($id.Pid) killed ($runDir)"
             }
         }
         if ($killed) {
@@ -957,7 +990,7 @@ function Invoke-GuiTask {
         Start-ScheduledTask -TaskName $task
         $deadline = (Get-Date).AddSeconds($IdleTimeout + 120)
         $driving = $false
-        $driver = 0
+        $driver = $null
         $missing = 0
         do {
             Start-Sleep -Seconds 3
@@ -966,12 +999,16 @@ function Invoke-GuiTask {
                 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
                 if ($OnDriving) { & $OnDriving }
             }
-            if (-not $driver -and (Test-Path $pidPath)) { $driver = [int](Get-Content $pidPath -Raw) }
+            if (-not $driver) {
+                $id = Read-DriverPid $pidPath
+                if ($id -and $null -ne $id.Start) { $driver = $id }
+            }
             # Once the driver has told us its pid, its process is the truth:
             # a task can be deleted by someone else, and Get-ScheduledTask can
-            # fail for a moment, while the driver is still driving.
+            # fail for a moment, while the driver is still driving. A process
+            # that cannot be told apart counts as still driving (the deadline holds).
             if ($driver) {
-                $state = if (Get-Process -Id $driver -ErrorAction SilentlyContinue) { 'Running' } else { 'Ended' }
+                $state = try { if (Get-DriverProcess $driver) { 'Running' } else { 'Ended' } } catch { 'Running' }
             }
             else {
                 $found = Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
@@ -982,7 +1019,10 @@ function Invoke-GuiTask {
         } while ($state -eq 'Running' -and (Get-Date) -lt $deadline)
         if ($state -eq 'Running') {
             Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
-            if ($driver) { Stop-Process -Id $driver -Force -ErrorAction SilentlyContinue }
+            if ($driver) {
+                $process = try { Get-DriverProcess $driver } catch { $null }
+                if ($process) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
+            }
             $timedOut = $true
             Write-Host $(if ($driving) { "TIMEOUT after $TimeoutSeconds seconds of driving" } else { "TIMEOUT: the driver never started to drive within $IdleTimeout s" })
         }
@@ -993,17 +1033,18 @@ function Invoke-GuiTask {
         elseif (-not (Test-Path $ResultPath)) {
             $info = Get-ScheduledTaskInfo -TaskName $task -ErrorAction SilentlyContinue
             $last = if ($info) { '0x{0:x8}' -f [uint32]$info.LastTaskResult } else { 'unknown (the task is gone)' }
-            Write-Host "the driver (pid $driver) ended with no result: task $task last result $last"
+            Write-Host "the driver (pid $(if ($driver) { $driver.Pid } else { 'unknown' })) ended with no result: task $task last result $last"
         }
     }
     finally {
         Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
         $died = $timedOut -or $vanished -or -not (Test-Path $ResultPath)
         if ($died -and (Test-Path $pidPath)) {
-            $driver = [int](Get-Content $pidPath -Raw)
-            if (Get-Process -Id $driver -ErrorAction SilentlyContinue) {
-                Stop-Process -Id $driver -Force -ErrorAction SilentlyContinue
-                Write-Host "killed the driver, pid $driver"
+            $id = Read-DriverPid $pidPath
+            $process = if ($id) { try { Get-DriverProcess $id } catch { Write-Host "the driver was not killed: $($_.Exception.Message)"; $null } }
+            if ($process) {
+                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                Write-Host "killed the driver, pid $($process.Id)"
             }
         }
         # Give a killed driver's watchdog time to report before the runner acts.

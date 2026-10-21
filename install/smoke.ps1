@@ -158,6 +158,10 @@ $shot = Join-Path $Dir 'settings.png'
 $checks = [System.Collections.ArrayList]::new()
 $samples = [System.Collections.ArrayList]::new()
 $script:GuiAbort = $null
+# The Copy Path text this run put on the clipboard: the end empties the
+# clipboard only while it still holds exactly that (e2e-hygiene.ps1).
+$script:clipboardPayload = ''
+. (Join-Path $root 'shell\tests\e2e-hygiene.ps1')
 
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Remove-Item $driveLog, $peelLog, $shot, $resultPath -ErrorAction SilentlyContinue
@@ -520,14 +524,18 @@ try {
     Check 'tool: Zip via Alt (remapped) writes to the output folder' (Test-Path $zip) "$tool; $zip; next to source: $(Test-Path (Join-Path $test 'sample.zip'))"
 
     Start-Sleep -Milliseconds 800
-    [System.Windows.Forms.Clipboard]::Clear()
+    # Never emptied first (it may hold Daniel's copy): only text copied after
+    # this sequence number counts.
+    $clipSeq = [PeelClipboard]::GetClipboardSequenceNumber()
     $item = FindItem 'sample.txt'
     $action = RunByKeyboard $item 'Ctrl' 'action' 'Copy Path'
     $clip = ''
     $deadline = (Get-Date).AddSeconds(15)
     while ((Get-Date) -lt $deadline) {
-        $clip = [System.Windows.Forms.Clipboard]::GetText()
-        if ($clip) { break }
+        if ([PeelClipboard]::GetClipboardSequenceNumber() -ne $clipSeq) {
+            $clip = [System.Windows.Forms.Clipboard]::GetText()
+            if ($clip) { break }
+        }
         Start-Sleep -Milliseconds 200
     }
     # Copy Path puts the path in double quotes (shipped behavior): require the
@@ -535,6 +543,7 @@ try {
     $clipText = $clip.Trim()
     $quoted = $clipText.Length -ge 2 -and $clipText.StartsWith('"') -and $clipText.EndsWith('"')
     $clipPath = if ($quoted) { $clipText.Substring(1, $clipText.Length - 2) } else { $clipText }
+    if ($quoted -and ($clipPath -ieq $source)) { $script:clipboardPayload = $clip }
     Check 'action: Copy Path via Ctrl (remapped) fills the clipboard, in quotes' ($quoted -and ($clipPath -ieq $source)) "$action; quoted=$quoted; clipboard=$clip"
 
     # 4. Soak: hotkey presses.
@@ -631,6 +640,7 @@ finally {
     # First: end any drag and let go of every button and key (gui-guard.ps1).
     try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
     Restore-GuiCursor $originalCursor
+    try { L ("end: " + (Clear-ClipboardTextIfOurs $script:clipboardPayload)) } catch { L "end: clipboard check failed: $_" }
     StopPeel $smokePeel
     CloseTestExplorer
     Remove-Item Env:PEEL_LOG, Env:PEEL_SETTINGS, Env:PEEL_EXIT_AFTER, Env:PEEL_KEYBOARD_IDLE_MS -ErrorAction SilentlyContinue
