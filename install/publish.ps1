@@ -11,14 +11,26 @@
   stays locked in a failed build never blocks going back.
 
   install.json records the last verified pair (it stayed up for -StaySeconds)
-  and the candidate (switched in, not verified yet). A verified pair is never
-  deleted until a newer one is verified. A named mutex lets one publish run at
-  a time on an install root (exit 5 if another one runs).
+  and the candidate (switched in, not verified yet), with whether that run
+  meant to start Peel and whether settings.json was there before it. The
+  bytes themselves are in settings.before next to it until the candidate is
+  verified or rolled back, so a run killed in the watch window loses nothing.
+  A verified pair is never deleted until a newer one is verified; only a run
+  that saw a build stay up marks it verified. A named mutex lets one publish
+  run at a time on an install root (exit 5 if another one runs).
+
+  While a candidate is unverified, the start with Windows entry names the
+  verified pair's own Peel.exe (versions\<stamp>\app\Peel.exe), so a log on
+  before the next run starts the verified app, not the candidate. It names
+  app\Peel.exe again once a build is verified or rolled back.
 
   1. Recovers first: a candidate left by an earlier run (killed in the middle
-     of the switch, -NoStart, or nobody signed in) goes back to the verified
-     pair, both junctions together, before anything is deleted. Then it drops
-     the versions\* that neither pair uses.
+     of the switch or in the watch window, -NoStart, or nobody signed in)
+     goes back to the verified pair, both junctions together, with
+     settings.json as it was before that run, before anything is deleted.
+     Peel starts again if it was running or that run meant to start it.
+     With no verified pair the candidate stays, still a candidate. Then it
+     drops the versions\* that neither pair nor the Run entry uses.
   2. While the installed Peel keeps running: copies the engine source to
      versions\<stamp>\src, builds a new venv at versions\<stamp>\venv (the
      same pinned modules the current venv has, plus this engine, not
@@ -29,10 +41,11 @@
   3. Stops the installed Peel, saves settings.json as it is, records the
      candidate, and points app and venv at it. An install from before
      versions\ (app and venv real folders) moves into versions\ once as the
-     verified pair.
+     verified pair. If settings.json cannot be read or install.json cannot be
+     written here, nothing switches: the stopped Peel starts again, exit 1.
   4. Writes the start with Windows entry (HKCU Run, value "Peel", created if
      the Run key is missing), unless the user turned it off in Settings. A
-     settings file it cannot read leaves the entry as it is.
+     settings file it cannot read leaves the entry on or off as it is.
   5. Starts Peel in the signed in desktop session and watches it for
      -StaySeconds (10). Up the whole time: the candidate becomes the verified
      pair and the older versions go. Quit, never showed up, or the start
@@ -61,7 +74,8 @@
 .PARAMETER NoStart
   Install and write the Run entry, but leave Peel stopped (the smoke run starts
   its own copy). Nothing checked that the new build starts, so it stays a
-  candidate and the next run goes back to the verified pair first.
+  candidate, the Run entry keeps naming the verified build, and the next run
+  goes back to the verified pair first (settings.json included).
 
 .PARAMETER InstallRoot, SettingsPath, RunKey, PrebuiltApp, EngineBuilder, StartTask
   For install\test-publish.ps1, which runs this against a scratch root. The
@@ -105,6 +119,7 @@ $app = Join-Path $peelHome 'app'
 $venv = Join-Path $peelHome 'venv'
 $versions = Join-Path $peelHome 'versions'
 $journalPath = Join-Path $peelHome 'install.json'
+$settingsSnapshot = Join-Path $peelHome 'settings.before'
 $legacyEngineCopy = Join-Path $peelHome 'engine'
 $exe = Join-Path $app 'Peel.exe'
 $buildLog = Join-Path $peelHome 'publish.log'
@@ -179,19 +194,28 @@ function New-Pair([string]$app, [string]$venv) {
     return [pscustomobject]@{ app = $app; venv = $venv }
 }
 
+# start: the run that put the candidate in meant to start Peel (not
+# -NoStart). settings: 'saved' (the bytes are in settings.before), 'absent'
+# (there was no settings.json) or $null (nothing to put back).
 function Read-Journal {
-    if (-not (Test-Path $journalPath)) { return [pscustomobject]@{ verified = $null; candidate = $null } }
+    if (-not (Test-Path $journalPath)) {
+        return [pscustomobject]@{ verified = $null; candidate = $null; start = $false; settings = $null }
+    }
     return (Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json)
 }
 
-# Written to a side file and swapped in, so a crash leaves the old journal or
+# Written to a side file and swapped in, so a crash leaves the old file or
 # the new one, never half of one.
-function Write-Journal($verified, $candidate) {
-    $text = ConvertTo-Json -Depth 3 ([pscustomobject]@{ verified = $verified; candidate = $candidate })
-    $temp = "$journalPath.new"
-    [IO.File]::WriteAllText($temp, $text)
-    if (Test-Path $journalPath) { [IO.File]::Replace($temp, $journalPath, [NullString]::Value) }
-    else { [IO.File]::Move($temp, $journalPath) }
+function Write-Whole([string]$path, [byte[]]$bytes) {
+    $temp = "$path.new"
+    [IO.File]::WriteAllBytes($temp, $bytes)
+    if (Test-Path -LiteralPath $path) { [IO.File]::Replace($temp, $path, [NullString]::Value) }
+    else { [IO.File]::Move($temp, $path) }
+}
+
+function Write-Journal($verified, $candidate, [bool]$start = $false, $settings = $null) {
+    $text = ConvertTo-Json -Depth 3 ([pscustomobject]@{ verified = $verified; candidate = $candidate; start = $start; settings = $settings })
+    Write-Whole $journalPath ((New-Object Text.UTF8Encoding $false).GetBytes($text))
 }
 
 # The pair app and venv point at now. A real folder there is an install from
@@ -221,10 +245,12 @@ function Use-Pair($pair) {
     }
 }
 
-# Drops each versions\* folder that neither the journal nor a junction uses.
+# Drops each versions\* folder that neither the journal, a junction nor the
+# Run entry uses.
 function Remove-Unused {
     $journal = Read-Journal
-    $keep = @(@($journal.verified, $journal.candidate, (New-Pair (Get-LinkTarget $app) (Get-LinkTarget $venv))) |
+    $runApp = Get-RunApp
+    $keep = @(@($journal.verified, $journal.candidate, (New-Pair (Get-LinkTarget $app) (Get-LinkTarget $venv)), (New-Pair $runApp $null)) |
         Where-Object { $_ } | ForEach-Object { $_.app; $_.venv } | Where-Object { $_ } | ForEach-Object { Split-Path -Parent $_ })
     foreach ($old in @(Get-ChildItem -LiteralPath $versions -Directory -ErrorAction SilentlyContinue)) {
         if ($keep -contains $old.FullName) { continue }
@@ -374,6 +400,64 @@ function Get-StartWithWindows {
     return $null
 }
 
+# The app folder the Run entry starts from, when the entry is one of ours
+# (app\Peel.exe or a versions\*\app\Peel.exe), else $null.
+function Get-RunApp {
+    $value = (Get-ItemProperty -Path $RunKey -Name 'Peel' -ErrorAction SilentlyContinue).Peel
+    if (-not $value) { return $null }
+    $path = $value.Trim().Trim('"')
+    if ($path -ieq $exe -or $path.StartsWith($versions + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        return (Split-Path -Parent $path)
+    }
+    return $null
+}
+
+# The start with Windows entry names $target, unless Settings turned it off.
+# A settings file it cannot read leaves the entry on or off as it is, and
+# only moves an entry of ours to $target.
+function Set-RunEntry([string]$target) {
+    $command = '"{0}"' -f $target
+    $startWithWindows = Get-StartWithWindows
+    if ($null -eq $startWithWindows) {
+        if (Get-RunApp) {
+            Set-ItemProperty -Path $RunKey -Name 'Peel' -Value $command
+            Write-Step "cannot read startWithWindows from ${SettingsPath}: the start with Windows entry stays on, now $command"
+        }
+        else { Write-Step "cannot read startWithWindows from ${SettingsPath}, leaving the start with Windows entry as it is" }
+    }
+    elseif ($startWithWindows) {
+        if (-not (Test-Path $RunKey)) { New-Item -Path $RunKey -Force | Out-Null }
+        Set-ItemProperty -Path $RunKey -Name 'Peel' -Value $command
+        Write-Step "start with Windows: on (HKCU Run ""Peel"" $command)"
+    }
+    else {
+        if (Test-Path $RunKey) { Remove-ItemProperty -Path $RunKey -Name 'Peel' -ErrorAction SilentlyContinue }
+        Write-Step 'start with Windows: off, as Settings says'
+    }
+}
+
+# The new build may rewrite settings.json as it starts; a rollback puts the
+# bytes back, or removes a file that was not there. The bytes go to disk
+# before the switch so the next run has them if this one is killed.
+function Save-Settings {
+    if (Test-Path -LiteralPath $SettingsPath) {
+        Write-Whole $settingsSnapshot ([IO.File]::ReadAllBytes($SettingsPath))
+        return 'saved'
+    }
+    if (Test-Path -LiteralPath $settingsSnapshot) { Remove-Item -LiteralPath $settingsSnapshot -Force }
+    return 'absent'
+}
+
+function Restore-Settings([string]$saved) {
+    if ($saved -eq 'saved') {
+        if (-not (Test-Path -LiteralPath $settingsSnapshot)) { throw "no $settingsSnapshot to put settings.json back from" }
+        Write-Whole $SettingsPath ([IO.File]::ReadAllBytes($settingsSnapshot))
+    }
+    elseif ($saved -eq 'absent' -and (Test-Path -LiteralPath $SettingsPath)) {
+        Remove-Item -LiteralPath $SettingsPath -Force
+    }
+}
+
 # The start failing (Task Scheduler refusing the task, say) counts as a build
 # that did not come up, so it goes back like one.
 function Invoke-Start {
@@ -384,33 +468,41 @@ function Invoke-Start {
     }
 }
 
-# Back to the verified pair: Peel stopped, both junctions on the verified
-# pair, the journal says so, then the candidate goes if it can.
+# Back to the verified pair: Peel stopped, settings.json as it was before
+# the candidate, both junctions on the verified pair, the Run entry on
+# app\Peel.exe, the journal says so, then the candidate goes if it can. Each
+# step is safe to run again, so a run killed in here is finished by the next.
 function Restore-Verified($journal) {
     [void](Stop-Installed)
+    try { Restore-Settings $journal.settings }
+    catch { Write-Step "cannot put settings.json back ($($_.Exception.Message)); the saved copy stays at $settingsSnapshot" }
     Use-Pair $journal.verified
+    try { Set-RunEntry $exe }
+    catch { Write-Step "cannot move the start with Windows entry back to $exe ($($_.Exception.Message))" }
     Write-Journal $journal.verified $null
+    if ($journal.settings -eq 'saved') { Remove-Quietly $settingsSnapshot }
     if ($journal.candidate) { Remove-Quietly (Split-Path -Parent $journal.candidate.app) }
     Write-Step "the verified app and engine are back ($($journal.verified.app))"
 }
 
 # --- recover -----------------------------------------------------------------
 # A candidate here was never verified: an earlier run died in the middle of
-# the switch (app and venv may be from different pairs), ran with -NoStart, or
-# found nobody signed in. Go back to the verified pair, both junctions
-# together, before anything is deleted. With no verified pair the candidate
-# is all there is, so it stays.
+# the switch (app and venv may be from different pairs) or in the watch
+# window, ran with -NoStart, or found nobody signed in. Go back to the
+# verified pair, both junctions together, before anything is deleted, and
+# start it if Peel runs now or that run meant to start it (a run killed after
+# it stopped Peel). With no verified pair the candidate is all there is: its
+# junctions go together, and it stays a candidate, since nothing saw it run.
 $journal = Read-Journal
 if ($journal.candidate) {
     if ($journal.verified) {
         Write-Step 'an earlier run left a build that was never verified: going back to the verified pair first'
         $wasUp = (Get-Installed).Count -gt 0
         Restore-Verified $journal
-        if ($wasUp) { [void](Invoke-Start) }
+        if ($wasUp -or $journal.start) { [void](Invoke-Start) }
     }
     else {
         Use-Pair $journal.candidate
-        Write-Journal $journal.candidate $null
     }
 }
 Remove-Unused
@@ -478,46 +570,39 @@ if ($others.Count -gt 0) {
     Write-Step ("note: another Peel.exe runs (" + (($others | ForEach-Object { "$($_.Id) $($_.Path)" }) -join '; ') + ")")
 }
 
-# The new build may rewrite settings.json as it starts; a rollback puts the
-# bytes back, or removes a file that was not there.
-$settingsBefore = $null
-if (Test-Path -LiteralPath $SettingsPath) { $settingsBefore = [IO.File]::ReadAllBytes($SettingsPath) }
-function Restore-Settings {
-    if ($null -ne $settingsBefore) { [IO.File]::WriteAllBytes($SettingsPath, $settingsBefore) }
-    elseif (Test-Path -LiteralPath $SettingsPath) { Remove-Item -LiteralPath $SettingsPath -Force }
-}
-
-# The verified pair is what a failure goes back to. With no journal yet the
-# installed pair counts as verified: it is the one that has been running.
-$verified = (Read-Journal).verified
-if (-not $verified) { $verified = Get-CurrentPair (Join-Path $versions "$(Split-Path -Leaf $version)-previous") }
+# The verified pair is what a failure goes back to. With no journal at all
+# the installed pair counts as verified: it is the one that has been running
+# (an install from before install.json). A journal with no verified pair
+# means nothing has been seen to run yet, so there is none.
 $candidate = New-Pair $versionApp $versionVenv
-Write-Journal $verified $candidate
+$verified = $null
+try {
+    $verified = (Read-Journal).verified
+    if (-not $verified -and -not (Test-Path $journalPath)) {
+        $verified = Get-CurrentPair (Join-Path $versions "$(Split-Path -Leaf $version)-previous")
+    }
+    $settingsSaved = Save-Settings
+    Write-Journal $verified $candidate (-not $NoStart) $settingsSaved
+}
+catch {
+    # Nothing has switched: the installed pair is as it was, so it starts again.
+    Write-Step "cannot record the switch, so nothing switched: $($_.Exception.Message)"
+    if ($wasRunning) { [void](Invoke-Start) }
+    Remove-Quietly $version
+    exit 1
+}
 
 $switched = $false
 try {
     if ($verified) { Use-Pair $verified }
+    # Log on starts the verified build until this one is seen to stay up.
+    Set-RunEntry $(if ($verified) { Join-Path $verified.app 'Peel.exe' } else { $exe })
     # First install: the venv setup.ps1 made was only the template.
     if ((Test-Path $venv) -and -not (Test-Link $venv)) { Move-WithRetry $venv (Join-Path $version 'template-venv') }
     Set-Link $app $versionApp
     if ($env:PEEL_PUBLISH_TEST_DIE -eq 'mid-switch') { [Environment]::Exit(9) }
     Set-Link $venv $versionVenv
     Write-Step "installed $exe from $version"
-
-    # --- start with Windows ---------------------------------------------------
-    $startWithWindows = Get-StartWithWindows
-    if ($null -eq $startWithWindows) {
-        Write-Step "cannot read startWithWindows from ${SettingsPath}, leaving the start with Windows entry as it is"
-    }
-    elseif ($startWithWindows) {
-        if (-not (Test-Path $RunKey)) { New-Item -Path $RunKey -Force | Out-Null }
-        Set-ItemProperty -Path $RunKey -Name 'Peel' -Value ('"{0}"' -f $exe)
-        Write-Step 'start with Windows: on (HKCU Run "Peel")'
-    }
-    else {
-        if (Test-Path $RunKey) { Remove-ItemProperty -Path $RunKey -Name 'Peel' -ErrorAction SilentlyContinue }
-        Write-Step 'start with Windows: off, as Settings says'
-    }
     $switched = $true
 }
 catch {
@@ -539,15 +624,17 @@ if ($result -ne 0) {
         exit 4
     }
     Write-Step 'the new build did not stay up: going back to the verified pair'
-    [void](Stop-Installed)
-    Restore-Settings
     Restore-Verified (Read-Journal)
     if ($wasRunning -or $switched) { [void](Invoke-Start) }
     exit 6
 }
 
-# Up and stayed up: this pair is the verified one now, and the older go.
+# Up and stayed up: this pair is the verified one now, log on starts it, and
+# the older go (a Run entry still on one of them keeps it).
 Write-Journal $candidate $null
+Remove-Quietly $settingsSnapshot
+try { Set-RunEntry $exe }
+catch { Write-Step "cannot move the start with Windows entry to $exe ($($_.Exception.Message)); the next run tries again" }
 Remove-Unused
 # Before versions\ there was one source copy here; nothing installs from it now.
 Remove-Quietly $legacyEngineCopy
