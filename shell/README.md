@@ -106,6 +106,66 @@ They leave their evidence in `C:\peel-dev\e2e`, `C:\peel-dev\e2e-render` and
 `C:\peel-dev\e2e-editors`: `result.json`, `drive.log`, Peel's own `peel.log`
 and the screenshots.
 
+### The GUI guard: no stuck drag on Daniel's screen
+
+On 2026-10-20 an aborted test drag left an Explorer drag image (a
+`SysDragImage` window, a file icon ghost) stuck on George's screen: Daniel
+moved the mouse while a test drove it, which broke the injected drag. Every
+driver that moves the real mouse or presses real keys (the `e2e-*.ps1`
+drivers, the `review-*` drivers and `install/smoke.ps1`) now dot-sources
+`tests/gui-guard.ps1`:
+
+- **Before driving** it waits for `-IdleSeconds` (default 300) with no user
+  input (`GetLastInputInfo`) and logs the wait; after `-IdleTimeout` it gives up
+  as `ABORTED (user busy)`.
+- **While driving** a low level mouse and keyboard hook counts input without
+  the injected flag. The first one aborts the run as `ABORTED (user input)`,
+  exit code 3, which is not a test failure.
+- **One way to inject.** Drivers declare no `mouse_event`, `keybd_event` or
+  `SetCursorPos` of their own: every move, click and key goes through
+  `[PeelGuard]::Move / Place / Down / Up / Click / Key / Tap / Hotkey ...`.
+  Each call refuses before the drive started or after it ended, throws the
+  user input abort once a person touched George, counts itself
+  (`[PeelGuard]::Injections`) and writes a line to `inject.log` in the run
+  folder. What the run pressed and has not let go is kept in
+  `guard-state.json` there.
+- **In every finally** the teardown ends the run's own drag and nothing else:
+  if the run holds a button, Escape (cancels the OLE drag), then that button
+  is released over a small window of our own with no drop target (so a drag
+  that missed the Escape drops on nothing); then the keys the run holds are
+  released, and a visible `SysDragImage` is hidden and closed. These cleanup
+  inputs are counted apart (`[PeelGuard]::Cleanups`).
+- **A run that never drove changes nothing.** When the idle wait gives up,
+  the teardown sends no Escape and no release, the cursor is not put back
+  (`Restore-GuiCursor` only acts after a drive that no person interrupted),
+  share sheets are not touched, and no test folder is created or deleted.
+  `tests/test-gui-guard.ps1` proves it with a simulated busy user and
+  simulated held buttons.
+- **When the driver is killed** (a timeout, `Stop-ScheduledTask`) its finally
+  never runs. A watchdog process it started (`tests/gui-teardown.ps1
+  -WaitPid`) sees it exit and tears down, and the runner checks again from an
+  Interactive task, with a screenshot (`teardown-*.json`,
+  `shot-after-teardown.png`). Only one of them acts: each claims
+  `guard-state.json` by renaming it, and a claimed state is taken over only
+  when its owner process is dead and its teardown is not done.
+- **Runners** take `C:\peel-dev\gui.lock` themselves (created exclusively; it
+  names the runner's pid, and a lock whose pid is gone is taken over) and hold it until the teardown and the restart
+  of Daniel's installed Peel are done (`Invoke-GuiDriver`). Do not create the
+  lock by hand first: the runner would wait on you. Each run gets a fresh run
+  folder (`<dir>\runs\<stamp>`, passed as `-GuardDir`) for `driver.pid`,
+  `driving.txt` and the guard state, a unique task name, and a driver it lost
+  track of is killed by its pid. A driver that tests a dev build pauses the
+  installed Peel once it drives (never during the idle wait), and starts it
+  again after stopping its own test copy; only test copies are ever stopped.
+
+`-TimeoutSeconds` on a runner counts from the end of the idle wait
+(`driving.txt`). The guard proves itself with `tests/test-gui-guard.ps1` (no
+desktop needed), `run-e2e.ps1 -Test abort-fail` (the driver throws while it
+holds a real Explorer drag) and `-Test abort-kill -TimeoutSeconds 25` (the
+runner kills it mid drag); the last two pass only when no drag image and no
+held button is left, and abort-kill also when exactly one owner (the
+watchdog) tore down.
+
 ## The editor windows
 
 `Editors/` holds the windows that collect parameters for an entry the registry
@@ -192,8 +252,8 @@ by a real drag, driven by the real mouse and UI Automation, with the output
 checked by ffprobe, ffmpeg and PyMuPDF and one screenshot per editor read
 back. It waits for 5 minutes with no user input on George before it touches
 the mouse, pauses the installed Peel for the run and starts it again, and
-leaves its evidence in `C:\peel-dev\e2e-timeline`. Take
-`C:\peel-dev\gui.lock` before running it.
+leaves its evidence in `C:\peel-dev\e2e-timeline`. It takes
+`C:\peel-dev\gui.lock` itself (do not create it first).
 
 ```
 ssh george "powershell -NoProfile -ExecutionPolicy Bypass -File C:\peel-dev\<branch>\shell\tests\run-timeline.ps1 -Engine <venv>\Scripts\peel.exe"

@@ -49,7 +49,12 @@ param(
     # at the same one through PEEL_CLI, so the shell and the checks never
     # disagree about which engine they are talking about.
     [string]$Peel = "$env:LOCALAPPDATA\Peel\venv\Scripts\peel.exe",
-    [string]$Check = 'C:\peel-dev\peel-6f29\shell\tests\e2e-editors-check.py'
+    [string]$Check = 'C:\peel-dev\peel-6f29\shell\tests\e2e-editors-check.py',
+    # gui-guard.ps1: user idle to wait for before driving, and how long to wait.
+    [int]$IdleSeconds = 300,
+    [int]$IdleTimeout = 1800,
+    # The run folder a runner made for this run (gui-guard.ps1, Invoke-GuiTask).
+    [string]$GuardDir = ''
 )
 $Python = Join-Path (Split-Path -Parent $Peel) 'python.exe'
 
@@ -59,6 +64,7 @@ $driveLog = Join-Path $Dir 'drive.log'
 $peelLog = Join-Path $Dir 'peel.log'
 $resultPath = Join-Path $Dir 'result.json'
 $checks = [System.Collections.ArrayList]::new()
+$script:GuiAbort = $null
 $shots = [System.Collections.ArrayList]::new()
 $script:cursor = @(0, 0)
 
@@ -86,6 +92,7 @@ function WaitLog($pattern, $timeoutMs, $atLeast = 1) {
     while ((Get-Date) -lt $deadline) {
         $found = [regex]::Matches((PeelLog), $pattern)
         if ($found.Count -ge $atLeast) { return $found[$found.Count - 1] }
+        Assert-NoUserInput
         Start-Sleep -Milliseconds 100
     }
     return $null
@@ -95,26 +102,13 @@ Add-Type -AssemblyName System.Drawing, System.Windows.Forms, UIAutomationClient,
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class InEd {
-  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
-  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint f, UIntPtr e);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
-  // SetCursorPos does not reach a low level hook. Absolute SendInput moves do.
-  public static void Move(int x, int y) {
-    int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77), vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
-    int ax = (int)(((x - vx) * 65535.0) / (vw - 1)), ay = (int)(((y - vy) * 65535.0) / (vh - 1));
-    mouse_event(0x0001 | 0x8000 | 0x4000, ax, ay, 0, UIntPtr.Zero);
-  }
-  public static void Place(int x, int y) { SetCursorPos(x, y); }
-  public static void Down() { mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero); }
-  public static void Up() { mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero); }
-  public static void Tap(byte vk) {
-    keybd_event(vk, 0, 0, UIntPtr.Zero); System.Threading.Thread.Sleep(60); keybd_event(vk, 0, 2, UIntPtr.Zero);
-  }
 }
 '@
 [void][InEd]::SetProcessDPIAware()
+# Idle wait, real input abort, and the teardown that ends any drag.
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
 
 $VkCtrl = [byte]0xA2
 $VkEsc = [byte]0x1B
@@ -122,7 +116,8 @@ $UIA = [System.Windows.Automation.AutomationElement]
 $Tree = [System.Windows.Automation.TreeScope]
 
 function MoveTo($x, $y) {
-    [InEd]::Move([int]$x, [int]$y)
+    Assert-NoUserInput
+    [PeelGuard]::Move([int]$x, [int]$y)
     $script:cursor = @([int]$x, [int]$y)
 }
 
@@ -162,9 +157,9 @@ function StartDragFrom($item) {
     $r = $item.Current.BoundingRectangle
     $x = [int]($r.X + 24); $y = [int]($r.Y + $r.Height / 2)
     L "grab at $x,$y"
-    [void][InEd]::Place($x, $y); Start-Sleep -Milliseconds 250
+    [void][PeelGuard]::Place($x, $y); Start-Sleep -Milliseconds 250
     MoveTo $x $y; Start-Sleep -Milliseconds 120
-    [InEd]::Down(); Start-Sleep -Milliseconds 120
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 120
     for ($i = 1; $i -le 14; $i++) {
         MoveTo ($x + $i * 14) ($y + $i * 7)
         Start-Sleep -Milliseconds 30
@@ -298,11 +293,11 @@ function DragOnCanvas($rect, $fromX, $fromY, $toX, $toY) {
     L "canvas drag from image $fromX,$fromY ($($from[0]),$($from[1])) to $toX,$toY ($($to[0]),$($to[1]))"
     MoveTo $from[0] $from[1]
     Start-Sleep -Milliseconds 150
-    [InEd]::Down()
+    [PeelGuard]::Down()
     Start-Sleep -Milliseconds 120
     GlideTo $to[0] $to[1] 10
     Start-Sleep -Milliseconds 150
-    [InEd]::Up()
+    [PeelGuard]::Up()
     Start-Sleep -Milliseconds 250
 }
 
@@ -333,7 +328,7 @@ function OpenEditorFrom($source, $label) {
     # is for a line that will never come.
     $shown = CountLog 'wheel shown at'
     $drawn = CountLog 'wheel tool page 0: '
-    [InEd]::Tap($VkCtrl)
+    [PeelGuard]::Tap($VkCtrl)
     $line = WaitLog 'wheel shown at (\d+),(\d+)' 5000 ($shown + 1)
     if (-not $line) { throw 'the tools wheel never opened' }
     $centre = @([int]$line.Groups[1].Value, [int]$line.Groups[2].Value)
@@ -347,7 +342,7 @@ function OpenEditorFrom($source, $label) {
     L "aiming at $label, index $([array]::IndexOf($labels, $label)) of $($labels.Count)"
     GlideTo $target[0] $target[1]
     Start-Sleep -Milliseconds 400
-    [InEd]::Up()
+    [PeelGuard]::Up()
     $drop = WaitLog "drop on $label with (\d+) file" 6000
     Check "$label opens from the wheel" ($drop -ne $null) "$($drop.Value)"
     return $labels
@@ -377,6 +372,9 @@ try {
     Check 'the engine offers the five image editors' ($offered.Count -eq 5) `
         "needs_editor tools for a PNG from $Peel : $($offered -join ',')"
     if ($offered.Count -ne 5) { throw "this engine has no image editors to test: $Peel" }
+
+    Start-GuiGuard -Dir $Dir -RunDir $GuardDir -PauseInstalledFor $App -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    $originalCursor = [System.Windows.Forms.Cursor]::Position
 
     $env:PEEL_LOG = $peelLog
     $env:PEEL_EXIT_AFTER = '900'
@@ -474,7 +472,7 @@ try {
     $where = CanvasPoint $rect 220 200
     MoveTo $where[0] $where[1]
     Start-Sleep -Milliseconds 150
-    [InEd]::Down(); Start-Sleep -Milliseconds 120; [InEd]::Up()
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 120; [PeelGuard]::Up()
     Start-Sleep -Milliseconds 300
     $both = (El $draw 'AnnotateHint').Current.Name
     Check 'the caption is placed where it was clicked' ($both -match '^2 shapes') $both
@@ -631,7 +629,7 @@ try {
     Check 'the Crop window opens a second time' ($again -ne $null) 'found by its title'
     if ($again) {
         $null = CanvasRect 'image.crop' 12000 ($turnedCanvas + 2)
-        [InEd]::Tap($VkEsc)
+        [PeelGuard]::Tap($VkEsc)
         Check 'Escape closes the editor' ((WaitLog 'image\.crop: editor cancelled' 5000) -ne $null) 'from the log'
     }
     Start-Sleep -Seconds 2
@@ -648,15 +646,17 @@ try {
         "$(CountLog ': editor open') editor windows opened"
 }
 catch {
-    Check 'driver completed' $false "$_"
+    $script:GuiAbort = Get-GuiAbort $_
+    if ($script:GuiAbort) { L "ABORTED: $_" } else { Check 'driver completed' $false "$_" }
 }
 finally {
-    [System.Windows.Forms.Cursor]::Position = $originalCursor
-    try { [InEd]::Up() } catch { }
+    # First: end any drag and let go of every button and key (gui-guard.ps1).
+    try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
+    Restore-GuiCursor $originalCursor
     if ($peelProcess) { Stop-Process -Id $peelProcess.Id -ErrorAction SilentlyContinue }
     CloseTestExplorer
     $failed = @($checks | Where-Object { -not $_.ok })
-    [pscustomobject]@{ ok = ($failed.Count -eq 0); checks = $checks; shots = $shots; log = $peelLog } |
+    [pscustomobject]@{ ok = ($failed.Count -eq 0 -and -not $script:GuiAbort); aborted = $script:GuiAbort; checks = $checks; shots = $shots; log = $peelLog } |
         ConvertTo-Json -Depth 4 | Set-Content $resultPath -Encoding UTF8
     L ("done, {0} of {1} checks passed" -f ($checks.Count - $failed.Count), $checks.Count)
     if ($failed.Count -gt 0) { exit 1 }

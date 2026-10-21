@@ -13,7 +13,12 @@ param(
     [string]$Dir = 'C:\peel-dev\e2e-render',
     [string]$App = 'C:\peel-dev\peel-4500-hq-plct-7\shell\Peel\bin\Release\net8.0-windows\Peel.exe',
     [string]$Fake = 'C:\peel-dev\peel-4500-hq-plct-7\shell\tests\FakeEngine\bin\Release\net8.0\FakeEngine.exe',
-    [string]$Options = 'C:\peel-dev\peel-4500-hq-plct-7\shell\tests\fake-options.json'
+    [string]$Options = 'C:\peel-dev\peel-4500-hq-plct-7\shell\tests\fake-options.json',
+    # gui-guard.ps1: user idle to wait for before driving, and how long to wait.
+    [int]$IdleSeconds = 300,
+    [int]$IdleTimeout = 1800,
+    # The run folder a runner made for this run (gui-guard.ps1, Invoke-GuiTask).
+    [string]$GuardDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,6 +28,7 @@ $peelLog = Join-Path $Dir 'peel.log'
 $resultPath = Join-Path $Dir 'result.json'
 $checks = [System.Collections.ArrayList]::new()
 $script:cursor = @(0, 0)
+$script:GuiAbort = $null
 
 New-Item -ItemType Directory -Force $Dir | Out-Null
 Remove-Item (Join-Path $Dir '*.png'), $driveLog, $peelLog, $resultPath -ErrorAction SilentlyContinue
@@ -43,6 +49,7 @@ function WaitLog($pattern, $timeoutMs, $atLeast = 1) {
     while ((Get-Date) -lt $deadline) {
         $found = [regex]::Matches((PeelLog), $pattern)
         if ($found.Count -ge $atLeast) { return $found[$found.Count - 1] }
+        Assert-NoUserInput
         Start-Sleep -Milliseconds 100
     }
     return $null
@@ -52,26 +59,15 @@ Add-Type -AssemblyName System.Drawing, System.Windows.Forms, UIAutomationClient,
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class In2 {
-  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
-  [DllImport("user32.dll")] public static extern void mouse_event(uint f, int x, int y, uint d, UIntPtr e);
-  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint f, UIntPtr e);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
-  public static void Move(int x, int y) {
-    int vx = GetSystemMetrics(76), vy = GetSystemMetrics(77), vw = GetSystemMetrics(78), vh = GetSystemMetrics(79);
-    int ax = (int)(((x - vx) * 65535.0) / (vw - 1)), ay = (int)(((y - vy) * 65535.0) / (vh - 1));
-    mouse_event(0x0001 | 0x8000 | 0x4000, ax, ay, 0, UIntPtr.Zero);
-  }
-  public static void Down() { mouse_event(0x0002, 0, 0, 0, UIntPtr.Zero); }
-  public static void Up() { mouse_event(0x0004, 0, 0, 0, UIntPtr.Zero); }
-  public static void Tap(byte vk) {
-    keybd_event(vk, 0, 0, UIntPtr.Zero); System.Threading.Thread.Sleep(60); keybd_event(vk, 0, 2, UIntPtr.Zero);
-  }
 }
 '@
 [void][In2]::SetProcessDPIAware()
+# Idle wait, real input abort, and the teardown that ends any drag.
+. (Join-Path $PSScriptRoot 'gui-guard.ps1')
 
-function MoveTo($x, $y) { [In2]::Move([int]$x, [int]$y); $script:cursor = @([int]$x, [int]$y) }
+function MoveTo($x, $y) { Assert-NoUserInput; [PeelGuard]::Move([int]$x, [int]$y); $script:cursor = @([int]$x, [int]$y) }
 function Jiggle($times = 4) {
     for ($i = 1; $i -le $times; $i++) { MoveTo ($script:cursor[0] + 2) ($script:cursor[1] + 2); Start-Sleep -Milliseconds 70 }
 }
@@ -122,12 +118,16 @@ $peelProcess = $null
 $originalCursor = [System.Windows.Forms.Cursor]::Position
 $shots = [System.Collections.ArrayList]::new()
 try {
-    # A share sheet left by an earlier run sits over the test window and
-    # swallows the drag, so clear the desktop first (e2e-hygiene.ps1).
     . (Join-Path $PSScriptRoot 'e2e-hygiene.ps1')
-    L ("start: " + (Close-ShareSheets).Text)
     if (-not (Test-Path $Fake)) { throw "build the fake engine first: $Fake" }
     Set-Content -Path (Join-Path $test 'sample.txt') -Value "wheel rendering test`r`n" -Encoding UTF8
+
+    Start-GuiGuard -Dir $Dir -RunDir $GuardDir -PauseInstalledFor $App -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
+    # A share sheet left by an earlier run sits over the test window and
+    # swallows the drag, so clear the desktop first (e2e-hygiene.ps1). Only
+    # once the drive started: before that the sheet can be Daniel's own.
+    L ("start: " + (Close-ShareSheets).Text)
+    $originalCursor = [System.Windows.Forms.Cursor]::Position
 
     $env:PEEL_LOG = $peelLog
     $env:PEEL_EXIT_AFTER = '240'
@@ -144,12 +144,12 @@ try {
 
     $r = $item.Current.BoundingRectangle
     $x = [int]($r.X + 24); $y = [int]($r.Y + $r.Height / 2)
-    [void][In2]::SetCursorPos($x, $y); Start-Sleep -Milliseconds 250
+    [void][PeelGuard]::Place($x, $y); Start-Sleep -Milliseconds 250
     MoveTo $x $y; Start-Sleep -Milliseconds 120
-    [In2]::Down(); Start-Sleep -Milliseconds 120
+    [PeelGuard]::Down(); Start-Sleep -Milliseconds 120
     for ($i = 1; $i -le 14; $i++) { MoveTo ($x + $i * 14) ($y + $i * 7); Start-Sleep -Milliseconds 30 }
 
-    [In2]::Tap([byte]0xA0)
+    [PeelGuard]::Tap([byte]0xA0)
     $shown = WaitLog 'wheel shown at (\d+),(\d+)' 4000
     if (-not $shown) { throw 'the wheel never opened' }
     $centre = @([int]$shown.Groups[1].Value, [int]$shown.Groups[2].Value)
@@ -163,7 +163,7 @@ try {
     $null = $shots.Add((Shoot $centre 'shot-convert-9.png'))
 
     # The tools wheel has more entries than fit, so the last segment pages.
-    [In2]::Tap([byte]0xA2)
+    [PeelGuard]::Tap([byte]0xA2)
     $tools = WaitLog 'wheel tool page 0: (.+)' 6000
     $toolLabels = @($tools.Groups[1].Value.Trim() -split ',')
     Check 'a long tools list pages' (($toolLabels.Count -eq 12) -and ($toolLabels[-1] -eq 'More')) "$($tools.Value)"
@@ -183,7 +183,7 @@ try {
         $null = $shots.Add((Shoot $centre 'shot-tools-page2.png'))
     }
 
-    [In2]::Tap([byte]0xA4)
+    [PeelGuard]::Tap([byte]0xA4)
     $actionsLine = WaitLog 'wheel action page 0: (.+)' 6000
     Check 'the actions wheel draws' ($actionsLine -ne $null) "$($actionsLine.Value)"
     if ($actionsLine) {
@@ -194,23 +194,26 @@ try {
         $null = $shots.Add((Shoot $centre 'shot-actions.png'))
     }
 
-    [In2]::Tap([byte]0x1B)
+    [PeelGuard]::Tap([byte]0x1B)
     Start-Sleep -Milliseconds 300
-    [In2]::Up()
+    [PeelGuard]::Up()
     Start-Sleep -Seconds 1
     Check 'nothing ran' (-not ((PeelLog) -match 'job start')) 'the fake engine refuses to run anything'
     Check 'no unhandled exceptions' (-not ((PeelLog) -match 'unhandled')) 'log has no unhandled exception'
 }
 catch {
-    Check 'driver completed' $false "$_"
+    $script:GuiAbort = Get-GuiAbort $_
+    if ($script:GuiAbort) { L "ABORTED: $_" } else { Check 'driver completed' $false "$_" }
 }
 finally {
+    # First: end any drag and let go of every button and key (gui-guard.ps1).
+    try { L (Stop-GuiGuard).Text } catch { L "teardown failed: $_" }
     try { L ("end: " + (Close-ShareSheets).Text) } catch { L "end: share sheet check failed: $_" }
-    [System.Windows.Forms.Cursor]::Position = $originalCursor
+    Restore-GuiCursor $originalCursor
     if ($peelProcess) { Stop-Process -Id $peelProcess.Id -ErrorAction SilentlyContinue }
     CloseTestExplorer
     $failed = @($checks | Where-Object { -not $_.ok })
-    [pscustomobject]@{ ok = ($failed.Count -eq 0); checks = $checks; shots = $shots; log = $peelLog } |
+    [pscustomobject]@{ ok = ($failed.Count -eq 0 -and -not $script:GuiAbort); aborted = $script:GuiAbort; checks = $checks; shots = $shots; log = $peelLog } |
         ConvertTo-Json -Depth 4 | Set-Content $resultPath -Encoding UTF8
     L ("done, {0} of {1} checks passed" -f ($checks.Count - $failed.Count), $checks.Count)
     if ($failed.Count -gt 0) { exit 1 }
