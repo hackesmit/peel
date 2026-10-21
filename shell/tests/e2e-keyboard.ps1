@@ -173,10 +173,9 @@ try {
     if ($offered -notcontains $Segment) { throw "the engine does not offer a $Segment conversion for $Source" }
 
     Start-GuiGuard -Dir $Dir -RunDir $GuardDir -PauseInstalledFor $App -IdleSeconds $IdleSeconds -IdleTimeout $IdleTimeout -Log { param($m) L $m }
-    # A share sheet left by an earlier run sits over the test window and
-    # swallows the drag, so clear the desktop first (e2e-hygiene.ps1). Only
-    # once the drive started: before that the sheet can be Daniel's own.
-    L ("start: " + (Close-ShareSheets).Text)
+    # Note the share sheets already on screen: they are not this run's, so
+    # Close-ShareSheets leaves them alone (e2e-hygiene.ps1).
+    L ("start: " + (Register-ShareSheets).Text)
     $originalCursor = [System.Windows.Forms.Cursor]::Position
 
     $env:PEEL_LOG = $peelLog
