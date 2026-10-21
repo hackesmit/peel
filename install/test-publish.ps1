@@ -12,7 +12,13 @@
   build quits after 5 s, one whose engine build fails, one whose build leaves
   a file locked as it quits, one whose start throws, one killed between the
   two junctions, one whose build rewrites settings.json, two runs at once,
-  and one that starts from an older install with real app and venv folders. Nothing moves the mouse or the
+  and one that starts from an older install with real app and venv folders.
+  The lucy round 2 cases (hq-plct.26): a failed first install that the next
+  run must not call verified, a -NoStart run whose Run value must keep naming
+  the verified build, a run killed after the app switched (the next run must
+  start Peel again), a publisher killed in the watch window after its build
+  rewrote settings.json, and a settings.json or install.json that cannot be
+  read or written once Peel is stopped. Nothing moves the mouse or the
   keyboard; the stand in starts in the signed in session through a scheduled
   task, so someone has to be signed in at George.
 
@@ -77,7 +83,8 @@ Set-Content -LiteralPath $settings -Value '{ "startWithWindows": true }' -Encodi
 
 # The stand in: mode.txt next to it says stay, exit (at once), late (after
 # 5 s), helper (starts sub\Helper.exe, which keeps its own image locked, then
-# quits) or clobber (rewrites the file settings.txt names, then quits).
+# quits), clobber (rewrites the file settings.txt names, then quits) or
+# rewrite (rewrites it and stays up).
 $fake = Join-Path $scratch 'Peel.exe'
 Add-Type -OutputType WindowsApplication -OutputAssembly $fake -TypeDefinition @'
 using System;
@@ -98,12 +105,16 @@ public static class FakePeel
             File.WriteAllText(File.ReadAllText(Path.Combine(dir, "settings.txt")).Trim(), "{ \"migrated\": true }");
             return 1;
         }
+        if (mode == "rewrite")
+        {
+            File.WriteAllText(File.ReadAllText(Path.Combine(dir, "settings.txt")).Trim(), "{ \"migrated\": true }");
+        }
         Thread.Sleep(Timeout.Infinite);
         return 0;
     }
 }
 '@
-$modes = @(@('good1', 'stay'), @('good2', 'stay'), @('quits', 'exit'), @('late', 'late'), @('locks', 'helper'), @('clobber', 'clobber'))
+$modes = @(@('good1', 'stay'), @('good2', 'stay'), @('quits', 'exit'), @('late', 'late'), @('locks', 'helper'), @('clobber', 'clobber'), @('rewrites', 'rewrite'))
 foreach ($build in $modes) {
     $dir = Join-Path $builds $build[0]
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -115,7 +126,9 @@ $helperDir = Join-Path $builds 'locks\sub'
 New-Item -ItemType Directory -Force -Path $helperDir | Out-Null
 Copy-Item $fake (Join-Path $helperDir 'Helper.exe')
 Set-Content -LiteralPath (Join-Path $helperDir 'mode.txt') -Value 'stay' -Encoding Ascii
-Set-Content -LiteralPath (Join-Path $builds 'clobber\settings.txt') -Value $settings -Encoding Ascii
+foreach ($name in @('clobber', 'rewrites')) {
+    Set-Content -LiteralPath (Join-Path $builds "$name\settings.txt") -Value $settings -Encoding Ascii
+}
 
 $builder = Join-Path $scratch 'engine-builder.ps1'
 Set-Content -LiteralPath $builder -Encoding UTF8 -Value @'
@@ -185,6 +198,14 @@ function Test-IsLink([string]$path) {
     return ($null -ne $item) -and [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
 }
 
+function Get-RunValue {
+    return (Get-ItemProperty -Path $runKey -Name Peel -ErrorAction SilentlyContinue).Peel
+}
+
+function Get-Bytes([string]$path) {
+    return [Convert]::ToBase64String([IO.File]::ReadAllBytes($path))
+}
+
 function Check-Clean([string]$case) {
     $versions = @(Get-ChildItem -LiteralPath (Join-Path $root 'versions') -Directory -ErrorAction SilentlyContinue)
     Check "$case keeps only the pair in use" ($versions.Count -eq 1) "($($versions.Count) in versions)"
@@ -193,6 +214,20 @@ function Check-Clean([string]$case) {
 }
 
 try {
+    # 0 a first install whose build quits: nothing verified it, so the next
+    # run must not count it as verified (lucy round 2, finding 5)
+    $code = Publish 'quits' 'e0'
+    Check 'a failed first install exits 4' ($code -eq 4) "(exit $code)"
+    Check 'a failed first install has no verified pair' ($null -eq (Get-Journal).verified)
+    $value = Get-RunValue
+    Check 'a failed first install names the app in the root (nothing else to name)' ($value -eq ('"{0}"' -f (Join-Path $app 'Peel.exe'))) $value
+    $code = Publish 'quits' 'e0b'
+    Check 'the next failed build after a failed first install exits 4, not 6' ($code -eq 4) "(exit $code)"
+    Check 'the next run never marks the failed first install verified' ($null -eq (Get-Journal).verified) (ConvertTo-Json -Compress (Get-Journal))
+    foreach ($link in @($app, $venv)) { if (Test-IsLink $link) { [IO.Directory]::Delete($link, $false) } }
+    Remove-Item -Recurse -Force (Join-Path $root 'versions'), (Join-Path $root 'install.json')
+    Remove-ItemProperty -Path $runKey -Name Peel -ErrorAction SilentlyContinue
+
     # 1 first install
     $code = Publish 'good1' 'e1'
     Check 'first install exits 0' ($code -eq 0) "(exit $code)"
@@ -209,6 +244,24 @@ try {
     Check 'good upgrade runs good2' ((Get-RunningBuild) -eq 'good2') (Get-RunningBuild)
     Check 'good upgrade switches in engine e2' ((Get-Engine) -eq 'e2') (Get-Engine)
     Check-Clean 'good upgrade'
+
+    # 2b -NoStart: nothing verifies the new build, so log on must still start
+    # the verified one (lucy round 2, finding 1)
+    $code = Publish 'good1' 'e2n' @('-NoStart')
+    Check '-NoStart exits 0' ($code -eq 0) "(exit $code)"
+    Check '-NoStart points app at the new build' ((Get-AppBuild) -eq 'good1') (Get-AppBuild)
+    $value = Get-RunValue
+    $pinned = ($value -replace '"', '')
+    $pinnedBuild = '(none)'
+    if ($pinned -and (Test-Path (Join-Path (Split-Path -Parent $pinned) 'build.txt'))) {
+        $pinnedBuild = (Get-Content (Join-Path (Split-Path -Parent $pinned) 'build.txt')).Trim()
+    }
+    Check '-NoStart keeps the Run value on the verified build' ($pinnedBuild -eq 'good2' -and $pinned -ne (Join-Path $app 'Peel.exe')) $value
+    $code = Publish 'good2' 'e2'
+    Check 'after -NoStart, an upgrade exits 0' ($code -eq 0) "(exit $code)"
+    $value = Get-RunValue
+    Check 'after -NoStart, a verified upgrade names the app in the root again' ($value -eq ('"{0}"' -f (Join-Path $app 'Peel.exe'))) $value
+    Check-Clean 'after -NoStart, an upgrade'
 
     # 3 a build that exits at startup (the bead's Definition of Done)
     $code = Publish 'quits' 'e3'
@@ -270,6 +323,8 @@ try {
     $code = Publish 'good1' 'fail'
     Check 'after a killed run, a failed engine build exits non zero' ($code -ne 0) "(exit $code)"
     Check 'after a killed run, the next run puts the verified pair back together' ((Get-AppBuild) -eq 'good2' -and (Get-Engine) -eq 'e11') "$(Get-AppBuild) $(Get-Engine)"
+    # The killed run had stopped Peel (lucy round 2, finding 4).
+    Check 'after a killed run, the next run starts the verified Peel again' ((Get-RunningBuild) -eq 'good2') (Get-RunningBuild)
     Check-Clean 'after a killed run'
     $code = Publish 'good2' 'e13'
     Check 'after a killed run, an upgrade exits 0' ($code -eq 0) "(exit $code)"
@@ -281,6 +336,25 @@ try {
     $now = [IO.File]::ReadAllBytes($settings)
     Check 'a build that rewrites settings gets the old bytes back' ([Convert]::ToBase64String($now) -eq [Convert]::ToBase64String($settingsBytes)) ([Text.Encoding]::UTF8.GetString($now))
     Check 'a build that rewrites settings leaves good2 running' ((Get-RunningBuild) -eq 'good2') (Get-RunningBuild)
+
+    # 10b the publisher is killed in the watch window, after its build has
+    # rewritten settings.json: the next run puts the bytes back (lucy round 2,
+    # finding 2)
+    $settingsBytes = Get-Bytes $settings
+    $env:PEEL_TEST_ENGINE = 'e17'
+    $killedLog = Join-Path $scratch 'publish-killed.log'
+    $killed = Start-Process -FilePath powershell -ArgumentList (@(Get-PublishArgs 'rewrites') + @('-StaySeconds', '120')) -PassThru -WindowStyle Hidden -RedirectStandardOutput $killedLog
+    $null = $killed.Handle
+    $deadline = (Get-Date).AddSeconds(60)
+    while ((Get-Bytes $settings) -eq $settingsBytes -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    Check 'the killed watch: the new build rewrote settings first' ((Get-Bytes $settings) -ne $settingsBytes)
+    Stop-Process -Id $killed.Id -Force
+    $killed.WaitForExit()
+    $code = Publish 'good1' 'fail'
+    Check 'after a kill in the watch window, a failed engine build exits non zero' ($code -ne 0) "(exit $code)"
+    Check 'after a kill in the watch window, the next run gets the old settings bytes back' ((Get-Bytes $settings) -eq $settingsBytes) ([IO.File]::ReadAllText($settings))
+    Check 'after a kill in the watch window, good2 runs on engine e13' ((Get-RunningBuild) -eq 'good2' -and (Get-Engine) -eq 'e13') "$(Get-RunningBuild) $(Get-Engine)"
+    Check-Clean 'after a kill in the watch window'
 
     # 11 two runs at once: the second one must not touch the install
     $env:PEEL_TEST_ENGINE = 'e15'
@@ -294,6 +368,27 @@ try {
     $first.WaitForExit()
     Check 'the first run still finishes with good1 and e15' ($first.ExitCode -eq 0 -and (Get-RunningBuild) -eq 'good1' -and (Get-Engine) -eq 'e15') "(exit $($first.ExitCode), $(Get-RunningBuild), $(Get-Engine))"
     Check-Clean 'two runs at once'
+
+    # 11b settings.json cannot be read once Peel is stopped (a folder there):
+    # nothing switches and the stopped Peel starts again (lucy round 2,
+    # finding 3)
+    $savedSettings = $settings
+    $settings = Join-Path $scratch 'settings-folder'
+    New-Item -ItemType Directory -Force -Path $settings | Out-Null
+    $code = Publish 'good2' 'e18'
+    $settings = $savedSettings
+    Check 'an unreadable settings file exits 1' ($code -eq 1) "(exit $code)"
+    Check 'an unreadable settings file leaves good1 and e15 running' ((Get-RunningBuild) -eq 'good1' -and (Get-AppBuild) -eq 'good1' -and (Get-Engine) -eq 'e15') "$(Get-RunningBuild) $(Get-AppBuild) $(Get-Engine)"
+    Check-Clean 'an unreadable settings file'
+
+    # 11c install.json cannot be written once Peel is stopped
+    $journalItem = Get-Item -LiteralPath (Join-Path $root 'install.json')
+    $journalItem.IsReadOnly = $true
+    $code = Publish 'good2' 'e19'
+    $journalItem.IsReadOnly = $false
+    Check 'a journal that cannot be written exits 1' ($code -eq 1) "(exit $code)"
+    Check 'a journal that cannot be written leaves good1 and e15 running' ((Get-RunningBuild) -eq 'good1' -and (Get-AppBuild) -eq 'good1' -and (Get-Engine) -eq 'e15') "$(Get-RunningBuild) $(Get-AppBuild) $(Get-Engine)"
+    Check-Clean 'a journal that cannot be written'
 
     # 12 an older install: app and venv are real folders, no journal
     Get-Running | ForEach-Object { Stop-Process -Id $_.Id -Force; Wait-Process -Id $_.Id -Timeout 10 -ErrorAction SilentlyContinue }
