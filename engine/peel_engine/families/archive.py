@@ -76,6 +76,21 @@ STREAM_SLACK = 16 * MIB
 #: before one member. Real ones are a few hundred bytes, one or two deep.
 MAX_TAR_META = MIB
 MAX_TAR_META_CHAIN = 8
+#: Deepest folder nesting and longest name an archive entry or link target
+#: may have. The tar logical tree stores every prefix of a name, so memory
+#: grows with the square of its depth; no real archive nests this deep, and
+#: Windows cannot write a path longer than MAX_NAME_CHARS anyway.
+MAX_NAME_DEPTH = 256
+MAX_NAME_CHARS = 32767
+#: Memory the tar logical tree (and the Windows name claims built from it)
+#: may take, estimated as the characters of every name and folder prefix kept
+#: plus a fixed cost per entry. Names under both caps above can still repeat
+#: long prefixes across members, so the tree is charged against a fixed slack
+#: plus an allowance per member: it grows with the member count, as any
+#: archive's index does, never with the square of a name's depth.
+TREE_SLACK = 64 * MIB
+TREE_PER_MEMBER = 4096
+TREE_ENTRY_COST = 64
 
 #: The extraction budget, as params on every entry that unpacks an archive.
 LIMIT_PARAMS = (
@@ -540,7 +555,10 @@ def _extract_tar(source: Path, dest: Path, budget: _Budget, skipped: list[str], 
             raise
         # gzip, bz2 and lzma report a damaged stream as a bare OSError.
         raise RunnerFailed(f"{source.name} is corrupt: {_clean(exc)}") from None
-    _materialize_links(root, tree, budget, skipped)
+    try:
+        _materialize_links(root, tree, budget, skipped)
+    except _TarMetaRefused as exc:
+        budget.refuse(str(exc))
 
 
 def _read_tar_member(tf, member, dest: Path, root: Path, tree: "_TarTree", budget: _Budget, skipped: list[str]) -> None:
@@ -758,6 +776,13 @@ def _drop_7z_folder_links(listing: str, dest: Path, skipped: list[str]) -> None:
             out = _safe_target(dest, rel)
         except RunnerFailed:
             continue
+        # _safe_target follows links; on Linux 7-Zip writes a stored folder
+        # link as a real symlink, and following it would empty-check and
+        # remove the folder it points at. Only a path with no link anywhere
+        # along it (resolved equals literal) is the folder 7-Zip wrote.
+        literal = dest.resolve().joinpath(*[p for p in PureWindowsPath(rel).parts if p not in ("", ".")])
+        if os.path.normcase(out) != os.path.normcase(literal):
+            continue
         if not os.path.isdir(out) or os.path.islink(out):
             continue
         with os.scandir(out) as it:
@@ -896,25 +921,56 @@ class _TarTree:
         self.children: dict[str, set[str]] = {}
         self.links: list[str] = []
         self._memo: dict[str, object] = {}
+        self.size = 0
+        self.members = 0
+
+    def charge(self, chars: int) -> None:
+        self.size += chars + TREE_ENTRY_COST
+        if self.size > TREE_SLACK + TREE_PER_MEMBER * self.members:
+            raise _TarMetaRefused(
+                "its names are too long and too many to index "
+                f"({self.size // MIB} MB for {self.members:,} entries)"
+            )
 
     def _register(self, key: str) -> None:
-        parts = key.split("/")
-        for i, part in enumerate(parts):
-            self.children.setdefault("/".join(parts[:i]), set()).add(part)
+        # Walk up from the deepest folder and stop at the first one already
+        # known: every folder above it is known too. So each call builds only
+        # the prefixes it adds, and each one added is charged.
+        end = len(key)
+        while True:
+            cut = key.rfind("/", 0, end)
+            parent = key[:cut] if cut >= 0 else ""
+            name = key[cut + 1 : end]
+            kids = self.children.get(parent)
+            if kids is not None:
+                if name not in kids:
+                    self.charge(len(name))
+                    kids.add(name)
+                return
+            self.charge(len(parent) + len(name))
+            self.children[parent] = {name}
+            if cut < 0:
+                return
+            end = cut
 
     def add(self, key: str, kind: str, skipped: list[str]) -> None:
         if not key:
             return
+        self.members += 1
         old = self.nodes.get(key)
         if old is not None and old[0] in ("sym", "hard"):
             skipped.append(f"{key} (link over an existing name)")
+        if old is None:
+            self.charge(len(key))
         self.nodes[key] = (kind, None)
         self._register(key)
 
     def add_link(self, key: str, kind: str, target: str, skipped: list[str]) -> None:
+        self.members += 1
         if not key or key in self.nodes or key in self.children:
             skipped.append(f"{key or '.'} (link over an existing name)")
             return
+        self.charge(len(key) + len(target))
         self.nodes[key] = (kind, target)
         self.links.append(key)
         self._register(key)
@@ -1064,18 +1120,25 @@ class _NameClaims:
     """
 
     def __init__(self, tree: _TarTree) -> None:
+        self.tree = tree
         self.taken: set[str] = set()
         for key, (kind, _) in tree.nodes.items():
             if kind not in ("sym", "hard"):
                 self._take(key, parents=True)
         for key in tree.children:
             if key:
-                self.taken.add(_win_name(key))
+                self._add(_win_name(key))
+
+    def _add(self, name: str) -> None:
+        # Charged to the tree's memory allowance: this set can hold as much.
+        if name not in self.taken:
+            self.tree.charge(len(name))
+            self.taken.add(name)
 
     def _take(self, key: str, parents: bool = False) -> None:
         parts = key.split("/")
         for i in range(1 if parents else len(parts), len(parts) + 1):
-            self.taken.add(_win_name("/".join(parts[:i])))
+            self._add(_win_name("/".join(parts[:i])))
 
     def claim(self, out: Path, name: str, skipped: list[str]) -> bool:
         if _win_name(name) in self.taken or os.path.lexists(out):
@@ -1266,9 +1329,14 @@ def _safe_target(dest: Path, name: str) -> Path:
     # back slashes or carry a drive letter. Reject anything absolute outright.
     if PurePosixPath(name).is_absolute() or PureWindowsPath(name).is_absolute():
         raise RunnerFailed(f"refused unsafe archive path: {name!r}")
+    if len(name) > MAX_NAME_CHARS:
+        raise RunnerFailed(f"refused archive path longer than {MAX_NAME_CHARS} characters: {name[:80]!r}...")
     parts = [p for p in PureWindowsPath(name).parts if p not in ("", ".")]
     if any(p == ".." for p in parts):
         raise RunnerFailed(f"refused unsafe archive path: {name!r}")
+    if len(parts) > MAX_NAME_DEPTH:
+        # Checked before resolve(), which costs time with the square of depth.
+        raise RunnerFailed(f"refused archive path deeper than {MAX_NAME_DEPTH} folders: {name[:80]!r}...")
     dest_root = dest.resolve()
     target = (dest_root / Path(*parts)).resolve()
     if target != dest_root and dest_root not in target.parents:
