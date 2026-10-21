@@ -18,7 +18,11 @@
   the verified build, a run killed after the app switched (the next run must
   start Peel again), a publisher killed in the watch window after its build
   rewrote settings.json, and a settings.json or install.json that cannot be
-  read or written once Peel is stopped. Nothing moves the mouse or the
+  read or written once Peel is stopped. Review round 1 (hq-plct.26): a
+  failed first install must leave no Run value of ours, a rollback killed
+  before Peel starts again must leave the restart to the next run, and a
+  rollback that cannot put a read only settings.json back must keep the
+  journal and settings.before, exit 7 and leave Peel stopped. Nothing moves the mouse or the
   keyboard; the stand in starts in the signed in session through a scheduled
   task, so someone has to be signed in at George.
 
@@ -206,6 +210,22 @@ function Get-Bytes([string]$path) {
     return [Convert]::ToBase64String([IO.File]::ReadAllBytes($path))
 }
 
+# A publisher whose build rewrites settings.json, killed in its watch window
+# once the rewrite is on disk; returns whether the rewrite was seen.
+function Invoke-KilledWatch([string]$engine) {
+    $before = Get-Bytes $settings
+    $env:PEEL_TEST_ENGINE = $engine
+    $log = Join-Path $scratch "publish-killed-$engine.log"
+    $killed = Start-Process -FilePath powershell -ArgumentList (@(Get-PublishArgs 'rewrites') + @('-StaySeconds', '120')) -PassThru -WindowStyle Hidden -RedirectStandardOutput $log
+    $null = $killed.Handle
+    $deadline = (Get-Date).AddSeconds(60)
+    while ((Get-Bytes $settings) -eq $before -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
+    $rewritten = (Get-Bytes $settings) -ne $before
+    Stop-Process -Id $killed.Id -Force
+    $killed.WaitForExit()
+    return $rewritten
+}
+
 function Check-Clean([string]$case) {
     $versions = @(Get-ChildItem -LiteralPath (Join-Path $root 'versions') -Directory -ErrorAction SilentlyContinue)
     Check "$case keeps only the pair in use" ($versions.Count -eq 1) "($($versions.Count) in versions)"
@@ -219,11 +239,14 @@ try {
     $code = Publish 'quits' 'e0'
     Check 'a failed first install exits 4' ($code -eq 4) "(exit $code)"
     Check 'a failed first install has no verified pair' ($null -eq (Get-Journal).verified)
+    # Nothing verified, so log on must not start the candidate (review round 1, b).
     $value = Get-RunValue
-    Check 'a failed first install names the app in the root (nothing else to name)' ($value -eq ('"{0}"' -f (Join-Path $app 'Peel.exe'))) $value
+    Check 'a failed first install registers no start with Windows entry' ($null -eq $value) $value
     $code = Publish 'quits' 'e0b'
     Check 'the next failed build after a failed first install exits 4, not 6' ($code -eq 4) "(exit $code)"
     Check 'the next run never marks the failed first install verified' ($null -eq (Get-Journal).verified) (ConvertTo-Json -Compress (Get-Journal))
+    $value = Get-RunValue
+    Check 'the next failed build after a failed first install registers no entry either' ($null -eq $value) $value
     foreach ($link in @($app, $venv)) { if (Test-IsLink $link) { [IO.Directory]::Delete($link, $false) } }
     Remove-Item -Recurse -Force (Join-Path $root 'versions'), (Join-Path $root 'install.json')
     Remove-ItemProperty -Path $runKey -Name Peel -ErrorAction SilentlyContinue
@@ -329,6 +352,23 @@ try {
     $code = Publish 'good2' 'e13'
     Check 'after a killed run, an upgrade exits 0' ($code -eq 0) "(exit $code)"
 
+    # 9b the recovery of a killed run is itself killed after its rollback and
+    # before Peel starts again: the run after it must still start Peel
+    # (review round 1, c)
+    $env:PEEL_PUBLISH_TEST_DIE = 'mid-switch'
+    $code = Publish 'good1' 'e13m'
+    Check 'the first run died mid switch' ($code -eq 9) "(exit $code)"
+    $env:PEEL_PUBLISH_TEST_DIE = 'before-restart'
+    $code = Publish 'good1' 'fail'
+    $env:PEEL_PUBLISH_TEST_DIE = $null
+    Check 'the recovery died after its rollback with Peel stopped' ($code -eq 9 -and (Get-Running).Count -eq 0) "(exit $code, $((Get-Running).Count) running)"
+    Check 'the killed recovery leaves the restart in the journal' ([bool](Get-Journal).restart) (ConvertTo-Json -Compress (Get-Journal))
+    $code = Publish 'good1' 'fail'
+    Check 'after a killed recovery, a failed engine build exits non zero' ($code -ne 0) "(exit $code)"
+    Check 'after a killed recovery, the next run starts good2 on e13 again' ((Get-RunningBuild) -eq 'good2' -and (Get-Engine) -eq 'e13') "$(Get-RunningBuild) $(Get-Engine)"
+    Check 'after a killed recovery, the restart flag is gone once Peel runs' (-not (Get-Journal).restart) (ConvertTo-Json -Compress (Get-Journal))
+    Check-Clean 'after a killed recovery'
+
     # 10 a build that rewrites settings.json and quits
     $settingsBytes = [IO.File]::ReadAllBytes($settings)
     $code = Publish 'clobber' 'e14'
@@ -341,20 +381,32 @@ try {
     # rewritten settings.json: the next run puts the bytes back (lucy round 2,
     # finding 2)
     $settingsBytes = Get-Bytes $settings
-    $env:PEEL_TEST_ENGINE = 'e17'
-    $killedLog = Join-Path $scratch 'publish-killed.log'
-    $killed = Start-Process -FilePath powershell -ArgumentList (@(Get-PublishArgs 'rewrites') + @('-StaySeconds', '120')) -PassThru -WindowStyle Hidden -RedirectStandardOutput $killedLog
-    $null = $killed.Handle
-    $deadline = (Get-Date).AddSeconds(60)
-    while ((Get-Bytes $settings) -eq $settingsBytes -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 200 }
-    Check 'the killed watch: the new build rewrote settings first' ((Get-Bytes $settings) -ne $settingsBytes)
-    Stop-Process -Id $killed.Id -Force
-    $killed.WaitForExit()
+    Check 'the killed watch: the new build rewrote settings first' (Invoke-KilledWatch 'e17')
     $code = Publish 'good1' 'fail'
     Check 'after a kill in the watch window, a failed engine build exits non zero' ($code -ne 0) "(exit $code)"
     Check 'after a kill in the watch window, the next run gets the old settings bytes back' ((Get-Bytes $settings) -eq $settingsBytes) ([IO.File]::ReadAllText($settings))
     Check 'after a kill in the watch window, good2 runs on engine e13' ((Get-RunningBuild) -eq 'good2' -and (Get-Engine) -eq 'e13') "$(Get-RunningBuild) $(Get-Engine)"
     Check-Clean 'after a kill in the watch window'
+
+    # 10c as 10b, but settings.json is read only when the next run rolls
+    # back: the rollback is not finished, so it keeps the journal and the
+    # saved bytes, exits 7 and leaves Peel stopped (review round 1, a)
+    $settingsBytes = Get-Bytes $settings
+    Check 'the read only watch: the new build rewrote settings first' (Invoke-KilledWatch 'e17r')
+    $settingsItem = Get-Item -LiteralPath $settings
+    $settingsItem.IsReadOnly = $true
+    $code = Publish 'good1' 'fail'
+    $settingsItem.IsReadOnly = $false
+    Check 'a settings file that cannot be put back exits 7' ($code -eq 7) "(exit $code)"
+    $snapshot = Join-Path $root 'settings.before'
+    Check 'a settings file that cannot be put back keeps settings.before' ((Test-Path $snapshot) -and (Get-Bytes $snapshot) -eq $settingsBytes)
+    Check 'a settings file that cannot be put back keeps the candidate in the journal' ($null -ne (Get-Journal).candidate) (ConvertTo-Json -Compress (Get-Journal))
+    Check 'a settings file that cannot be put back leaves Peel stopped' ((Get-Running).Count -eq 0) "($((Get-Running).Count) running)"
+    $code = Publish 'good1' 'fail'
+    Check 'once settings is writable, a failed engine build exits non zero' ($code -ne 0 -and $code -ne 7) "(exit $code)"
+    Check 'once settings is writable, the old settings bytes are back' ((Get-Bytes $settings) -eq $settingsBytes) ([IO.File]::ReadAllText($settings))
+    Check 'once settings is writable, good2 runs on engine e13' ((Get-RunningBuild) -eq 'good2' -and (Get-Engine) -eq 'e13') "$(Get-RunningBuild) $(Get-Engine)"
+    Check-Clean 'once settings is writable'
 
     # 11 two runs at once: the second one must not touch the install
     $env:PEEL_TEST_ENGINE = 'e15'
