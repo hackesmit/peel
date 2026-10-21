@@ -152,6 +152,53 @@ instead. The app's own handler catches all three, so the symptom is a window
 that is subtly wrong and a line in the log rather than a crash, which is why
 the csproj carries a comment and not a setting.
 
+## The timeline and page editors
+
+`Editors/Timeline/` and `Editors/Pages/` hold the windows for the video, audio
+and PDF entries that need input (hq-plct.11). They register with EditorHost
+through `MediaEditors.Handles` and `PageEditors.Handles` and nothing else.
+
+- **One timeline window, five tools.** Video and audio Trim, video Split,
+  audio Bleep, video Redact and video Crop are `TimelineEditor` over a
+  `TimelinePlan` (start and end, cuts or an interval, ranges, one optional
+  range). The bar (`TimelineBar`) draws the plan and turns the mouse into
+  edits; `TimeAxis` does the arithmetic, the way `PreviewMap` does for
+  pictures. Audio Metadata is a form (`AudioMetadataEditor`).
+- **The length comes from ffprobe.** `MediaProbe` finds ffprobe where the
+  engine does (`PEEL_BACKEND_FFPROBE`, PATH, the standard Windows folders) and
+  runs it in a kill on close job, so the window and the engine agree on how
+  long a file is. MediaElement plays what Media Foundation can open; for the
+  rest (Opus, OGG, many MKVs) the window says so and still works.
+- **Frames and page thumbnails come from the engine.** `FrameGrab` runs
+  `av.video_snapshot` and `PageThumbs` runs `docs.pdf_to_png` with `--out-dir`
+  into a folder of their own under `%TEMP%\Peel`, decode, and delete it. The
+  Redact and Crop box is drawn on the engine's own frame, so it is in the
+  pixels `av.video_redact` and `av.video_crop` check it against, phone
+  rotation included.
+- **Even sizes.** The engine floors an odd box size to even. `RegionPlan`
+  evens a crop down (the window shows the real output size) and a redaction
+  up, so no covered pixel is left sharp.
+- **The file must not change underneath.** A video can be gigabytes, so
+  instead of hashing it (as the image editors do) EditorHost compares its size
+  and last write time (`FileStamp`) right before the job starts.
+- The PDF page drag is the window's own (mouse capture and a marker), never
+  an OLE drag, so it brings no drag image and no wheel.
+- Snapshot has no editor: the engine marks it as running at once with its
+  defaults, which is what the SPEC says.
+
+The GUI test is `tests/run-timeline.ps1` (`e2e-timeline.ps1` plus
+`e2e-timeline-check.py`): every one of these editors opened from the wheel
+by a real drag, driven by the real mouse and UI Automation, with the output
+checked by ffprobe, ffmpeg and PyMuPDF and one screenshot per editor read
+back. It waits for 5 minutes with no user input on George before it touches
+the mouse, pauses the installed Peel for the run and starts it again, and
+leaves its evidence in `C:\peel-dev\e2e-timeline`. Take
+`C:\peel-dev\gui.lock` before running it.
+
+```
+ssh george "powershell -NoProfile -ExecutionPolicy Bypass -File C:\peel-dev\<branch>\shell\tests\run-timeline.ps1 -Engine <venv>\Scripts\peel.exe"
+```
+
 ## Logging
 
 `%LOCALAPPDATA%\Peel\logs\peel.log`, or wherever `PEEL_LOG` points. Writes are
@@ -168,9 +215,6 @@ cannot leave a tray app behind.
   hq-plct.8.
 - The six Alt wheel actions. Entries marked `handled_by: shell` say so in a
   toast instead of running: bead hq-plct.9.
-- The editor windows for video, audio and PDF entries with `needs_editor`
-  (trim, split, bleep, organize pages): bead hq-plct.11. `Editors/EditorHost.cs`
-  knows which entries it has a window for and says so in a toast for the rest.
 - Settings, including remapping the modifiers. The wheel to modifier mapping is
   already data (the engine's `default_modifier`), so this is a settings file and
   a window, not a change to the wheel.
