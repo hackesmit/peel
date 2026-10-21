@@ -56,6 +56,27 @@ the user PATH.
 The installed app (`C:\Program Files\Peel` or `%LOCALAPPDATA%\Peel`) is owned by
 the shell-install bead, not this script.
 
+Once `publish.ps1` has run, `venv` is a junction to
+`%LOCALAPPDATA%\Peel\engines\<stamp>\venv`, the engine build that goes with
+the installed app. Re-running `setup.ps1` then writes into that build, so to
+fix missing backends run `setup.ps1` and then `publish.ps1`, which builds a
+fresh pair. Do not use `-RecreateVenv` on a junction; run `publish.ps1`
+instead.
+
+## publish.ps1 and its tests
+
+`publish.ps1` installs or upgrades the app and the engine as a pair and keeps
+the previous pair until the new app has stayed up for 10 s; a new build that
+quits puts the previous app and engine back (exit 6). See its header for the
+steps and exit codes. `test-publish.ps1` runs it against a scratch root in
+%TEMP% with a stand in Peel.exe and checks each case, plus the loose JSON
+reader in `LooseJson.ps1`. It needs someone signed in at George, and it never
+touches the installed Peel:
+
+```
+ssh george "powershell -NoProfile -ExecutionPolicy Bypass -File C:\peel-dev\<branch>\install\test-publish.ps1"
+```
+
 ## Python version
 
 George runs CPython 3.14, and every module backend has a working 3.14 wheel
