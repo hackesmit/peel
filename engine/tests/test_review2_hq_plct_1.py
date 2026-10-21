@@ -47,9 +47,9 @@ def _claim_in_child(src: str, q) -> None:
 def test_r2_real_processes_never_share_a_name(tmp_path):
     src = tmp_path / "photo.txt"
     src.write_text("x", encoding="utf-8")
-    # Windows has no fork; spawn re-imports this module, which works because the
-    # child target is a module-level function.
-    ctx = mp.get_context("fork" if "fork" in mp.get_all_start_methods() else "spawn")
+    # spawn exists on every platform (Windows has no fork) and re-imports this
+    # module, which works because the child target is a module-level function.
+    ctx = mp.get_context("spawn")
     q = ctx.Queue()
     procs = [ctx.Process(target=_claim_in_child, args=(str(src), q)) for _ in range(16)]
     for p in procs:
