@@ -180,10 +180,47 @@ public class WheelLookTests
     public void FormatWheelsReadInCapitalsAndToolWheelsKeepTheirCase()
     {
         Assert.True(WheelRenderer.ReadsAsFormats(Plan("mp3", "WEBP", "docx")));
-        Assert.False(WheelRenderer.ReadsAsFormats(Plan("Compress", "Crop", "Trim")));
-        Assert.False(WheelRenderer.ReadsAsFormats(Plan("Copy Path", "Move")));
+        Assert.False(WheelRenderer.ReadsAsFormats(PlanOf("tool", "Compress", "Crop", "Trim")));
+        Assert.False(WheelRenderer.ReadsAsFormats(PlanOf("action", "Copy Path", "Move")));
         Assert.False(WheelRenderer.ReadsAsFormats(WheelPlan.Loading));
     }
+
+    [Fact]
+    public void TheFamilyDecidesCapitalsNotTheLengthOfTheNames() => OnSta(() =>
+    {
+        // One long format name used to make the whole page read as tools.
+        var formats = PlanOf("Convert", "Markdown", "PDF", "html");
+        Assert.True(WheelRenderer.ReadsAsFormats(formats));
+        var renderer = new WheelRenderer();
+        renderer.SetPlan(formats, WheelTheme.AccentFor("convert"));
+        renderer.SetHot(0);
+        Assert.Equal("MARKDOWN", renderer.HotLabel);
+        // Short tool names are still tool names.
+        var tools = PlanOf("tool", "Crop", "Trim", "Mute");
+        Assert.False(WheelRenderer.ReadsAsFormats(tools));
+        renderer.SetPlan(tools, WheelTheme.AccentFor("tool"));
+        renderer.SetHot(1);
+        Assert.Equal("Trim", renderer.HotLabel);
+        // A convert page with nothing on it shows its placeholder as written.
+        var empty = new WheelPlan("convert", "Convert",
+            new[] { new WheelSegment(SegmentKind.Empty, "Nothing here", string.Empty, null) }, 0, 1);
+        Assert.False(WheelRenderer.ReadsAsFormats(empty));
+    });
+
+    [Fact]
+    public void CapitalsDoNotFollowTheUserCulture() => OnSta(() =>
+    {
+        // Turkish capitalises i as a dotted I; a format name must not change.
+        Thread.CurrentThread.CurrentCulture = new System.Globalization.CultureInfo("tr-TR");
+        Thread.CurrentThread.CurrentUICulture = new System.Globalization.CultureInfo("tr-TR");
+        var renderer = new WheelRenderer();
+        renderer.SetPlan(Plan("gif", "tiff", "mkv"), WheelTheme.AccentFor("convert"));
+        renderer.SetHot(0);
+        Assert.Equal("GIF", renderer.HotLabel);
+        renderer.SetHot(1);
+        Assert.Equal("TIFF", renderer.HotLabel);
+        Render(renderer, "wheel-tr.png");
+    });
 
     [Fact]
     public void EveryToolNameFitsATwelvePetalWheelWithoutACut() => OnSta(() =>
@@ -203,10 +240,12 @@ public class WheelLookTests
         Assert.Equal(11, WheelRenderer.FitSize("Crop", 11, width, face, 1));
     });
 
-    private static WheelPlan Plan(params string[] labels)
+    private static WheelPlan Plan(params string[] labels) => PlanOf("convert", labels);
+
+    private static WheelPlan PlanOf(string family, params string[] labels)
     {
         var segments = Array.ConvertAll(labels, label => new WheelSegment(SegmentKind.Entry, label, string.Empty, null));
-        return new WheelPlan("convert", "Convert", segments, 0, 1);
+        return new WheelPlan(family, family, segments, 0, 1);
     }
 
     private static double Overlap(Geometry a, Geometry b) =>
@@ -244,7 +283,7 @@ public class WheelLookTests
         return new Pixels(data, side);
     }
 
-    private static void OnSta(Action body)
+    internal static void OnSta(Action body)
     {
         Exception? failure = null;
         var thread = new Thread(() =>
