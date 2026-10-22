@@ -72,7 +72,7 @@ internal partial class TimelineEditor : EditorWindowBase
     private bool _writing;
     private bool _playable;
     private bool _playing;
-    private int _frameAsked;
+    private readonly LatestRun _snapshot = new();
     private Point _from;
     private bool _drawing;
 
@@ -299,10 +299,12 @@ internal partial class TimelineEditor : EditorWindowBase
         {
             return;
         }
-        var asked = ++_frameAsked;
+        // One snapshot run at a time: a newer ask cancels this one's engine.
         // FrameGrab never throws: a frame it cannot take leaves the last one up.
-        var (bitmap, _) = await FrameGrab.AtAsync(_engine, _path, seconds, _closing.Token).ConfigureAwait(true);
-        if (asked != _frameAsked || _closing.IsCancellationRequested || bitmap is null)
+        var (_, latest, frame) = await _snapshot.RunAsync(
+            token => FrameGrab.AtAsync(_engine, _path, seconds, token), _closing.Token).ConfigureAwait(true);
+        var bitmap = frame.Bitmap;
+        if (!latest || _closing.IsCancellationRequested || bitmap is null)
         {
             return;
         }
