@@ -116,6 +116,116 @@ public class WheelCloseTests
     });
 
     [Fact]
+    public void AStaleFadeEndDoesNotStopTheNextClosesFallback() => WheelLookTests.OnSta(() =>
+    {
+        // Review round 1 (hq-i9v0.2): the cancelled close's Completed came in
+        // during the next close and stopped that close's fallback timer.
+        var window = new KeyboardWheelWindow();
+        try
+        {
+            window.ShowAt(OffScreen, OffScreen);
+            window.HideNow("hotkey pressed again");
+            window.ShowAt(OffScreen, OffScreen);
+            Renderer(window).CloseDuration = TimeSpan.FromSeconds(30);
+            window.HideNow("escape");
+
+            Pump(WheelFade.Fallback + TimeSpan.FromMilliseconds(400));
+            Assert.False(((Window)window).IsVisible, "the fallback still hid the wheel after the stale fade ended");
+        }
+        finally
+        {
+            window.Close();
+        }
+    });
+
+    [Fact]
+    public void TheKeyboardWheelHandsTheForegroundBackTheMomentItCloses() => WheelLookTests.OnSta(() =>
+    {
+        var window = new KeyboardWheelWindow();
+        try
+        {
+            var explorer = new IntPtr(0x1234);
+            var foreground = explorer;
+            window.FocusReturn.Windows = new KeyboardFocusReturn.Desktop(
+                () => foreground,
+                hwnd => hwnd == explorer,
+                (_, _) => IntPtr.Zero,
+                hwnd =>
+                {
+                    foreground = hwnd;
+                    return true;
+                });
+            var reasons = new System.Collections.Generic.List<string>();
+            window.Hidden += reasons.Add;
+            window.ShowAt(OffScreen, OffScreen);
+            foreground = window.Handle; // the wheel took the keyboard
+            Renderer(window).CloseDuration = TimeSpan.FromSeconds(30);
+
+            window.HideNow("escape");
+            Assert.True(explorer == foreground, $"foreground {foreground} after the close, hidden for: {string.Join(", ", reasons)}, before {window.FocusReturn.Before}");
+            Assert.True(((Window)window).IsVisible, "the wheel is still fading");
+            Assert.True(NoActivate(window.Handle), "and cannot take the foreground again");
+
+            window.ShowAt(OffScreen, OffScreen);
+            Assert.False(NoActivate(window.Handle), "a wheel shown again takes the keyboard");
+            Assert.Equal(explorer, window.FocusReturn.Before);
+            window.HideNow("test over");
+            Pump(WheelFade.Fallback + TimeSpan.FromMilliseconds(100));
+            Assert.False(NoActivate(window.Handle), "a hidden wheel can be activated when it next opens");
+        }
+        finally
+        {
+            window.Close();
+        }
+    });
+
+    [Fact]
+    public void TheForegroundGoesBackToTheWindowInFrontBeforeTheWheel()
+    {
+        var wheel = new IntPtr(1);
+        var explorer = new IntPtr(2);
+        var under = new IntPtr(3);
+        var alive = new System.Collections.Generic.HashSet<IntPtr> { explorer, under };
+        var foreground = explorer;
+        var focus = new KeyboardFocusReturn(wheel)
+        {
+            Windows = new KeyboardFocusReturn.Desktop(
+                () => foreground,
+                alive.Contains,
+                (_, _) => under,
+                hwnd =>
+                {
+                    foreground = hwnd;
+                    return true;
+                }),
+        };
+
+        focus.Opening();
+        foreground = wheel;
+        focus.Opening();
+        Assert.Equal(explorer, focus.Before);
+        Assert.Equal(explorer, focus.Closing(0, 0));
+        Assert.Equal(explorer, foreground);
+
+        // The user clicked elsewhere first: the wheel does not take it back.
+        foreground = under;
+        Assert.Equal(IntPtr.Zero, focus.Closing(0, 0));
+        Assert.Equal(under, foreground);
+
+        // The window in front before is gone: the one under the wheel gets it.
+        foreground = wheel;
+        alive.Remove(explorer);
+        Assert.Equal(under, focus.Closing(0, 0));
+        Assert.Equal(under, foreground);
+
+        // Nothing usable under it either: the foreground stays where it is.
+        foreground = wheel;
+        alive.Clear();
+        Assert.Equal(IntPtr.Zero, focus.Closing(0, 0));
+        Assert.Equal(wheel, foreground);
+    }
+
+    [Fact]
     public void ADragWheelWhoseFadeNeverEndsIsStillHidden() => WheelLookTests.OnSta(() =>
     {
         var window = new WheelWindow();
@@ -156,6 +266,9 @@ public class WheelCloseTests
 
     private static bool Transparent(IntPtr handle) =>
         (Peel.Hooks.Native.GetWindowStyleEx(handle) & WheelHubWindow.WS_EX_TRANSPARENT) != 0;
+
+    private static bool NoActivate(IntPtr handle) =>
+        (Peel.Hooks.Native.GetWindowStyleEx(handle) & Peel.Hooks.Native.WS_EX_NOACTIVATE) != 0;
 
     private static void Press(Window window, Key key)
     {
