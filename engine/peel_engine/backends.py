@@ -340,6 +340,11 @@ def version(name: str) -> str:
     found = find(name)
     if backend is None or found is None or backend.kind == MODULE:
         return _module_version(backend) if backend and backend.kind == MODULE else ""
+    if name == "soffice":
+        # soffice --version never answers on Windows: timeout kills only the
+        # soffice.exe launcher and leaves soffice.bin plus a console window.
+        # Read the product key from bootstrap.ini beside the exe instead.
+        return _soffice_version(found)
     args = [str(found)] + ([backend.version_arg] if backend.version_arg else [])
     try:
         proc = subprocess.run(
@@ -350,6 +355,17 @@ def version(name: str) -> str:
         return ""
     text = (proc.stdout or proc.stderr or "").strip()
     return text.splitlines()[0].strip() if text else ""
+
+
+def _soffice_version(found: Path) -> str:
+    """Read 'LibreOffice X.Y' from program/bootstrap.ini without running soffice."""
+    try:
+        text = (found.resolve().parent / "bootstrap.ini").read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    m = re.search(r"^ProductKey=(.+)$", text, re.M)
+    return m.group(1).strip() if m else ""
 
 
 def _module_version(backend: Backend) -> str:
