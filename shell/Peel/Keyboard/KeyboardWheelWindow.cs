@@ -111,6 +111,7 @@ internal sealed class KeyboardWheelWindow : Window
             Show();
         }
         Native.SetWindowPos(_handle, Native.HWND_TOPMOST, left, top, side, side, Native.SWP_SHOWWINDOW);
+        _renderer.PlayOpen();
         _lifetime.Opened(_clock.ElapsedMilliseconds);
         _watch.Start();
         Activate();
