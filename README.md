@@ -66,4 +66,9 @@ start, Peel goes back to the one you had. Details: [install/README.md](install/R
 
 ## Licence
 
-No licence has been chosen yet, so all rights are reserved by the author.
+Peel is released under the [MIT licence](LICENSE).
+
+Peel installs and calls other programs and Python packages that keep their
+own licences, for example FFmpeg (LGPL/GPL), 7-Zip (LGPL), LibreOffice (MPL),
+Pandoc (GPL) and PyMuPDF (AGPL). They are downloaded by the install scripts,
+not included in this repository.
