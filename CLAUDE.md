@@ -25,6 +25,11 @@ copy Tangerine's binary, code, icons or other assets. Own names and own icons.
   only the install bead touches it.
 
 ## Conventions
+- The UI must look like the reference (Daniel, 2026-10-22): Tangerine's public
+  landing demo, frames in ~/hq/state/peel-ref/. Any bead that changes a UI
+  surface proves it with a screenshot of the installed UI on George next to
+  the reference, read back before close. Recreate the look by own drawing;
+  never copy an asset.
 - Engine registry is data, not branches: each action is one entry (id, family,
   label, inputs, output ext, params schema, runner). The shell never hard-codes
   formats; it renders what `peel options` returns.
