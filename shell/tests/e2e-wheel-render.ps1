@@ -143,6 +143,7 @@ try {
 
     $r = $item.Current.BoundingRectangle
     $x = [int]($r.X + 24); $y = [int]($r.Y + $r.Height / 2)
+    if (-not (Confirm-GrabPoint $item $x $y)) { throw "another window stays over the test Explorer at $x,$y" }
     [void][PeelGuard]::Place($x, $y); Start-Sleep -Milliseconds 250
     MoveTo $x $y; Start-Sleep -Milliseconds 120
     [PeelGuard]::Down(); Start-Sleep -Milliseconds 120

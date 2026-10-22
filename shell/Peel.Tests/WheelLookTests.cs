@@ -176,6 +176,33 @@ public class WheelLookTests
         Assert.Equal("C", renderer.HotLabel);
     });
 
+    [Fact]
+    public void FormatWheelsReadInCapitalsAndToolWheelsKeepTheirCase()
+    {
+        Assert.True(WheelRenderer.ReadsAsFormats(Plan("mp3", "WEBP", "docx")));
+        Assert.False(WheelRenderer.ReadsAsFormats(Plan("Compress", "Crop", "Trim")));
+        Assert.False(WheelRenderer.ReadsAsFormats(Plan("Copy Path", "Move")));
+        Assert.False(WheelRenderer.ReadsAsFormats(WheelPlan.Loading));
+    }
+
+    [Fact]
+    public void EveryToolNameFitsATwelvePetalWheelWithoutACut() => OnSta(() =>
+    {
+        // The longest single words the fake registry's tools wheel shows
+        // (tests/fake-options.json), on a full twelve petal page.
+        var renderer = new WheelRenderer();
+        var width = renderer.LabelWidth(WheelPlanner.MaxSegments);
+        var face = WheelRenderer.NameFace;
+        foreach (var word in new[] { "Compress", "Normalize", "Annotate", "Metadata", "Watermark", "Organize", "Terminal" })
+        {
+            var size = WheelRenderer.FitSize(word, 11, width, face, 1);
+            var measured = new FormattedText(word, System.Globalization.CultureInfo.InvariantCulture,
+                FlowDirection.LeftToRight, face, size, Brushes.Black, 1);
+            Assert.True(measured.WidthIncludingTrailingWhitespace <= width, $"{word} at {size} is {measured.WidthIncludingTrailingWhitespace:0.0} of {width:0.0}");
+        }
+        Assert.Equal(11, WheelRenderer.FitSize("Crop", 11, width, face, 1));
+    });
+
     private static WheelPlan Plan(params string[] labels)
     {
         var segments = Array.ConvertAll(labels, label => new WheelSegment(SegmentKind.Entry, label, string.Empty, null));

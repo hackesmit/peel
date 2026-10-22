@@ -26,7 +26,7 @@ internal static class WheelHub
         }
         var maxWidth = (2 * wheel.HubRadius) - 18;
         var text = new FormattedText(
-            label.ToUpper(CultureInfo.CurrentUICulture),
+            label,
             CultureInfo.CurrentUICulture,
             FlowDirection.LeftToRight,
             PillFace,

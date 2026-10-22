@@ -34,7 +34,9 @@ internal sealed class WheelRenderer : FrameworkElement
     private WheelPlan _plan = WheelPlan.Loading;
     private Brush _accent = WheelTheme.AccentFor(string.Empty);
     private int _hot = -1;
+    private bool _upper;
     private readonly Typeface _labelFace;
+    private readonly Typeface _nameFace;
     private readonly Typeface _detailFace;
 
     /// <param name="drawsHub">
@@ -49,6 +51,7 @@ internal sealed class WheelRenderer : FrameworkElement
         RenderTransform = _scale;
         RenderTransformOrigin = new Point(0.5, 0.5);
         _labelFace = new Typeface(new FontFamily(WheelTheme.FontFamily), FontStyles.Normal, FontWeights.Bold, FontStretches.Normal);
+        _nameFace = NameFace;
         _detailFace = new Typeface(new FontFamily(WheelTheme.FontFamily), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
         _shadow = ShadowBrush(_geometry);
         _plate = PlateShape(_geometry, drawsHub);
@@ -65,8 +68,42 @@ internal sealed class WheelRenderer : FrameworkElement
     /// <summary>The label the hub pill shows: the hovered segment's, or empty.</summary>
     internal string HotLabel =>
         _hot >= 0 && _hot < _plan.Count && _plan.Segments[_hot].Kind != SegmentKind.Empty
-            ? _plan.Segments[_hot].Label
+            ? Display(_plan.Segments[_hot].Label)
             : string.Empty;
+
+    /// <summary>Tool and action names: a touch narrower than the bold format
+    /// names, so a long one fits a thin petal.</summary>
+    internal static readonly Typeface NameFace =
+        new(new FontFamily(WheelTheme.FontFamily), FontStyles.Normal, FontWeights.SemiBold, FontStretches.Normal);
+
+    /// <summary>The smallest a label shrinks to before it is trimmed instead.</summary>
+    internal const double MinLabelSize = 9;
+
+    /// <summary>
+    /// Format names are shown in capitals, as on the reference: a wheel whose
+    /// every entry is a short name (MP3, WEBP, DOCX) reads as formats. Tool and
+    /// action names (Compress, Copy Path) keep their case, because capitals
+    /// make them too wide for a twelve petal wheel.
+    /// </summary>
+    internal static bool ReadsAsFormats(WheelPlan plan)
+    {
+        var entries = 0;
+        foreach (var segment in plan.Segments)
+        {
+            if (segment.Kind != SegmentKind.Entry)
+            {
+                continue;
+            }
+            entries++;
+            if (segment.Label.Length > 5 || segment.Label.Contains(' '))
+            {
+                return false;
+            }
+        }
+        return entries > 0;
+    }
+
+    private string Display(string label) => _upper ? label.ToUpper(CultureInfo.CurrentUICulture) : label;
 
     /// <summary>Raised after the hovered segment changes, so a hub drawn elsewhere can follow.</summary>
     internal event Action? HotChanged;
@@ -76,6 +113,7 @@ internal sealed class WheelRenderer : FrameworkElement
         var sameShape = plan.Count == _plan.Count;
         _plan = plan;
         _accent = accent;
+        _upper = ReadsAsFormats(plan);
         _hot = -1;
         if (!sameShape)
         {
@@ -177,7 +215,9 @@ internal sealed class WheelRenderer : FrameworkElement
             var hot = i == _hot && segment.Kind != SegmentKind.Empty;
             var (dx, dy) = _geometry.LabelOffset(count, i);
             var brush = hot ? WheelTheme.HotLabel : segment.Kind == SegmentKind.Entry ? WheelTheme.Label : WheelTheme.Quiet;
-            var label = Text(segment.Label.ToUpper(CultureInfo.CurrentUICulture), size, width, _labelFace, brush, dip);
+            var text = Display(segment.Label);
+            var face = _upper ? _labelFace : _nameFace;
+            var label = Text(text, FitSize(text, size, width, face, dip), width, face, brush, dip);
             // The group line is only worth its space on the segment being
             // aimed at. Drawn on every one, a twelve segment wheel is a wall
             // of overlapping text.
@@ -206,15 +246,43 @@ internal sealed class WheelRenderer : FrameworkElement
     /// width where the label sits, so a busy wheel wraps or trims instead of
     /// writing over its neighbours.
     /// </summary>
-    private double LabelWidth(int count)
+    internal double LabelWidth(int count)
     {
         var thickness = (_geometry.PetalOuter - _geometry.PetalInner) * 0.9;
         if (count <= 2)
         {
             return thickness;
         }
-        var chord = (2 * _geometry.LabelRadius * Math.Sin(Math.PI / count)) - WheelGeometry.Gap - 6;
+        var chord = (2 * _geometry.LabelRadiusFor(count) * Math.Sin(Math.PI / count)) - WheelGeometry.Gap - 4;
         return Math.Max(40, Math.Min(thickness, chord));
+    }
+
+    /// <summary>
+    /// The size at which the label's longest word fits the petal, from
+    /// <paramref name="size"/> down to <see cref="MinLabelSize"/>; past that it
+    /// is trimmed. A word cut in the middle ("COM...") is worse than a smaller one.
+    /// </summary>
+    internal static double FitSize(string text, double size, double width, Typeface face, double dip)
+    {
+        var longest = string.Empty;
+        foreach (var word in text.Split(' '))
+        {
+            if (word.Length > longest.Length)
+            {
+                longest = word;
+            }
+        }
+        while (size > MinLabelSize)
+        {
+            var measured = new FormattedText(longest, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight,
+                face, size, Brushes.Black, dip);
+            if (measured.WidthIncludingTrailingWhitespace <= width)
+            {
+                break;
+            }
+            size = Math.Max(MinLabelSize, size - 0.5);
+        }
+        return size;
     }
 
     private static FormattedText Text(string value, double size, double maxWidth, Typeface face, Brush brush, double dip) =>
