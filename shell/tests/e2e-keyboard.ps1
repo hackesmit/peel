@@ -194,6 +194,11 @@ try {
     if (-not $item) { throw "$Source is not visible in Explorer" }
     $before = @(Get-ChildItem $test -File | ForEach-Object { $_.Name })
 
+    # The hotkey reads the foreground Explorer, so another window left in
+    # front (a UWP app, a browser) would make it a no-files toast.
+    $r = $item.Current.BoundingRectangle
+    if (-not (Confirm-GrabPoint $item ([int]($r.X + 24)) ([int]($r.Y + $r.Height / 2)))) { throw "another window stays over the test Explorer" }
+
     # Scenario A: select, hotkey, arrow to the segment, Enter.
     SelectItem $item
     [PeelGuard]::Hotkey()

@@ -12,12 +12,61 @@ namespace Peel.Wheel;
 
 internal readonly record struct WheelGeometry(double InnerRadius, double OuterRadius)
 {
-    internal static readonly WheelGeometry Default = new(58, 164);
+    // InnerRadius and OuterRadius are the hit test: the hub hole and the edge
+    // of the window's disc. Everything drawn sits inside OuterRadius, because
+    // the window region clips the drawing too.
+    internal static readonly WheelGeometry Default = new(54, 150);
 
-    /// <summary>Window side length in device independent pixels, with room for the shadow.</summary>
+    /// <summary>Window side length in device independent pixels.</summary>
     internal double Size => (OuterRadius + Padding) * 2;
 
-    internal const double Padding = 8;
+    internal const double Padding = 4;
+
+    /// <summary>Width of the soft shadow around the plate, inside the disc.</summary>
+    internal const double ShadowWidth = 6;
+
+    /// <summary>Clear plate between two petals, between a petal and the hub,
+    /// and between a petal and the rim.</summary>
+    internal const double Gap = 6;
+
+    /// <summary>The light round plate the petals sit on.</summary>
+    internal double PlateRadius => OuterRadius - ShadowWidth;
+
+    /// <summary>Outer edge of every petal: a rim of plate shows beyond it.</summary>
+    internal double PetalOuter => PlateRadius - Gap;
+
+    /// <summary>Inner edge of every petal, a gap of plate past the hub hole.</summary>
+    internal double PetalInner => InnerRadius + Gap;
+
+    /// <summary>The drawn hub: a light disc a little inside the hole, so a
+    /// ring of plate separates it from the petals as it does at the rim.</summary>
+    internal double HubRadius => InnerRadius - 2;
+
+    /// <summary>
+    /// Half the clear gap, as an angle, at a radius. A radial edge offset by a
+    /// constant distance from the segment boundary meets a circle of radius r
+    /// at asin(g / 2r) past the boundary, so the gap keeps its width all the
+    /// way out instead of opening up like a wedge.
+    /// </summary>
+    internal static double HalfGapAngle(double radius) =>
+        Math.Asin(Math.Min(1, (Gap / 2) / radius)) * 180.0 / Math.PI;
+
+    /// <summary>
+    /// How round a petal's corners are. Big and soft on a sparse wheel, as on
+    /// the reference; capped to a third of the petal's narrowest width (its
+    /// inner edge) so a twelve segment wheel still keeps a body.
+    /// </summary>
+    internal double CornerRadius(int count)
+    {
+        const double Preferred = 20;
+        if (count <= 1)
+        {
+            return 0;
+        }
+        var step = 360.0 / count;
+        var innerWidth = 2 * PetalInner * Math.Sin((step / 2 - HalfGapAngle(PetalInner)) * Math.PI / 180.0);
+        return Math.Max(2, Math.Min(Preferred, innerWidth / 3));
+    }
 
     internal double Centre => Size / 2;
 
@@ -67,12 +116,17 @@ internal readonly record struct WheelGeometry(double InnerRadius, double OuterRa
 
     /// <summary>Radius the labels sit at: a little past the middle of the ring,
     /// because the further out they are the more room each one has.</summary>
-    internal double LabelRadius => InnerRadius + (0.58 * (OuterRadius - InnerRadius));
+    internal double LabelRadius => PetalInner + (0.55 * (PetalOuter - PetalInner));
+
+    /// <summary>On a dense wheel the labels sit further out still, where a
+    /// thin petal is widest, so a tool name fits without a cut.</summary>
+    internal double LabelRadiusFor(int count) =>
+        count >= 10 ? PetalInner + (0.62 * (PetalOuter - PetalInner)) : LabelRadius;
 
     /// <summary>Where a segment's label sits, as an offset from the wheel centre.</summary>
     internal (double X, double Y) LabelOffset(int count, int index)
     {
         var step = 360.0 / Math.Max(count, 1);
-        return Offset(index * step, LabelRadius);
+        return Offset(index * step, LabelRadiusFor(count));
     }
 }
