@@ -235,6 +235,9 @@ try {
     $files = WaitLog 'drag carries (\d+) file' 4000
     Check 'wheel reads the dragged files' ($files -ne $null) "$($files.Value)"
     Check 'hub is cut out of the window' ((WaitLog 'hub hole cut=True' 3000) -ne $null) 'SetWindowRgn made the hub a hole'
+    # The hub is painted by a window of its own over the hole; it must be
+    # click-through, or a drop in the hub would stop reaching Explorer.
+    Check 'the drawn hub lets a drop through' ((WaitLog 'hub falls through=True' 3000) -ne $null) 'WindowFromPoint at the centre is neither the wheel nor its hub window'
 
     $drawn = WaitLog 'wheel convert page 0: (.+)' 5000
     Check 'conversion wheel is drawn from the engine' ($drawn -ne $null) "$($drawn.Value)"

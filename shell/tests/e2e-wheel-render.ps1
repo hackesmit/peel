@@ -156,6 +156,10 @@ try {
     $drawn = WaitLog 'wheel convert page 0: (.+)' 6000
     Check 'nine conversions fill one ring' ($drawn -and (@($drawn.Groups[1].Value.Trim() -split ',').Count -eq 9)) "$($drawn.Value)"
     $labels = @($drawn.Groups[1].Value.Trim() -split ',')
+    # At rest: the pointer is still in the hub, so no petal is hovered and
+    # the hub pill is empty.
+    Start-Sleep -Milliseconds 300
+    $null = $shots.Add((Shoot $centre 'shot-convert-idle.png'))
     $target = SegmentPoint $centre $labels.Count 2
     GlideTo $target[0] $target[1]
     Start-Sleep -Milliseconds 400
