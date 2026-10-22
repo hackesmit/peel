@@ -1342,6 +1342,17 @@ def video_mute(job: Job) -> Result:
 # boxblur passes the box through untouched.
 _MIN_BLUR_RADIUS = 2
 
+# Source formats a box can be blurred and overlaid in natively: no alpha (the
+# overlay would mix the blur over the original by the box's own alpha), and
+# chroma at most halved each way (_blur_reaches sizes the chroma radius for
+# that; a 4:1:1 plane is a quarter wide and its radius would clamp to 0). Any
+# other format, or one the probe did not name, is blurred on yuv444p.
+_NATIVE_REDACT_FORMATS = frozenset(
+    f"{base}{depth}"
+    for base in ("yuv420p", "yuv422p", "yuv440p", "yuv444p")
+    for depth in ("", "10le", "12le")
+) | {"yuvj420p", "yuvj422p", "yuvj440p", "yuvj444p", "nv12", "nv21", "p010le", "gray", "gray10le", "gray12le"}
+
 # pixelize's largest block. The average fill is one block over the whole box,
 # so a box with a longer side would come out as two or more tiles, each its
 # own average: a box half black and half white would come back unchanged.
@@ -1359,8 +1370,11 @@ def _box_window(x: int, y: int, w: int, h: int, width: int, height: int, strengt
 
 def _blur_reaches(x: int, y: int, w: int, h: int, width: int, height: int, strength: int) -> bool:
     """Whether every plane of the box's window holds a useful blur radius.
-    Chroma is taken as half the window (4:2:0, rounded up), the smallest any
-    source can have, so this never says yes when a plane would come up short."""
+    Chroma is taken as half the window (4:2:0, rounded up). A 4:1:1 or 4:1:0
+    source has smaller chroma still, but only the formats in
+    _NATIVE_REDACT_FORMATS (chroma at most halved) are blurred natively; every
+    other one is blurred on yuv444p, where chroma is the full window. Either
+    way no plane comes up shorter than this assumes."""
     left, top, right, bottom = _box_window(x, y, w, h, width, height, strength)
     luma = min(right - left, bottom - top)
     chroma = min(-(-(right - left) // 2), -(-(bottom - top) // 2))
@@ -1425,20 +1439,25 @@ def video_redact(job: Job) -> Result:
         )
 
     target = job.output_path()
-    if w % 2 or h % 2 or x % 2 or y % 2 or not reaches:
+    streams = _streams(info, "video")
+    source_fmt = streams[0].get("pix_fmt") if streams else None
+    if w % 2 or h % 2 or x % 2 or y % 2 or not reaches or source_fmt not in _NATIVE_REDACT_FORMATS:
         # On a chroma subsampled frame (yuv420p) crop and overlay snap to the
         # 2 pixel chroma grid (overlay also works in yuv420 unless told
         # otherwise), so an odd box (an odd frame covered edge to edge, say)
         # would blur one column or row short. Blur and overlay on a frame with
         # no subsampling, then hand the encoder the source's own format back.
         # The average fill for a frame too small to blur goes this way too,
-        # so the fill is one colour per pixel, not per chroma block.
-        streams = _streams(info, "video")
-        back = streams[0].get("pix_fmt") if streams else None
+        # so the fill is one colour per pixel, not per chroma block. So does
+        # any format not known to be safe natively (_NATIVE_REDACT_FORMATS).
+        # yuv444p has no alpha, so the blurred box is opaque and replaces
+        # what is under it. A source's alpha is not kept, here or on the
+        # native path: none of the encoders redact writes with (_VIDEO_CODECS)
+        # stores alpha, so the output had none before this either.
         graph = (
             f"[0:v]format=yuv444p,split[base][box];[box]{_box_blur(x, y, w, h, width, height, strength)}[blur];"
             f"[base][blur]overlay={x}:{y}:format=yuv444{window},{_EVEN}"
-            f"{f',format={back}' if back else ''}[v]"
+            f"{f',format={source_fmt}' if source_fmt else ''}[v]"
         )
     else:
         graph = (

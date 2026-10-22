@@ -262,3 +262,77 @@ def test_a_box_taller_than_one_block_on_a_wider_frame_is_blurred(reg, tmp_path):
     pixels = plane(result.outputs[0], rect)
     assert max(pixels) - min(pixels) < 40, (min(pixels), max(pixels))
     assert all(70 < v < 180 for v in pixels), (min(pixels), max(pixels))
+
+
+# Round 4 (review round 3). Two sources took the native path and reported
+# success with the box still readable. A half transparent yuva420p clip: the
+# overlay mixed the blurred box over the original by the box's own alpha, so
+# at alpha 128 a black and white checker showed through at half contrast
+# (Opus). A yuv411p or yuv410p clip: its chroma is a quarter of the luma width,
+# boxblur's chroma radius clamped to 0 and red and blue came through (lucy).
+# Any source format outside a short known-safe list (no alpha, chroma at least
+# half size) is now blurred on yuv444p, where the blurred box is opaque.
+
+def alpha_checker(target: Path) -> Path:
+    """A lossless 64x64 yuva420p clip: a black and white luma checker of 1 px
+    cells, every pixel at alpha 128."""
+    subprocess.run(
+        [FFMPEG, "-v", "error", "-y", "-f", "lavfi",
+         "-i", "color=c=black:size=64x64:rate=10:duration=0.3,format=yuva444p,"
+               "geq=lum='if(mod(X+Y,2),16,235)':cb=128:cr=128:a=128",
+         "-c:v", "ffv1", "-level", "1", "-pix_fmt", "yuva420p", str(target)],
+        check=True,
+    )
+    return target
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(
+    "rect, strength",
+    [
+        ((20, 20, 2, 2), 12),   # the Opus repro
+        ((20, 20, 20, 20), 4),
+    ],
+)
+def test_a_box_on_a_half_transparent_clip_is_obscured(reg, tmp_path, rect, strength):
+    source = alpha_checker(tmp_path / "alpha.mkv")
+    assert max(plane(source, rect)) - min(plane(source, rect)) > 200
+    x, y, w, h = rect
+    result = reg.run("av.video_redact", [source], {"x": x, "y": y, "w": w, "h": h, "strength": strength})
+    if not result.ok:
+        # A refusal is safe, as long as it is a message and writes nothing.
+        assert result.code and "Traceback" not in result.message
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["alpha.mkv"]
+        return
+    pixels = plane(result.outputs[0], rect)
+    assert max(pixels) - min(pixels) < 40, (min(pixels), max(pixels))
+
+
+def quarter_chroma(target: Path, pix_fmt: str) -> Path:
+    """A lossless 8x16 clip at pix_fmt (4:1:1 or 4:1:0) with flat luma and red
+    and blue chroma in its left and right 4 px columns."""
+    subprocess.run(
+        [FFMPEG, "-v", "error", "-y", "-f", "lavfi",
+         "-i", "color=c=black:size=8x16:rate=10:duration=0.3,format=yuv444p,"
+               "geq=lum=128:cb='if(lt(X,4),40,216)':cr='if(lt(X,4),240,16)'",
+         "-c:v", "ffv1", "-level", "1", "-pix_fmt", pix_fmt, str(target)],
+        check=True,
+    )
+    return target
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("pix_fmt", ["yuv411p", "yuv410p"])
+def test_quarter_width_chroma_is_obscured(reg, tmp_path, pix_fmt):
+    source = quarter_chroma(tmp_path / "quarter.mkv", pix_fmt)
+    rect = (0, 0, 8, 16)
+    result = reg.run("av.video_redact", [source], {"x": 0, "y": 0, "w": 8, "h": 16, "strength": 1})
+    assert result.ok, result.message
+    for fmt in ("u", "v"):
+        before = max(plane(source, rect, fmt)) - min(plane(source, rect, fmt))
+        assert before > 70, (fmt, before)
+        # Strength 1 on an 8 px box pulls the columns towards each other, as
+        # it does on a yuv420p or yuv444p source (to about two thirds of the
+        # range); it does not flatten them. Round 3 kept the whole range.
+        pixels = plane(result.outputs[0], rect, fmt)
+        assert max(pixels) - min(pixels) < before * 0.8, (fmt, pixels[:8])
