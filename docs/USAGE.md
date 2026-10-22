@@ -10,14 +10,39 @@ clock) and starts when you sign in to Windows.
 2. Keep holding the mouse button and tap a key:
    - **Shift**: conversions (PNG to JPG, DOCX to PDF, MP4 to MP3, ...).
    - **Ctrl**: file tools (Compress, Zip, Trim, Crop, ...).
-   - **Alt**: file actions (Copy Path; Share, Float, Copy, Move and Terminal
-     are coming).
-3. Move onto a segment and let go. The result appears next to the original
-   file, and a small notice says when it is done.
+   - **Alt**: file actions (Share, Float, Copy, Move, Copy Path, Terminal).
+3. Move onto a segment (it turns orange, and its name shows in the middle of
+   the wheel) and let go. The result appears next to the original file, and a
+   small notice says when it is done.
 
 To cancel, let go in the middle of the wheel (the normal drop happens), let go
 outside it, or press **Esc**. Tap a different key to switch wheels. When a
 wheel has more entries than fit, the last segment says "More".
+
+## File actions
+
+- **Share**: opens the Windows share sheet (Nearby Share, Mail, and the apps
+  you have).
+- **Float**: pins a small always-on-top thumbnail of each file. Drag it into
+  any app or folder as if it were the file. Right-click or Esc closes it.
+- **Copy**: puts the files on the clipboard. Paste them in Explorer or an app.
+- **Move**: moves the files to a recent folder, or **Choose folder...** for
+  any other. A name already taken gets " 2", never an overwrite.
+- **Copy Path**: puts the full path as text on the clipboard.
+- **Terminal**: opens Windows Terminal (or PowerShell) in the file's folder.
+
+## Editors
+
+Tools that need a choice open a small window before they run:
+
+- **Images**: Crop, Edit (rotate, flip, brightness, contrast, saturation),
+  Annotate (pen, arrow, box, text), Redact (blur or black box), Metadata.
+- **Video and audio**: Trim and Split on a timeline, Redact (draw a box on a
+  frame; optional time range), Bleep (mark time ranges), audio Metadata.
+- **PDF**: Organize pages (drag to reorder, rotate, delete) and Split.
+
+Press **Save** (or **Apply**, **Crop**, **Cut**) to write the result next to
+the source, or **Cancel** to close without writing. The source file is never changed.
 
 ## Without a drag
 
