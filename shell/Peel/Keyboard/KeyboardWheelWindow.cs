@@ -17,6 +17,16 @@
 // every Deactivated ask it). Every hide raises Hidden, so the controller resets
 // its open state on every close path, not only the ones it started.
 //
+// Closing fades out the same way the drag wheel does (WheelRenderer.PlayClose,
+// with WheelFade's fallback for an animation that never completes). Input ends
+// the moment the close begins: the window turns click-through, ignores keys,
+// stops its watch and reports itself not visible, and Hidden is raised then,
+// not when the fade ends. The foreground goes back at once too
+// (KeyboardFocusReturn), and the fading wheel is no-activate, so keys typed
+// during the fade reach the window the user returns to. A wheel shown again
+// during the fade cancels the close, so the fade's end cannot hide the wheel
+// that came back.
+//
 // A tapped Alt switches wheels; on its own, Windows would also turn the Alt
 // key up into SC_KEYMENU and put the window in menu mode, which eats the next
 // arrow key. The window swallows the Alt key up and SC_KEYMENU while open.
@@ -38,7 +48,14 @@ internal sealed class KeyboardWheelWindow : Window
     private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
     private readonly KeyboardWheelLifetime _lifetime = new(IdleFromEnvironment());
     private readonly DispatcherTimer _watch;
+    private readonly DispatcherTimer _fadeTimer;
+    private readonly WheelFade _fade = new();
+    private readonly KeyboardFocusReturn _focus;
+    private int _fadeToken;
     private IntPtr _handle;
+
+    // While it fades: the pointer goes through and nothing can activate it.
+    private const long Fading = WheelHubWindow.WS_EX_TRANSPARENT | Native.WS_EX_NOACTIVATE;
 
     internal KeyboardWheelWindow()
     {
@@ -63,6 +80,7 @@ internal sealed class KeyboardWheelWindow : Window
         // A tool window, topmost, kept off the taskbar; NOT WS_EX_NOACTIVATE,
         // because this window has to be able to take the keyboard.
         Native.SetWindowStyleEx(_handle, style | Native.WS_EX_TOOLWINDOW | Native.WS_EX_TOPMOST);
+        _focus = new KeyboardFocusReturn(_handle);
 
         HwndSource.FromHwnd(_handle)?.AddHook(WndProc);
         PreviewKeyDown += OnPreviewKeyDown;
@@ -71,6 +89,8 @@ internal sealed class KeyboardWheelWindow : Window
 
         _watch = new DispatcherTimer(DispatcherPriority.Input) { Interval = TimeSpan.FromMilliseconds(100) };
         _watch.Tick += (_, _) => Watch();
+        _fadeTimer = new DispatcherTimer(DispatcherPriority.Render) { Interval = WheelFade.Fallback };
+        _fadeTimer.Tick += (_, _) => FinishClose(_fadeToken);
     }
 
     /// <summary>A navigation key was pressed while the wheel had focus.</summary>
@@ -84,10 +104,19 @@ internal sealed class KeyboardWheelWindow : Window
 
     internal IntPtr Handle => _handle;
 
+    /// <summary>
+    /// Visible and not on its way out. Hides Window.IsVisible on purpose: a
+    /// wheel fading out has already ended its session.
+    /// </summary>
+    internal new bool IsVisible => base.IsVisible && !_fade.Closing;
+
     /// <summary>The wheel is the foreground window, so it holds the keyboard.</summary>
     internal bool IsForeground => IsVisible && KeyboardNative.GetForegroundWindow() == _handle;
 
     internal WheelPlan Plan => _renderer.Plan;
+
+    /// <summary>Who gets the foreground back on close; the tests swap its desktop.</summary>
+    internal KeyboardFocusReturn FocusReturn => _focus;
 
     internal void SetPlan(WheelPlan plan, Brush accent) => _renderer.SetPlan(plan, accent);
 
@@ -100,6 +129,8 @@ internal sealed class KeyboardWheelWindow : Window
     /// </summary>
     internal void ShowAt(int screenX, int screenY)
     {
+        CancelClose();
+        _focus.Opening();
         var scale = Native.ScaleForPoint(screenX, screenY);
         var side = (int)Math.Round(WheelGeometry.Default.Size * scale);
         var left = screenX - (side / 2);
@@ -128,14 +159,66 @@ internal sealed class KeyboardWheelWindow : Window
         _watch.Stop();
         _lifetime.Closed();
         Log.Write($"keyboard wheel hidden ({reason})");
+        // Input ends now, the window goes when the fade ends.
+        var token = _fadeToken = _fade.Begin();
+        Native.SetWindowStyleEx(_handle, Native.GetWindowStyleEx(_handle) | Fading);
+        HandBackForeground();
+        _renderer.SetHot(-1);
+        _fadeTimer.Stop();
+        _fadeTimer.Start();
+        _renderer.PlayClose(() => FinishClose(token));
+        Hidden?.Invoke(reason);
+    }
+
+    private void FinishClose(int token)
+    {
+        // A stale fade (from a close that a reopen cancelled) must not stop
+        // the current close's fallback, so the timer stops only past the check.
+        if (!_fade.Finish(token))
+        {
+            return;
+        }
+        _fadeTimer.Stop();
         Hide();
         Native.SetWindowRgn(_handle, IntPtr.Zero, false);
-        _renderer.SetHot(-1);
-        Hidden?.Invoke(reason);
+        Native.SetWindowStyleEx(_handle, Native.GetWindowStyleEx(_handle) & ~Fading);
+        _renderer.Settle();
+    }
+
+    /// <summary>A wheel shown again while it fades out comes straight back.</summary>
+    private void CancelClose()
+    {
+        _fadeTimer.Stop();
+        if (!_fade.Cancel())
+        {
+            return;
+        }
+        Native.SetWindowStyleEx(_handle, Native.GetWindowStyleEx(_handle) & ~Fading);
+    }
+
+    /// <summary>The close began: the window that was in front before the wheel gets the keyboard now.</summary>
+    private void HandBackForeground()
+    {
+        if (!Native.GetWindowRect(_handle, out var rect))
+        {
+            rect = default;
+        }
+        var to = _focus.Closing((rect.Left + rect.Right) / 2, (rect.Top + rect.Bottom) / 2);
+        if (to != IntPtr.Zero)
+        {
+            var now = _focus.Windows.Foreground();
+            Log.Write($"keyboard wheel foreground returned to {Native.ClassOf(to)}, now {Native.ClassOf(now)}");
+        }
     }
 
     private void OnPreviewKeyDown(object sender, KeyEventArgs e)
     {
+        if (_fade.Closing)
+        {
+            // A wheel on its way out takes no more keys.
+            e.Handled = true;
+            return;
+        }
         var key = Map(e);
         if (key == NavKey.Other)
         {
@@ -167,7 +250,8 @@ internal sealed class KeyboardWheelWindow : Window
 
     private IntPtr WndProc(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam, ref bool handled)
     {
-        if (!IsVisible)
+        // base: a wheel fading out still keeps Alt out of menu mode.
+        if (!base.IsVisible)
         {
             return IntPtr.Zero;
         }

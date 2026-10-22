@@ -50,7 +50,7 @@ $checks = [System.Collections.ArrayList]::new()
 $script:GuiAbort = $null
 
 New-Item -ItemType Directory -Force $Dir | Out-Null
-Remove-Item $driveLog, $peelLog, $resultPath -ErrorAction SilentlyContinue
+Remove-Item $driveLog, $peelLog, $resultPath, (Join-Path $Dir 'shot-keyboard.png') -ErrorAction SilentlyContinue
 Remove-Item $test -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force $test | Out-Null
 
@@ -89,7 +89,7 @@ function Highlight() {
     return $null
 }
 
-Add-Type -AssemblyName System.Windows.Forms, UIAutomationClient, UIAutomationTypes
+Add-Type -AssemblyName System.Drawing, System.Windows.Forms, UIAutomationClient, UIAutomationTypes
 Add-Type @'
 using System; using System.Runtime.InteropServices;
 public static class In {
@@ -224,6 +224,18 @@ try {
 
     AimAt $Segment $labels
     Check 'arrow keys reach the segment' ((Highlight) -eq $Segment) "highlight=$(Highlight), target=$Segment"
+    # Evidence for a person, not a check: the open wheel with the highlight
+    # on the target, for the side by side against the reference.
+    try {
+        Start-Sleep -Milliseconds 250
+        $cx = [int]$shown.Groups[1].Value; $cy = [int]$shown.Groups[2].Value
+        $bitmap = New-Object System.Drawing.Bitmap 460, 460
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        $graphics.CopyFromScreen($cx - 230, $cy - 230, 0, 0, $bitmap.Size)
+        $bitmap.Save((Join-Path $Dir 'shot-keyboard.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+        $graphics.Dispose(); $bitmap.Dispose()
+        L "screenshot $(Join-Path $Dir 'shot-keyboard.png')"
+    } catch { L "screenshot failed: $_" }
 
     [PeelGuard]::Tap($VkEnter)
     $ran = WaitLog 'keyboard run (\S+) on (\d+) file' 6000
@@ -250,9 +262,14 @@ try {
     $shown = WaitLog 'keyboard wheel shown at (\d+),(\d+)' 6000 ($shownSeen + 1)
     Check 'hotkey opens the wheel again' ($shown -ne $null) "$($shown.Value)"
     WaitLog 'keyboard wheel convert page 0: (.+)' 6000 | Out-Null
+    $returnedSeen = CountLog 'keyboard wheel foreground returned to'
     [PeelGuard]::Tap($VkEsc)
     $cancelled = WaitLog 'keyboard wheel hidden \(escape\)' 4000
     Check 'Escape closes the wheel' ($cancelled -ne $null) "$($cancelled.Value)"
+    # Logged in the same call that begins the fade, so 'now' is the foreground
+    # while the wheel is still fading: keys typed then reach Explorer.
+    $returned = WaitLog 'keyboard wheel foreground returned to (\S+), now (\S+)' 2000 ($returnedSeen + 1)
+    Check 'the fading wheel gives Explorer the keyboard at once' (($returned -ne $null) -and ($returned.Groups[2].Value -eq 'CabinetWClass')) "$($returned.Value)"
     Start-Sleep -Seconds 2
     Check 'Escape runs nothing' ((CountLog 'keyboard run ') -eq $runsBefore) "runs seen: $(CountLog 'keyboard run ') (was $runsBefore)"
     $after = @(Get-ChildItem $test -File | ForEach-Object { $_.Name })
