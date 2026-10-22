@@ -308,11 +308,40 @@ function ItemPoint($item) {
     return @([int]($r.X + 24), [int]($r.Y + $r.Height / 2))
 }
 
+# Click $item and prove through Shell.Application that its Explorer window has
+# it selected, up to three tries. A click on a point another window covers
+# selects nothing (hq-z2dt: the console window of a hung 'soffice --version'
+# from peel doctor sat over the freshly opened Explorer), so the window comes
+# to the front and Confirm-GrabPoint checks the point first. True when selected.
 function SelectItem($item) {
-    $p = ItemPoint $item
-    [void][PeelGuard]::Place($p[0], $p[1]); Start-Sleep -Milliseconds 150
-    [PeelGuard]::Down(); Start-Sleep -Milliseconds 70; [PeelGuard]::Up()
-    Start-Sleep -Milliseconds 350
+    $name = $item.Current.Name
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        [void](FocusExplorer $item)
+        $p = ItemPoint $item
+        if (Confirm-GrabPoint $item $p[0] $p[1]) {
+            [void][PeelGuard]::Place($p[0], $p[1]); Start-Sleep -Milliseconds 150
+            [PeelGuard]::Down(); Start-Sleep -Milliseconds 70; [PeelGuard]::Up()
+            Start-Sleep -Milliseconds 350
+            $selected = SelectedIn (ExplorerWindowOf $item)
+            if ($selected -contains $name) { return $true }
+            L ("select {0}, try {1}: clicked {2},{3}, Explorer has selected [{4}]" -f $name, $attempt, $p[0], $p[1], ($selected -join ';'))
+        }
+        else { L "select $name, try ${attempt}: another window stays over it at $($p[0]),$($p[1])" }
+    }
+    return $false
+}
+
+# The display names Explorer window $hwnd has selected, the way UI Automation
+# names its items (with or without the extension, as Explorer shows them).
+function SelectedIn([IntPtr]$hwnd) {
+    $names = @()
+    try {
+        foreach ($window in @((New-Object -ComObject Shell.Application).Windows())) {
+            if ([long]$window.HWND -ne $hwnd.ToInt64()) { continue }
+            $names += @($window.Document.SelectedItems() | ForEach-Object { $_.Name })
+        }
+    } catch { L "select: cannot read the Explorer selection: $_" }
+    return $names
 }
 
 # The top level window that holds an Explorer item, found by walking up the
@@ -362,7 +391,7 @@ function AimAt($target, $count) {
 
 # Open the keyboard wheel on the selected file, switch with a key, run a label.
 function RunByKeyboard($item, $switchKey, $family, $label) {
-    SelectItem $item
+    if (-not (SelectItem $item)) { return "$($item.Current.Name) never showed as selected in Explorer" }
     if (-not (FocusExplorer $item)) { return "Explorer never took the foreground" }
     $shownSeen = CountLog 'keyboard wheel shown at'
     [PeelGuard]::Chord($VkP)
@@ -550,7 +579,7 @@ try {
     Sample $smokePeel 'before presses'
     $missed = 0
     $item = FindItem 'sample.txt'
-    SelectItem $item
+    [void](SelectItem $item)
     for ($i = 1; $i -le $Presses; $i++) {
         $shownSeen = CountLog 'keyboard wheel shown at'
         $hiddenSeen = CountLog 'keyboard wheel hidden'
@@ -559,7 +588,7 @@ try {
         if (-not (WaitLog 'keyboard wheel shown at' 4000 ($shownSeen + 1))) {
             $missed++
             $item = FindItem 'sample.txt'
-            if ($item) { SelectItem $item }
+            if ($item) { [void](SelectItem $item) }
             continue
         }
         [PeelGuard]::Tap($VkEsc)
