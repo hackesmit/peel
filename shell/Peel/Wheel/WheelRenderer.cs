@@ -9,6 +9,7 @@
 // same reason.
 using System;
 using System.Globalization;
+using System.Linq;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
@@ -79,31 +80,24 @@ internal sealed class WheelRenderer : FrameworkElement
     /// <summary>The smallest a label shrinks to before it is trimmed instead.</summary>
     internal const double MinLabelSize = 9;
 
-    /// <summary>
-    /// Format names are shown in capitals, as on the reference: a wheel whose
-    /// every entry is a short name (MP3, WEBP, DOCX) reads as formats. Tool and
-    /// action names (Compress, Copy Path) keep their case, because capitals
-    /// make them too wide for a twelve petal wheel.
-    /// </summary>
-    internal static bool ReadsAsFormats(WheelPlan plan)
-    {
-        var entries = 0;
-        foreach (var segment in plan.Segments)
-        {
-            if (segment.Kind != SegmentKind.Entry)
-            {
-                continue;
-            }
-            entries++;
-            if (segment.Label.Length > 5 || segment.Label.Contains(' '))
-            {
-                return false;
-            }
-        }
-        return entries > 0;
-    }
+    /// <summary>The family whose entries are target formats (MP3, WEBP, MARKDOWN).</summary>
+    internal const string FormatsFamily = "convert";
 
-    private string Display(string label) => _upper ? label.ToUpper(CultureInfo.CurrentUICulture) : label;
+    /// <summary>
+    /// Format names are shown in capitals, as on the reference. The family
+    /// decides, not the names: the convert wheel is formats however long one
+    /// is. Tool and action names (Compress, Copy Path) keep their case,
+    /// because capitals make them too wide for a twelve petal wheel.
+    /// </summary>
+    internal static bool ReadsAsFormats(WheelPlan plan) =>
+        string.Equals(plan.Family, FormatsFamily, StringComparison.OrdinalIgnoreCase)
+        && plan.Segments.Any(segment => segment.Kind == SegmentKind.Entry);
+
+    /// <summary>
+    /// Invariant capitals: a format name is not a word of the user's language,
+    /// and a Turkish culture would turn the i of a name into a dotted capital.
+    /// </summary>
+    private string Display(string label) => _upper ? label.ToUpperInvariant() : label;
 
     /// <summary>Raised after the hovered segment changes, so a hub drawn elsewhere can follow.</summary>
     internal event Action? HotChanged;
@@ -137,8 +131,14 @@ internal sealed class WheelRenderer : FrameworkElement
     /// <summary>Fade and scale in from a little smaller, as the wheel appears.</summary>
     internal void PlayOpen() => Animate(this, _scale, ClosedScale, 0, 1, 1, OpenTime, null);
 
+    /// <summary>
+    /// This renderer's close fade. Only the tests change it, to stand for a
+    /// fade that never ends in time (no animation runs on a locked screen).
+    /// </summary>
+    internal TimeSpan CloseDuration { get; set; } = CloseTime;
+
     /// <summary>Fade and shrink a little, then call <paramref name="done"/>.</summary>
-    internal void PlayClose(Action done) => Animate(this, _scale, 1, 1, 0.94, 0, CloseTime, done);
+    internal void PlayClose(Action done) => Animate(this, _scale, 1, 1, 0.94, 0, CloseDuration, done);
 
     /// <summary>Stop any open or close animation and show the wheel at rest.</summary>
     internal void Settle() => Animate(this, _scale, 1, 1, 1, 1, TimeSpan.Zero, null);
