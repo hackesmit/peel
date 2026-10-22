@@ -23,6 +23,8 @@
 // Closing fades the wheel out for a moment. For that moment the window is made
 // click-through (WS_EX_TRANSPARENT) and reports itself not visible, so nothing
 // can land on a wheel that is leaving and every caller sees it gone at once.
+// WheelFade decides when the fade is over: its end, or a fallback timer when
+// the animation never completes (a locked screen runs no animations).
 //
 // One showing of the wheel is one session. The paths it read from OLE belong
 // to that session only: HideNow forgets them, and a drop is accepted only when
@@ -48,14 +50,15 @@ internal partial class WheelWindow : Window
     private readonly DispatcherTimer _hideTimer;
     private readonly DispatcherTimer _arrivalTimer;
     private readonly DispatcherTimer _dwellTimer;
+    private readonly DispatcherTimer _fadeTimer;
+    private readonly WheelFade _fade = new();
     private readonly ArrivalWatch _arrival = new(
         Math.Max(8, 2 * Math.Max(Native.GetSystemMetrics(Native.SM_CXDRAG), Native.GetSystemMetrics(Native.SM_CYDRAG))));
     private readonly System.Diagnostics.Stopwatch _clock = System.Diagnostics.Stopwatch.StartNew();
     private IntPtr _handle;
     private bool _holeCut;
     private bool _rejected;
-    private bool _closing;
-    private int _closeGeneration;
+    private int _fadeToken;
     private int _shownX;
     private int _shownY;
     private string[] _files = Array.Empty<string>();
@@ -72,6 +75,7 @@ internal partial class WheelWindow : Window
         _arrivalTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(100) };
         _arrivalTimer.Tick += (_, _) => OnArrivalTick();
         _dwellTimer = Timer(TimeSpan.FromMilliseconds(650), OnDwell);
+        _fadeTimer = Timer(WheelFade.Fallback, () => FinishClose(_fadeToken));
 
         _handle = new WindowInteropHelper(this).EnsureHandle();
         var style = Native.GetWindowStyleEx(_handle);
@@ -104,7 +108,7 @@ internal partial class WheelWindow : Window
     /// wheel fading out has already ended its session, and the controller must
     /// treat it as gone.
     /// </summary>
-    internal new bool IsVisible => base.IsVisible && !_closing;
+    internal new bool IsVisible => base.IsVisible && !_fade.Closing;
 
     internal IReadOnlyList<string> Files => _files;
 
@@ -192,21 +196,22 @@ internal partial class WheelWindow : Window
         Log.Write($"wheel hidden ({reason})");
         // Click-through first, so the fade can never catch a drop or the
         // pointer, then fade; the window really goes when the fade ends.
-        _closing = true;
-        var generation = ++_closeGeneration;
+        var token = _fadeToken = _fade.Begin();
         Native.SetWindowStyleEx(_handle, Native.GetWindowStyleEx(_handle) | WheelHubWindow.WS_EX_TRANSPARENT);
+        _fadeTimer.Stop();
+        _fadeTimer.Start();
         _hub.PlayClose();
-        _renderer.PlayClose(() => FinishClose(generation));
+        _renderer.PlayClose(() => FinishClose(token));
         Hidden?.Invoke(reason);
     }
 
-    private void FinishClose(int generation)
+    private void FinishClose(int token)
     {
-        if (!_closing || generation != _closeGeneration)
+        if (!_fade.Finish(token))
         {
             return;
         }
-        _closing = false;
+        _fadeTimer.Stop();
         Hide();
         _hub.Hide();
         ClearRegion();
@@ -218,12 +223,11 @@ internal partial class WheelWindow : Window
     /// <summary>A wheel shown again while it fades out comes straight back.</summary>
     private void CancelClose()
     {
-        if (!_closing)
+        _fadeTimer.Stop();
+        if (!_fade.Cancel())
         {
             return;
         }
-        _closing = false;
-        _closeGeneration++;
         ClearRegion();
         Native.SetWindowStyleEx(_handle, Native.GetWindowStyleEx(_handle) & ~(long)WheelHubWindow.WS_EX_TRANSPARENT);
     }
