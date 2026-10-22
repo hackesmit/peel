@@ -17,6 +17,13 @@
 // are known the hub is cut out. A drop in a square corner outside the ring
 // therefore always falls through.
 //
+// The hub is painted by WheelHubWindow, a click-through window over the hole,
+// so the wheel looks whole while the hole still passes a drop through.
+//
+// Closing fades the wheel out for a moment. For that moment the window is made
+// click-through (WS_EX_TRANSPARENT) and reports itself not visible, so nothing
+// can land on a wheel that is leaving and every caller sees it gone at once.
+//
 // One showing of the wheel is one session. The paths it read from OLE belong
 // to that session only: HideNow forgets them, and a drop is accepted only when
 // the drop's own data names the same paths the session read. A drag whose
@@ -36,7 +43,8 @@ namespace Peel.Wheel;
 
 internal partial class WheelWindow : Window
 {
-    private readonly WheelRenderer _renderer = new();
+    private readonly WheelRenderer _renderer = new(drawsHub: false);
+    private readonly WheelHubWindow _hub;
     private readonly DispatcherTimer _hideTimer;
     private readonly DispatcherTimer _arrivalTimer;
     private readonly DispatcherTimer _dwellTimer;
@@ -46,6 +54,8 @@ internal partial class WheelWindow : Window
     private IntPtr _handle;
     private bool _holeCut;
     private bool _rejected;
+    private bool _closing;
+    private int _closeGeneration;
     private int _shownX;
     private int _shownY;
     private string[] _files = Array.Empty<string>();
@@ -66,6 +76,8 @@ internal partial class WheelWindow : Window
         _handle = new WindowInteropHelper(this).EnsureHandle();
         var style = Native.GetWindowStyleEx(_handle);
         Native.SetWindowStyleEx(_handle, style | Native.WS_EX_NOACTIVATE | Native.WS_EX_TOOLWINDOW | Native.WS_EX_TOPMOST);
+        _hub = new WheelHubWindow(_handle);
+        _renderer.HotChanged += () => _hub.SetLabel(_renderer.HotLabel);
 
         DragEnter += OnDragEnter;
         DragOver += OnDragOver;
@@ -87,6 +99,13 @@ internal partial class WheelWindow : Window
 
     internal WheelPlan Plan => _renderer.Plan;
 
+    /// <summary>
+    /// Visible and not on its way out. Hides Window.IsVisible on purpose: a
+    /// wheel fading out has already ended its session, and the controller must
+    /// treat it as gone.
+    /// </summary>
+    internal new bool IsVisible => base.IsVisible && !_closing;
+
     internal IReadOnlyList<string> Files => _files;
 
     internal void SetPlan(WheelPlan plan, Brush accent)
@@ -103,6 +122,7 @@ internal partial class WheelWindow : Window
     internal void ShowAt(int screenX, int screenY)
     {
         _hideTimer.Stop();
+        CancelClose();
         var scale = Native.ScaleForPoint(screenX, screenY);
         var side = (int)Math.Round(WheelGeometry.Default.Size * scale);
         var left = screenX - (side / 2);
@@ -117,6 +137,9 @@ internal partial class WheelWindow : Window
         }
         Native.SetWindowPos(_handle, Native.HWND_TOPMOST, left, top, side, side,
             Native.SWP_NOACTIVATE | Native.SWP_SHOWWINDOW);
+        _hub.ShowAt(screenX, screenY, scale);
+        _renderer.PlayOpen();
+        _hub.PlayOpen();
         _shownX = screenX;
         _shownY = screenY;
         _arrival.Reset();
@@ -134,6 +157,9 @@ internal partial class WheelWindow : Window
         Native.SetWindowPos(_handle, Native.HWND_TOPMOST, -30000, -30000, 10, 10, Native.SWP_NOACTIVATE);
         Show();
         Hide();
+        Native.SetWindowPos(_hub.Handle, Native.HWND_TOPMOST, -30000, -30000, 10, 10, Native.SWP_NOACTIVATE);
+        _hub.Show();
+        _hub.Hide();
     }
 
     internal void HideAfter(TimeSpan delay)
@@ -164,9 +190,42 @@ internal partial class WheelWindow : Window
             return;
         }
         Log.Write($"wheel hidden ({reason})");
-        Hide();
-        ClearRegion();
+        // Click-through first, so the fade can never catch a drop or the
+        // pointer, then fade; the window really goes when the fade ends.
+        _closing = true;
+        var generation = ++_closeGeneration;
+        Native.SetWindowStyleEx(_handle, Native.GetWindowStyleEx(_handle) | WheelHubWindow.WS_EX_TRANSPARENT);
+        _hub.PlayClose();
+        _renderer.PlayClose(() => FinishClose(generation));
         Hidden?.Invoke(reason);
+    }
+
+    private void FinishClose(int generation)
+    {
+        if (!_closing || generation != _closeGeneration)
+        {
+            return;
+        }
+        _closing = false;
+        Hide();
+        _hub.Hide();
+        ClearRegion();
+        Native.SetWindowStyleEx(_handle, Native.GetWindowStyleEx(_handle) & ~(long)WheelHubWindow.WS_EX_TRANSPARENT);
+        _renderer.Settle();
+        _hub.Settle();
+    }
+
+    /// <summary>A wheel shown again while it fades out comes straight back.</summary>
+    private void CancelClose()
+    {
+        if (!_closing)
+        {
+            return;
+        }
+        _closing = false;
+        _closeGeneration++;
+        ClearRegion();
+        Native.SetWindowStyleEx(_handle, Native.GetWindowStyleEx(_handle) & ~(long)WheelHubWindow.WS_EX_TRANSPARENT);
     }
 
     private void OnDragEnter(object sender, DragEventArgs e)
@@ -312,6 +371,7 @@ internal partial class WheelWindow : Window
         }
         var applied = SetRegion(Math.Min(rect.Width, rect.Height), withHub: true);
         Log.Write($"hub hole cut={applied}");
+        Log.Write($"hub falls through={_hub.FallsThrough(_shownX, _shownY, _handle)}");
     }
 
     /// <summary>
