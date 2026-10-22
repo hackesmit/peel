@@ -118,10 +118,15 @@ internal readonly record struct WheelGeometry(double InnerRadius, double OuterRa
     /// because the further out they are the more room each one has.</summary>
     internal double LabelRadius => PetalInner + (0.55 * (PetalOuter - PetalInner));
 
+    /// <summary>On a dense wheel the labels sit further out still, where a
+    /// thin petal is widest, so a tool name fits without a cut.</summary>
+    internal double LabelRadiusFor(int count) =>
+        count >= 10 ? PetalInner + (0.62 * (PetalOuter - PetalInner)) : LabelRadius;
+
     /// <summary>Where a segment's label sits, as an offset from the wheel centre.</summary>
     internal (double X, double Y) LabelOffset(int count, int index)
     {
         var step = 360.0 / Math.Max(count, 1);
-        return Offset(index * step, LabelRadius);
+        return Offset(index * step, LabelRadiusFor(count));
     }
 }
