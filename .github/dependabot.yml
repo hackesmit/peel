@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/engine"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      weekly-updates:
+        patterns:
+          - "*"
